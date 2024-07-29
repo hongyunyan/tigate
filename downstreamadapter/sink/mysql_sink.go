@@ -180,6 +180,7 @@ func (s *MysqlSink) initWorker(workerCount int, cfg *writer.MysqlConfig, db *sql
 						log.Error("Failed to flush events", zap.Error(err), zap.Any("workerID", workerId), zap.Any("events", events))
 						return
 					}
+					log.Info("Flush events", zap.Int("count", len(events)), zap.Int("rows", rows), zap.Duration("duration", time.Since(start)), zap.Any("workerID", workerId))
 					s.flushRows.Add(float64(rows))
 					worker.WorkerFlushDuration.Observe(time.Since(start).Seconds())
 
