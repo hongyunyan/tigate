@@ -157,6 +157,26 @@ func (d *TableEventDispatcher) DispatcherEvents(ctx context.Context) {
 				// resolvedTs
 				d.resolvedTs.Set(event.ResolvedTs)
 			}
+
+			timeout := time.NewTimer(10 * time.Millisecond)
+		loop:
+			for {
+				select {
+				case <-timeout.C:
+					break loop
+				case event := <-d.GetEventChan():
+					log.Info("TableEventDispatcher get events from eventChan", zap.Any("event is DML", event.IsDMLEvent()), zap.Any("dispatcher table id", d.tableSpan.TableID))
+					if event.IsDMLEvent() {
+						sink.AddDMLEvent(tableSpan, event)
+					} else {
+						// resolvedTs
+						d.resolvedTs.Set(event.ResolvedTs)
+					}
+				default:
+					break loop
+				}
+			}
+
 		}
 	}
 }
