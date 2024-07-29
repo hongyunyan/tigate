@@ -193,6 +193,7 @@ func (s *MysqlSink) initWorker(workerCount int, cfg *writer.MysqlConfig, db *sql
 }
 
 func (s *MysqlSink) AddDMLEvent(tableSpan *common.TableSpan, event *common.TxnEvent) {
+	log.Info("MysqlSink begin DML event", zap.Any("tableID", tableSpan.TableID))
 	tableStatus, ok := s.tableStatuses.Get(tableSpan)
 	if !ok {
 		log.Error("unknown Span for Mysql Sink: ", zap.Any("tableSpan", tableSpan))
@@ -200,7 +201,7 @@ func (s *MysqlSink) AddDMLEvent(tableSpan *common.TableSpan, event *common.TxnEv
 	}
 	tableStatus.getProgress().Add(event)
 	tableStatus.getCh() <- event
-	log.Info("mysql sink recv event", zap.Any("tableID", tableSpan.TableID))
+	log.Info("MysqlSink finish DML event", zap.Any("tableID", tableSpan.TableID))
 }
 
 /*
