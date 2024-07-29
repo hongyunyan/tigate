@@ -119,6 +119,7 @@ func (n *Node) dependOn(dependencyNodes map[int64]*Node) {
 
 	// `totalDependencies` and `resolvedList` must be initialized before depending on any targets.
 	n.totalDependencies = int32(len(dependencyNodes))
+	log.Info("totalDependencies", zap.Int("totalDependencies", int(n.totalDependencies)))
 	n.resolvedList = make([]int64, 0, n.totalDependencies)
 	for i := 0; i < int(n.totalDependencies); i++ {
 		n.resolvedList = append(n.resolvedList, unassigned)
@@ -161,6 +162,7 @@ func (n *Node) tryAssignTo(cacheID int64) bool {
 	if n.TrySendToTxnCache != nil {
 		ok := n.TrySendToTxnCache(cacheID)
 		if !ok {
+			log.Info("trySendToTxnCache failed", zap.Int64("cacheID", cacheID))
 			return false
 		}
 		n.TrySendToTxnCache = nil

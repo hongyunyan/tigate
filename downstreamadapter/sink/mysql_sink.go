@@ -198,9 +198,9 @@ func (s *MysqlSink) AddDMLEvent(tableSpan *common.TableSpan, event *common.TxnEv
 		log.Error("unknown Span for Mysql Sink: ", zap.Any("tableSpan", tableSpan))
 		return
 	}
-	//log.Info("mysql sink recv event", zap.Any("tableID", tableSpan.TableID))
 	tableStatus.getProgress().Add(event)
 	tableStatus.getCh() <- event
+	log.Info("mysql sink recv event", zap.Any("tableID", tableSpan.TableID))
 }
 
 /*
