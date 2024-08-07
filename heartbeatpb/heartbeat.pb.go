@@ -1384,6 +1384,8 @@ func (m *TableSpan) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 
 func (m *HeartBeatRequest) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
+	fmt.Println("Marshal() of HeartBeatRequest", m.ChangefeedID, m.Watermark, m.Statuses, m.CompeleteStatus, m.Warning, m.Err)
+	fmt.Println("HeartBeatRequest size is", size)
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
