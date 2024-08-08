@@ -1554,6 +1554,8 @@ func (m *HeartBeatRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 			}
 			i--
 			dAtA[i] = 0x1a
+
+			log.Info("HeartbeatRequest after Statuses once ", zap.Any("i is", i), zap.Any("iNdEx", iNdEx))
 		}
 	}
 	log.Info("HeartbeatRequest after Statuses ", zap.Any("i is", i), zap.Any("len(m.Statuses)", len(m.Statuses)))
@@ -2468,6 +2470,7 @@ func (m *TableSpan) Size() (n int) {
 }
 
 func (m *HeartBeatRequest) Size() (n int) {
+	log.Info("HeartbeatRequest Size", zap.Any("ChangefeedID", m.ChangefeedID), zap.Any("Watermark", m.Watermark), zap.Any("Statuses", m.Statuses), zap.Any("CompeleteStatus", m.CompeleteStatus), zap.Any("Warning", m.Warning), zap.Any("Err", m.Err))
 	if m == nil {
 		return 0
 	}
@@ -2477,27 +2480,33 @@ func (m *HeartBeatRequest) Size() (n int) {
 	if l > 0 {
 		n += 1 + l + sovHeartbeat(uint64(l))
 	}
+	log.Info("HeartbeatRequest Size after changefeedID", zap.Any("n",n))
 	if m.Watermark != nil {
 		l = m.Watermark.Size()
 		n += 1 + l + sovHeartbeat(uint64(l))
 	}
+	log.Info("HeartbeatRequest Size after watermark", zap.Any("n",n))
 	if len(m.Statuses) > 0 {
 		for _, e := range m.Statuses {
 			l = e.Size()
 			n += 1 + l + sovHeartbeat(uint64(l))
 		}
 	}
+	log.Info("HeartbeatRequest Size after Statuses", zap.Any("n",n))
 	if m.CompeleteStatus {
 		n += 2
 	}
+	log.Info("HeartbeatRequest Size after CompeleteStatus", zap.Any("n",n))
 	if m.Warning != nil {
 		l = m.Warning.Size()
 		n += 1 + l + sovHeartbeat(uint64(l))
 	}
+	log.Info("HeartbeatRequest Size after Warning", zap.Any("n",n))
 	if m.Err != nil {
 		l = m.Err.Size()
 		n += 1 + l + sovHeartbeat(uint64(l))
 	}
+	log.Info("HeartbeatRequest Size after Err", zap.Any("n",n))
 	return n
 }
 
@@ -2839,6 +2848,7 @@ func (m *TableSpanStatus) Size() (n int) {
 	if m.CheckpointTs != 0 {
 		n += 1 + sovHeartbeat(uint64(m.CheckpointTs))
 	}
+	log.Info("HeartbeatRequest TableSpanStatus Size", zap.Any("n",n))
 	return n
 }
 
