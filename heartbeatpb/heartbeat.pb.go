@@ -9,6 +9,8 @@ import (
 	io "io"
 	math "math"
 	math_bits "math/bits"
+	"github.com/pingcap/log"
+	"go.uber.org/zap"
 )
 
 // Reference imports to suppress errors if they are not otherwise used.
@@ -1484,8 +1486,7 @@ func (m *TableSpan) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 
 func (m *HeartBeatRequest) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
-	fmt.Println("HeartbeatRequest", m.ChangefeedID, m.Watermark, m.Statuses, m.CompeleteStatus, m.Warning, m.Err)
-	fmt.Println("HeartbeatRequest size is", size)
+	log.Info("HeartbeatRequest", zap.Any("ChangefeedID", m.ChangefeedID), zap.Any("Watermark", m.Watermark), zap.Any("Statuses", m.Statuses), zap.Any("CompeleteStatus", m.CompeleteStatus), zap.Any("Warning", m.Warning), zap.Any("Err", m.Err),zap.Any("size is", size))
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
