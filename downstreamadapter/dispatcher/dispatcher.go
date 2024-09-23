@@ -109,6 +109,12 @@ func NewDispatcher(id common.DispatcherID, tableSpan *heartbeatpb.TableSpan, sin
 
 	// only when is not mysql sink, table trigger event dispatcher need tableNameStore to store the table name
 	// in order to calculate all the topics when sending checkpointTs to downstream
+	if tableSpan == nil {
+		log.Error("tableSpan is nil")
+	}
+	if dispatcher.sink == nil {
+		log.Error("sink is nil")
+	}
 	if tableSpan.Equal(heartbeatpb.DDLSpan) && dispatcher.sink.SinkType() != tisink.MysqlSinkType {
 		dispatcher.tableNameStore = NewTableNameStore()
 	}
@@ -331,6 +337,7 @@ func (d *Dispatcher) Remove() {
 			log.Error("remove dispatcher from dynamic stream failed", zap.Error(err))
 		}
 	}
+
 }
 
 func (d *Dispatcher) TryClose() (w heartbeatpb.Watermark, ok bool) {
