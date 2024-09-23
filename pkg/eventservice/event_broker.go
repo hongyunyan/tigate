@@ -125,12 +125,12 @@ func (c *eventBroker) sendWatermark(
 	watermark uint64,
 	counter prometheus.Counter,
 ) {
-	resolvedEvent := newWrapResolvedEvent(
+	// resolvedEvent :=
+	c.messageCh <- newWrapResolvedEvent(
 		server,
 		common.ResolvedEvent{
 			DispatcherID: dispatcherID,
 			ResolvedTs:   watermark})
-	c.messageCh <- resolvedEvent
 	if counter != nil {
 		counter.Inc()
 	}
