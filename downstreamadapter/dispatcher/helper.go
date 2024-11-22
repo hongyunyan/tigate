@@ -116,6 +116,7 @@ func NewSchemaIDToDispatchers() *SchemaIDToDispatchers {
 }
 
 func (s *SchemaIDToDispatchers) Set(schemaID int64, dispatcherID common.DispatcherID) {
+	log.Info("hyy set ", zap.Any("schemaID", schemaID), zap.Any("dispatcherID", dispatcherID))
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	if _, ok := s.m[schemaID]; !ok {
@@ -151,8 +152,10 @@ func (s *SchemaIDToDispatchers) GetDispatcherIDs(schemaID int64) []common.Dispat
 		for id := range ids {
 			dispatcherIDs = append(dispatcherIDs, id)
 		}
+		log.Info("hyy get ", zap.Any("schemaID", schemaID), zap.Any("dispatcherIDs", dispatcherIDs))
 		return dispatcherIDs
 	}
+	log.Info("hyy get empty dispatcherIDs")
 	return nil
 }
 
