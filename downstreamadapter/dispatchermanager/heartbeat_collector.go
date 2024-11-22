@@ -249,6 +249,7 @@ func (h *HeartBeatResponseHandler) Handle(eventDispatcherManager *EventDispatche
 	heartbeatResponse := resps[0]
 	dispatcherStatuses := heartbeatResponse.GetDispatcherStatuses()
 	for _, dispatcherStatus := range dispatcherStatuses {
+		log.Info("hyy receive heartbeat response", zap.Any("dispatcherStatus", dispatcherStatus))
 		influencedDispatchersType := dispatcherStatus.InfluencedDispatchers.InfluenceType
 		switch influencedDispatchersType {
 		case heartbeatpb.InfluenceType_Normal:

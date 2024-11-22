@@ -182,6 +182,7 @@ func NewDispatcher(
 // 1. If the action is a write, we need to add the ddl event to the sink for writing to downstream.
 // 2. If the action is a pass, we just need to pass the event
 func (d *Dispatcher) HandleDispatcherStatus(dispatcherStatus *heartbeatpb.DispatcherStatus) {
+	log.Info("hyy Handle dispatcher status", zap.Any("dispatcherStatus", dispatcherStatus), zap.Any("dispatcher", d.id))
 	// deal with the ack info
 	ack := dispatcherStatus.GetAck()
 	if ack != nil {
