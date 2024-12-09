@@ -58,6 +58,7 @@ func (f *saramaFactory) AdminClient(ctx context.Context) (tikafka.ClusterAdminCl
 	}
 
 	start = time.Now()
+	log.Info("hyy AdminClient endpoints", zap.Any("ip", f.option.BrokerEndpoints))
 	client, err := sarama.NewClient(f.option.BrokerEndpoints, config)
 	duration = time.Since(start).Seconds()
 	if duration > 2 {
