@@ -118,12 +118,14 @@ func (a *saramaAdminClient) GetTopicConfig(
 func (a *saramaAdminClient) GetTopicsMeta(
 	_ context.Context, topics []string, ignoreTopicError bool,
 ) (map[string]tikafka.TopicDetail, error) {
+	log.Info("hyy GetTopicsMeta line 121")
 	result := make(map[string]tikafka.TopicDetail, len(topics))
 
 	metaList, err := a.admin.DescribeTopics(topics)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	log.Info("hyy GetTopicsMeta line 128")
 
 	for _, meta := range metaList {
 		if meta.Err != sarama.ErrNoError {
