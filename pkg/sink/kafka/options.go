@@ -565,6 +565,8 @@ func AdjustOptions(
 		return errors.Trace(err)
 	}
 
+	log.Info("hyy 568")
+
 	// Only check replicationFactor >= minInsyncReplicas when producer's required acks is -1.
 	// If we don't check it, the producer probably can not send message to the topic.
 	// Because it will wait for the ack from all replicas. But we do not have enough replicas.
@@ -574,6 +576,8 @@ func AdjustOptions(
 			return errors.Trace(err)
 		}
 	}
+
+	log.Info("hyy 580")
 
 	info, exists := topics[topic]
 	// once we have found the topic, no matter `auto-create-topic`,
@@ -620,6 +624,8 @@ func AdjustOptions(
 
 		return nil
 	}
+
+	log.Info("hyy 628")
 
 	brokerMessageMaxBytesStr, err := admin.GetBrokerConfig(
 		ctx,
