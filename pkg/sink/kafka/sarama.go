@@ -76,25 +76,26 @@ func NewSaramaConfig(ctx context.Context, o *Options) (*sarama.Config, error) {
 	config.Producer.Return.Successes = true
 	config.Producer.Return.Errors = true
 	config.Producer.RequiredAcks = sarama.RequiredAcks(o.RequiredAcks)
-	compression := strings.ToLower(strings.TrimSpace(o.Compression))
-	switch compression {
-	case "none":
-		config.Producer.Compression = sarama.CompressionNone
-	case "gzip":
-		config.Producer.Compression = sarama.CompressionGZIP
-	case "snappy":
-		config.Producer.Compression = sarama.CompressionSnappy
-	case "lz4":
-		config.Producer.Compression = sarama.CompressionLZ4
-	case "zstd":
-		config.Producer.Compression = sarama.CompressionZSTD
-	default:
-		log.Warn("Unsupported compression algorithm", zap.String("compression", o.Compression))
-		config.Producer.Compression = sarama.CompressionNone
-	}
-	if config.Producer.Compression != sarama.CompressionNone {
-		log.Info("Kafka producer uses " + compression + " compression algorithm")
-	}
+	config.Producer.Compression = sarama.CompressionLZ4
+	//compression := strings.ToLower(strings.TrimSpace(o.Compression))
+	// switch compression {
+	// case "none":
+	// 	config.Producer.Compression = sarama.CompressionNone
+	// case "gzip":
+	// 	config.Producer.Compression = sarama.CompressionGZIP
+	// case "snappy":
+	// 	config.Producer.Compression = sarama.CompressionSnappy
+	// case "lz4":
+	// 	config.Producer.Compression = sarama.CompressionLZ4
+	// case "zstd":
+	// 	config.Producer.Compression = sarama.CompressionZSTD
+	// default:
+	// 	log.Warn("Unsupported compression algorithm", zap.String("compression", o.Compression))
+	// 	config.Producer.Compression = sarama.CompressionNone
+	// }
+	// if config.Producer.Compression != sarama.CompressionNone {
+	// 	log.Info("Kafka producer uses " + compression + " compression algorithm")
+	// }
 
 	if o.EnableTLS {
 		// for SSL encryption with a trust CA certificate, we must populate the
