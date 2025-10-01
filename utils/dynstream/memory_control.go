@@ -106,6 +106,7 @@ func (as *areaMemStat[A, P, T, D, H]) appendEvent(
 	}
 
 	failpoint.Inject("InjectDropEvent", func() {
+		log.Info("hyy Enable InjectDropEvent")
 		if as.settings.Load().algorithm == MemoryControlForEventCollector {
 			dropEvent := handler.OnDrop(event.event)
 			if dropEvent != nil {
