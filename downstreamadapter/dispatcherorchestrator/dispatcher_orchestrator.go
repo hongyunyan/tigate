@@ -269,6 +269,7 @@ func createBootstrapResponse(
 	manager *dispatchermanager.DispatcherManager,
 	startTs uint64,
 ) *heartbeatpb.MaintainerBootstrapResponse {
+	log.Info("hyy createBootstrapResponse", zap.Any("changefeedID", changefeedID), zap.Any("manager", manager), zap.Uint64("startTs", startTs))
 	response := &heartbeatpb.MaintainerBootstrapResponse{
 		ChangefeedID: changefeedID,
 		Spans:        make([]*heartbeatpb.BootstrapTableSpan, 0, manager.GetDispatcherMap().Len()),
@@ -303,7 +304,7 @@ func createBootstrapResponse(
 			Mode:            d.GetMode(),
 		})
 	})
-
+	log.Info("hyy finish createBootstrapResponse", zap.Any("response", response))
 	return response
 }
 
