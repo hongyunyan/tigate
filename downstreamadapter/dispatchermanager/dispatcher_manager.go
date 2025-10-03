@@ -691,9 +691,12 @@ func (e *DispatcherManager) aggregateDispatcherHeartbeats(needCompleteStatus boo
 		if watermark != nil {
 			message.Watermark.UpdateMin(*watermark)
 		}
+		log.Info("watermark", zap.Any("watermark", watermark), zap.Any("status", status), zap.Any("dispatcherID", id))
 	})
 	message.Watermark.Seq = seq
 	e.latestWatermark.Set(message.Watermark)
+
+	log.Info("final watermkar", zap.Any("message.Watermark", message.Watermark))
 
 	// if the event dispatcher manager is closing, we don't to remove the stopped dispatchers.
 	if !e.closing.Load() {
