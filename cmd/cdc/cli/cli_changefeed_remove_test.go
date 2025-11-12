@@ -19,9 +19,9 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/pingcap/errors"
+	v2 "github.com/pingcap/ticdc/api/v2"
+	"github.com/pingcap/ticdc/pkg/api/v2/mock"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
-	v2 "github.com/pingcap/tiflow/cdc/api/v2"
-	"github.com/pingcap/tiflow/pkg/api/v2/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,17 +37,17 @@ func TestChangefeedRemoveCli(t *testing.T) {
 	cf.EXPECT().Delete(gomock.Any(), "test", "abc").Return(nil)
 	cf.EXPECT().Get(gomock.Any(), "test", "abc").Return(nil,
 		cerror.ErrChangeFeedNotExists.GenWithStackByArgs("abc"))
-	os.Args = []string{"remove", "--changefeed-id=abc", "--namespace=test"}
+	os.Args = []string{"remove", "--changefeed-id=abc", "--keyspace=test"}
 	require.Nil(t, cmd.Execute())
 	cf.EXPECT().Get(gomock.Any(), "default", "abc").Return(nil,
 		cerror.ErrChangeFeedNotExists.GenWithStackByArgs("abc"))
-	os.Args = []string{"remove", "--changefeed-id=abc", "--namespace=default"}
+	os.Args = []string{"remove", "--changefeed-id=abc", "--keyspace=default"}
 	require.Nil(t, cmd.Execute())
 
 	o := newRemoveChangefeedOptions()
 	o.complete(f)
 	o.changefeedID = "abc"
-	o.namespace = "test"
+	o.keyspace = "test"
 	cf.EXPECT().Get(gomock.Any(), "test", "abc").Return(nil, errors.New("abc"))
 	require.NotNil(t, o.run(cmd))
 }

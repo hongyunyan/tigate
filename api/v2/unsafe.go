@@ -14,13 +14,16 @@
 package v2
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/pingcap/log"
+	"github.com/pingcap/ticdc/api/middleware"
 	"github.com/pingcap/ticdc/logservice/txnutil"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/txnutil/gc"
-	"github.com/tikv/client-go/v2/tikv"
+	"go.uber.org/zap"
 )
 
 // CDCMetaData returns all etcd key values used by cdc
@@ -47,15 +50,23 @@ func (h *OpenAPIV2) ResolveLock(c *gin.Context) {
 		_ = c.Error(cerror.ErrAPIInvalidParam.Wrap(err))
 		return
 	}
-	kvStorage := h.server.GetKVStorage()
 
-	if kvStorage == nil {
-		c.Status(http.StatusServiceUnavailable)
-		return
-	}
+	// The ctx's lifecycle is the same as the HTTP request.
+	// The schema store may use the context to fetch database information asynchronously.
+	// Therefore, we cannot use the context of the HTTP request.
+	// We create a new context here.
+	schemaCxt := context.Background()
+	keyspaceMeta := middleware.GetKeyspaceFromContext(c)
 
-	txnResolver := txnutil.NewLockerResolver(kvStorage.(tikv.Storage))
-	if err := txnResolver.Resolve(c, resolveLockReq.RegionID, resolveLockReq.Ts); err != nil {
+	txnResolver := txnutil.NewLockerResolver()
+	if err := txnResolver.Resolve(schemaCxt, keyspaceMeta.Id, resolveLockReq.RegionID, resolveLockReq.Ts); err != nil {
+		log.Error(
+			"resolve lock failed",
+			zap.Uint32("keyspaceID", keyspaceMeta.Id),
+			zap.Uint64("regionID", resolveLockReq.RegionID),
+			zap.Uint64("resolveLockTs", resolveLockReq.Ts),
+			zap.Error(err),
+		)
 		_ = c.Error(err)
 		return
 	}
@@ -72,8 +83,14 @@ func (h *OpenAPIV2) DeleteServiceGcSafePoint(c *gin.Context) {
 	pdClient := h.server.GetPdClient()
 	defer pdClient.Close()
 
-	err := gc.RemoveServiceGCSafepoint(c, pdClient,
-		h.server.GetEtcdClient().GetGCServiceID())
+	keyspaceMeta := middleware.GetKeyspaceFromContext(c)
+
+	err := gc.UnifyDeleteGcSafepoint(
+		c,
+		pdClient,
+		keyspaceMeta.Id,
+		h.server.GetEtcdClient().GetGCServiceID(),
+	)
 	if err != nil {
 		_ = c.Error(cerror.WrapError(cerror.ErrInternalServerError, err))
 	}

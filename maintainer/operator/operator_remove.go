@@ -19,6 +19,7 @@ import (
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/maintainer/replica"
+	"github.com/pingcap/ticdc/maintainer/span"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/messaging"
 	"github.com/pingcap/ticdc/pkg/node"
@@ -29,15 +30,18 @@ import (
 // removeDispatcherOperator is an operator to remove a table span from a dispatcher
 // and remove it from the replication db
 type removeDispatcherOperator struct {
-	replicaSet *replica.SpanReplication
-	finished   atomic.Bool
-	db         *replica.ReplicationDB
+	replicaSet     *replica.SpanReplication
+	finished       atomic.Bool
+	spanController *span.Controller
+
+	sendThrottler sendThrottler
 }
 
-func newRemoveDispatcherOperator(db *replica.ReplicationDB, replicaSet *replica.SpanReplication) *removeDispatcherOperator {
+func newRemoveDispatcherOperator(spanController *span.Controller, replicaSet *replica.SpanReplication) *removeDispatcherOperator {
 	return &removeDispatcherOperator{
-		replicaSet: replicaSet,
-		db:         db,
+		replicaSet:     replicaSet,
+		spanController: spanController,
+		sendThrottler:  newSendThrottler(),
 	}
 }
 
@@ -52,10 +56,14 @@ func (m *removeDispatcherOperator) Check(from node.ID, status *heartbeatpb.Table
 }
 
 func (m *removeDispatcherOperator) Schedule() *messaging.TargetMessage {
+	if !m.sendThrottler.shouldSend() {
+		return nil
+	}
+
 	return m.replicaSet.NewRemoveDispatcherMessage(m.replicaSet.GetNodeID())
 }
 
-// OnNodeRemove is called when node offline, and the replicaset must already move to absent status and will be scheduled again
+// OnNodeRemove is called when node offline, and the replicaset has been removed from spanController, so it's ok.
 func (m *removeDispatcherOperator) OnNodeRemove(n node.ID) {
 	if n == m.replicaSet.GetNodeID() {
 		m.finished.Store(true)
@@ -77,7 +85,6 @@ func (m *removeDispatcherOperator) IsFinished() bool {
 
 func (m *removeDispatcherOperator) OnTaskRemoved() {
 	panic("unreachable")
-	// m.finished.Store(true)
 }
 
 func (m *removeDispatcherOperator) Start() {
@@ -98,4 +105,8 @@ func (m *removeDispatcherOperator) String() string {
 
 func (m *removeDispatcherOperator) Type() string {
 	return "remove"
+}
+
+func (m *removeDispatcherOperator) BlockTsForward() bool {
+	return false
 }

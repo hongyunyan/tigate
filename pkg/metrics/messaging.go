@@ -24,7 +24,7 @@ var (
 			Subsystem: "messaging",
 			Name:      "send_message_counter",
 			Help:      "The counter of messages sent by a message center",
-		}, []string{"target", "type"}) // target: its addr, type: event, command
+		}, []string{"type"}) // target: its addr, type: event, command
 
 	MessagingReceiveMsgCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -32,7 +32,7 @@ var (
 			Subsystem: "messaging",
 			Name:      "receive_message_counter",
 			Help:      "The counter of messages received by a message center",
-		}, []string{"target", "type"}) // target: its addr, type: event, command
+		}, []string{"type"}) // target: its addr, type: event, command
 
 	MessagingDropMsgCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -40,7 +40,7 @@ var (
 			Subsystem: "messaging",
 			Name:      "drop_message_counter",
 			Help:      "The counter of messages dropped by a message center",
-		}, []string{"target", "type"}) // target: its addr, type: event, command
+		}, []string{"type"}) // target: its addr, type: event, command
 
 	MessagingErrorCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -48,7 +48,7 @@ var (
 			Subsystem: "messaging",
 			Name:      "error_counter",
 			Help:      "The counter of errors occurred in a message center",
-		}, []string{"target", "type", "message"}) // target: its addr, type: event, command, message: error info
+		}, []string{"type", "message"}) // type: event, command, message: error info
 	MessagingStreamGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "ticdc",
@@ -64,14 +64,23 @@ var (
 			Name:      "receive_channel_length",
 			Help:      "The length of the receive channel in a message center",
 		}, []string{"type"}) // type: event, command
+
+	MessagingSlowHandleCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "messaging",
+			Name:      "slow_handle_counter",
+			Help:      "The counter of messages that took more than 100ms to handle",
+		}, []string{"type"}) // type: message type
 )
 
 // InitMetrics registers all metrics used in owner
-func InitMessagingMetrics(registry *prometheus.Registry) {
+func initMessagingMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(MessagingSendMsgCounter)
 	registry.MustRegister(MessagingReceiveMsgCounter)
 	registry.MustRegister(MessagingDropMsgCounter)
 	registry.MustRegister(MessagingErrorCounter)
 	registry.MustRegister(MessagingStreamGauge)
 	registry.Register(MessagingReceiveChannelLength)
+	registry.MustRegister(MessagingSlowHandleCounter)
 }

@@ -17,14 +17,14 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/pingcap/ticdc/pkg/api"
+	bf "github.com/pingcap/ticdc/pkg/binlog-filter"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/integrity"
+	"github.com/pingcap/ticdc/pkg/security"
 	"github.com/pingcap/ticdc/pkg/util"
-	"github.com/pingcap/tiflow/cdc/model"
-	bf "github.com/pingcap/tiflow/pkg/binlog-filter"
-	"github.com/pingcap/tiflow/pkg/integrity"
-	"github.com/pingcap/tiflow/pkg/security"
 )
 
 // EmptyResponse return empty {} to http client
@@ -93,13 +93,13 @@ type PDConfig struct {
 
 // ChangefeedCommonInfo holds some common usage information of a changefeed
 type ChangefeedCommonInfo struct {
-	UpstreamID     uint64              `json:"upstream_id"`
-	ID             string              `json:"id"`
-	Namespace      string              `json:"namespace"`
-	FeedState      model.FeedState     `json:"state"`
-	CheckpointTSO  uint64              `json:"checkpoint_tso"`
-	CheckpointTime model.JSONTime      `json:"checkpoint_time"`
-	RunningError   *model.RunningError `json:"error"`
+	UpstreamID     uint64               `json:"upstream_id"`
+	ID             string               `json:"id"`
+	Keyspace       string               `json:"keyspace"`
+	FeedState      config.FeedState     `json:"state"`
+	CheckpointTSO  uint64               `json:"checkpoint_tso"`
+	CheckpointTime api.JSONTime         `json:"checkpoint_time"`
+	RunningError   *config.RunningError `json:"error"`
 }
 
 // SyncedStatusConfig represents synced check interval config for a changefeed
@@ -118,11 +118,11 @@ func (c ChangefeedCommonInfo) MarshalJSON() ([]byte, error) {
 	// alias the original type to prevent recursive call of MarshalJSON
 	type Alias ChangefeedCommonInfo
 
-	if c.FeedState == model.StateUnInitialized {
-		c.FeedState = model.StateNormal
+	if c.FeedState == config.StateUnInitialized {
+		c.FeedState = config.StateNormal
 	}
-	if c.FeedState == model.StatePending {
-		c.FeedState = model.StateWarning
+	if c.FeedState == config.StatePending {
+		c.FeedState = config.StateWarning
 	}
 
 	return json.Marshal(struct {
@@ -134,7 +134,7 @@ func (c ChangefeedCommonInfo) MarshalJSON() ([]byte, error) {
 
 // ChangefeedConfig use by create changefeed api
 type ChangefeedConfig struct {
-	Namespace     string         `json:"namespace"`
+	Keyspace      string         `json:"keyspace"`
 	ID            string         `json:"changefeed_id"`
 	StartTs       uint64         `json:"start_ts"`
 	TargetTs      uint64         `json:"target_ts"`
@@ -145,7 +145,7 @@ type ChangefeedConfig struct {
 
 // ProcessorCommonInfo holds the common info of a processor
 type ProcessorCommonInfo struct {
-	Namespace    string `json:"namespace"`
+	Keyspace     string `json:"keyspace"`
 	ChangeFeedID string `json:"changefeed_id"`
 	CaptureID    string `json:"capture_id"`
 }
@@ -193,8 +193,8 @@ type ReplicaConfig struct {
 	EnableTableMonitor    *bool  `json:"enable_table_monitor,omitempty"`
 	BDRMode               *bool  `json:"bdr_mode,omitempty"`
 
-	SyncPointInterval  *JSONDuration `json:"sync_point_interval,omitempty" swaggertype:"string"`
-	SyncPointRetention *JSONDuration `json:"sync_point_retention,omitempty" swaggertype:"string"`
+	SyncPointInterval  *JSONDuration `json:"sync_point_interval,omitempty"`
+	SyncPointRetention *JSONDuration `json:"sync_point_retention,omitempty"`
 
 	Filter                       *FilterConfig              `json:"filter"`
 	Mounter                      *MounterConfig             `json:"mounter"`
@@ -295,6 +295,7 @@ func (c *ReplicaConfig) toInternalReplicaConfigWithOriginConfig(
 				BinaryEncodingMethod: c.Sink.CSVConfig.BinaryEncodingMethod,
 				OutputOldValue:       c.Sink.CSVConfig.OutputOldValue,
 				OutputHandleKey:      c.Sink.CSVConfig.OutputHandleKey,
+				OutputFieldHeader:    c.Sink.CSVConfig.OutputFieldHeader,
 			}
 		}
 		var pulsarConfig *config.PulsarConfig
@@ -464,7 +465,6 @@ func (c *ReplicaConfig) toInternalReplicaConfigWithOriginConfig(
 			DateSeparator:                    c.Sink.DateSeparator,
 			EnablePartitionSeparator:         c.Sink.EnablePartitionSeparator,
 			FileIndexWidth:                   c.Sink.FileIndexWidth,
-			EnableKafkaSinkV2:                c.Sink.EnableKafkaSinkV2,
 			OnlyOutputUpdatedColumns:         c.Sink.OnlyOutputUpdatedColumns,
 			DeleteOnlyOutputHandleKeyColumns: c.Sink.DeleteOnlyOutputHandleKeyColumns,
 			ContentCompatible:                c.Sink.ContentCompatible,
@@ -510,10 +510,15 @@ func (c *ReplicaConfig) toInternalReplicaConfigWithOriginConfig(
 	}
 	if c.Scheduler != nil {
 		res.Scheduler = &config.ChangefeedSchedulerConfig{
-			EnableTableAcrossNodes: c.Scheduler.EnableTableAcrossNodes,
-			RegionThreshold:        c.Scheduler.RegionThreshold,
-			WriteKeyThreshold:      c.Scheduler.WriteKeyThreshold,
-			SplitNumberPerNode:     c.Scheduler.SplitNumberPerNode,
+			EnableTableAcrossNodes:     c.Scheduler.EnableTableAcrossNodes,
+			RegionThreshold:            c.Scheduler.RegionThreshold,
+			RegionCountPerSpan:         c.Scheduler.RegionCountPerSpan,
+			WriteKeyThreshold:          c.Scheduler.WriteKeyThreshold,
+			SchedulingTaskCountPerNode: c.Scheduler.SchedulingTaskCountPerNode,
+			EnableSplittableCheck:      c.Scheduler.EnableSplittableCheck,
+			BalanceScoreThreshold:      c.Scheduler.BalanceScoreThreshold,
+			MinTrafficPercentage:       c.Scheduler.MinTrafficPercentage,
+			MaxTrafficPercentage:       c.Scheduler.MaxTrafficPercentage,
 		}
 	}
 	if c.Integrity != nil {
@@ -600,6 +605,7 @@ func ToAPIReplicaConfig(c *config.ReplicaConfig) *ReplicaConfig {
 				BinaryEncodingMethod: cloned.Sink.CSVConfig.BinaryEncodingMethod,
 				OutputOldValue:       cloned.Sink.CSVConfig.OutputOldValue,
 				OutputHandleKey:      cloned.Sink.CSVConfig.OutputHandleKey,
+				OutputFieldHeader:    cloned.Sink.CSVConfig.OutputFieldHeader,
 			}
 		}
 		var kafkaConfig *KafkaConfig
@@ -767,7 +773,6 @@ func ToAPIReplicaConfig(c *config.ReplicaConfig) *ReplicaConfig {
 			DateSeparator:                    cloned.Sink.DateSeparator,
 			EnablePartitionSeparator:         cloned.Sink.EnablePartitionSeparator,
 			FileIndexWidth:                   cloned.Sink.FileIndexWidth,
-			EnableKafkaSinkV2:                cloned.Sink.EnableKafkaSinkV2,
 			OnlyOutputUpdatedColumns:         cloned.Sink.OnlyOutputUpdatedColumns,
 			DeleteOnlyOutputHandleKeyColumns: cloned.Sink.DeleteOnlyOutputHandleKeyColumns,
 			ContentCompatible:                cloned.Sink.ContentCompatible,
@@ -834,10 +839,15 @@ func ToAPIReplicaConfig(c *config.ReplicaConfig) *ReplicaConfig {
 	}
 	if cloned.Scheduler != nil {
 		res.Scheduler = &ChangefeedSchedulerConfig{
-			EnableTableAcrossNodes: cloned.Scheduler.EnableTableAcrossNodes,
-			RegionThreshold:        cloned.Scheduler.RegionThreshold,
-			WriteKeyThreshold:      cloned.Scheduler.WriteKeyThreshold,
-			SplitNumberPerNode:     cloned.Scheduler.SplitNumberPerNode,
+			EnableTableAcrossNodes:     cloned.Scheduler.EnableTableAcrossNodes,
+			RegionThreshold:            cloned.Scheduler.RegionThreshold,
+			RegionCountPerSpan:         cloned.Scheduler.RegionCountPerSpan,
+			WriteKeyThreshold:          cloned.Scheduler.WriteKeyThreshold,
+			SchedulingTaskCountPerNode: cloned.Scheduler.SchedulingTaskCountPerNode,
+			EnableSplittableCheck:      cloned.Scheduler.EnableSplittableCheck,
+			BalanceScoreThreshold:      cloned.Scheduler.BalanceScoreThreshold,
+			MinTrafficPercentage:       cloned.Scheduler.MinTrafficPercentage,
+			MaxTrafficPercentage:       cloned.Scheduler.MaxTrafficPercentage,
 		}
 	}
 
@@ -945,17 +955,18 @@ type Table struct {
 // SinkConfig represents sink config for a changefeed
 // This is a duplicate of config.SinkConfig
 type SinkConfig struct {
-	Protocol                         *string             `json:"protocol,omitempty"`
-	SchemaRegistry                   *string             `json:"schema_registry,omitempty"`
-	CSVConfig                        *CSVConfig          `json:"csv,omitempty"`
-	DispatchRules                    []*DispatchRule     `json:"dispatchers,omitempty"`
-	ColumnSelectors                  []*ColumnSelector   `json:"column_selectors,omitempty"`
-	TxnAtomicity                     *string             `json:"transaction_atomicity,omitempty"`
-	EncoderConcurrency               *int                `json:"encoder_concurrency,omitempty"`
-	Terminator                       *string             `json:"terminator,omitempty"`
-	DateSeparator                    *string             `json:"date_separator,omitempty"`
-	EnablePartitionSeparator         *bool               `json:"enable_partition_separator,omitempty"`
-	FileIndexWidth                   *int                `json:"file_index_width,omitempty"`
+	Protocol                 *string           `json:"protocol,omitempty"`
+	SchemaRegistry           *string           `json:"schema_registry,omitempty"`
+	CSVConfig                *CSVConfig        `json:"csv,omitempty"`
+	DispatchRules            []*DispatchRule   `json:"dispatchers,omitempty"`
+	ColumnSelectors          []*ColumnSelector `json:"column_selectors,omitempty"`
+	TxnAtomicity             *string           `json:"transaction_atomicity,omitempty"`
+	EncoderConcurrency       *int              `json:"encoder_concurrency,omitempty"`
+	Terminator               *string           `json:"terminator,omitempty"`
+	DateSeparator            *string           `json:"date_separator,omitempty"`
+	EnablePartitionSeparator *bool             `json:"enable_partition_separator,omitempty"`
+	FileIndexWidth           *int              `json:"file_index_width,omitempty"`
+	// deprecated: it's become useless since v9.0.0
 	EnableKafkaSinkV2                *bool               `json:"enable_kafka_sink_v2,omitempty"`
 	OnlyOutputUpdatedColumns         *bool               `json:"only_output_updated_columns,omitempty"`
 	DeleteOnlyOutputHandleKeyColumns *bool               `json:"delete_only_output_handle_key_columns"`
@@ -985,6 +996,7 @@ type CSVConfig struct {
 	BinaryEncodingMethod string `json:"binary_encoding_method"`
 	OutputOldValue       bool   `json:"output_old_value"`
 	OutputHandleKey      bool   `json:"output_handle_key"`
+	OutputFieldHeader    bool   `json:"output_field_header"`
 }
 
 // LargeMessageHandleConfig denotes the large message handling config
@@ -1040,13 +1052,27 @@ type ConsistentMemoryUsage struct {
 type ChangefeedSchedulerConfig struct {
 	// EnableTableAcrossNodes set true to split one table to multiple spans and
 	// distribute to multiple TiCDC nodes.
-	EnableTableAcrossNodes bool `toml:"enable_table_across_nodes" json:"enable_table_across_nodes"`
+	EnableTableAcrossNodes bool `json:"enable_table_across_nodes"`
 	// RegionThreshold is the region count threshold of splitting a table.
-	RegionThreshold int `toml:"region_threshold" json:"region_threshold"`
+	RegionThreshold int `json:"region_threshold"`
+	// RegionCountPerSpan is the maximax region count for each span when first splitted by RegionCountSpliiter
+	RegionCountPerSpan int `json:"region_count_per_span"`
 	// WriteKeyThreshold is the written keys threshold of splitting a table.
-	WriteKeyThreshold int `toml:"write_key_threshold" json:"write_key_threshold"`
-	// SplitNumberPerNode is the number of splits per node.
-	SplitNumberPerNode int `toml:"split_number_per_node" json:"split_number_per_node"`
+	WriteKeyThreshold int `json:"write_key_threshold"`
+	// SchedulingTaskCountPerNode is the upper limit for scheduling tasks each node.
+	SchedulingTaskCountPerNode int `json:"scheduling_task_count_per_node"`
+	// EnableSplittableCheck controls whether to check if a table is splittable before splitting.
+	// If true, only tables with primary key and no unique key can be split.
+	// If false, all tables can be split without checking.
+	// For MySQL downstream, this is always set to true for data consistency.
+	EnableSplittableCheck bool `json:"enable_splittable_check"`
+	// These config is used for adjust the frequency of balancing traffic.
+	// BalanceScoreThreshold is the score threshold for balancing traffic. Larger value means less frequent balancing.
+	BalanceScoreThreshold int `json:"balance_score_threshold"`
+	// MinTrafficPercentage is the minimum traffic percentage for balancing traffic. Larger value means less frequent balancing.
+	MinTrafficPercentage float64 `json:"min_traffic_percentage"`
+	// MaxTrafficPercentage is the maximum traffic percentage for balancing traffic. Less value means less frequent balancing.
+	MaxTrafficPercentage float64 `json:"max_traffic_percentage"`
 }
 
 // IntegrityConfig is the config for integrity check
@@ -1073,7 +1099,7 @@ type ResolveLockReq struct {
 type ChangeFeedInfo struct {
 	UpstreamID uint64    `json:"upstream_id,omitempty"`
 	ID         string    `json:"id"`
-	Namespace  string    `json:"namespace"`
+	Keyspace   string    `json:"keyspace"`
 	SinkURI    string    `json:"sink_uri,omitempty"`
 	CreateTime time.Time `json:"create_time"`
 	// Start sync at this commit ts if `StartTs` is specify or using the CreateTime of changefeed.
@@ -1081,16 +1107,16 @@ type ChangeFeedInfo struct {
 	// The ChangeFeed will exits until sync to timestamp TargetTs
 	TargetTs uint64 `json:"target_ts,omitempty"`
 	// used for admin job notification, trigger watch event in capture
-	AdminJobType   model.AdminJobType `json:"admin_job_type,omitempty"`
-	Config         *ReplicaConfig     `json:"config,omitempty"`
-	State          model.FeedState    `json:"state,omitempty"`
-	Error          *RunningError      `json:"error,omitempty"`
-	CreatorVersion string             `json:"creator_version,omitempty"`
+	AdminJobType   config.AdminJobType  `json:"admin_job_type,omitempty"`
+	Config         *ReplicaConfig       `json:"config,omitempty"`
+	State          config.FeedState     `json:"state,omitempty"`
+	Error          *config.RunningError `json:"error,omitempty"`
+	CreatorVersion string               `json:"creator_version,omitempty"`
 
-	ResolvedTs     uint64                    `json:"resolved_ts"`
-	CheckpointTs   uint64                    `json:"checkpoint_ts"`
-	CheckpointTime model.JSONTime            `json:"checkpoint_time"`
-	TaskStatus     []model.CaptureTaskStatus `json:"task_status,omitempty"`
+	ResolvedTs     uint64                     `json:"resolved_ts"`
+	CheckpointTs   uint64                     `json:"checkpoint_ts"`
+	CheckpointTime api.JSONTime               `json:"checkpoint_time"`
+	TaskStatus     []config.CaptureTaskStatus `json:"task_status,omitempty"`
 
 	GID            common.GID `json:"gid"`
 	MaintainerAddr string     `json:"maintainer_addr,omitempty"`
@@ -1098,21 +1124,12 @@ type ChangeFeedInfo struct {
 
 // SyncedStatus describes the detail of a changefeed's synced status
 type SyncedStatus struct {
-	Synced           bool           `json:"synced"`
-	SinkCheckpointTs model.JSONTime `json:"sink_checkpoint_ts"`
-	PullerResolvedTs model.JSONTime `json:"puller_resolved_ts"`
-	LastSyncedTs     model.JSONTime `json:"last_synced_ts"`
-	NowTs            model.JSONTime `json:"now_ts"`
-	Info             string         `json:"info"`
-}
-
-// RunningError represents some running error from cdc components,
-// such as processor.
-type RunningError struct {
-	Time    *time.Time `json:"time,omitempty"`
-	Addr    string     `json:"addr"`
-	Code    string     `json:"code"`
-	Message string     `json:"message"`
+	Synced           bool         `json:"synced"`
+	SinkCheckpointTs api.JSONTime `json:"sink_checkpoint_ts"`
+	PullerResolvedTs api.JSONTime `json:"puller_resolved_ts"`
+	LastSyncedTs     api.JSONTime `json:"last_synced_ts"`
+	NowTs            api.JSONTime `json:"now_ts"`
+	Info             string       `json:"info"`
 }
 
 // toCredential generates a security.Credential from a PDConfig
@@ -1166,26 +1183,22 @@ type ProcessorDetail struct {
 	Tables []int64 `json:"table_ids"`
 }
 
-// Liveness is the liveness status of a capture.
-// Liveness can only be changed from alive to stopping, and no way back.
-type Liveness int32
-
 // ServerStatus holds some common information of a server
 type ServerStatus struct {
-	Version   string   `json:"version"`
-	GitHash   string   `json:"git_hash"`
-	ID        string   `json:"id"`
-	ClusterID string   `json:"cluster_id"`
-	Pid       int      `json:"pid"`
-	IsOwner   bool     `json:"is_owner"`
-	Liveness  Liveness `json:"liveness"`
+	Version   string       `json:"version"`
+	GitHash   string       `json:"git_hash"`
+	ID        string       `json:"id"`
+	ClusterID string       `json:"cluster_id"`
+	Pid       int          `json:"pid"`
+	IsOwner   bool         `json:"is_owner"`
+	Liveness  api.Liveness `json:"liveness"`
 }
 
 // Capture holds common information of a capture in cdc
 type Capture struct {
 	ID string `json:"id"`
 	// IsCoordinator is true if the capture is the coordinator of the TiCDC cluster
-	// We make its json key as `is_owner` to keep the compatibility with old TiCDC.
+	// We make its json key as `is-owner` to keep the compatibility with old TiCDC.
 	IsCoordinator bool   `json:"is_owner"`
 	AdvertiseAddr string `json:"address"`
 	ClusterID     string `json:"cluster_id"`
@@ -1307,11 +1320,11 @@ type CloudStorageConfig struct {
 
 // ChangefeedStatus holds common information of a changefeed in cdc
 type ChangefeedStatus struct {
-	State        string        `json:"state,omitempty"`
-	ResolvedTs   uint64        `json:"resolved_ts"`
-	CheckpointTs uint64        `json:"checkpoint_ts"`
-	LastError    *RunningError `json:"last_error,omitempty"`
-	LastWarning  *RunningError `json:"last_warning,omitempty"`
+	State        string               `json:"state,omitempty"`
+	ResolvedTs   uint64               `json:"resolved_ts"`
+	CheckpointTs uint64               `json:"checkpoint_ts"`
+	LastError    *config.RunningError `json:"last_error,omitempty"`
+	LastWarning  *config.RunningError `json:"last_warning,omitempty"`
 }
 
 // GlueSchemaRegistryConfig represents a glue schema registry configuration

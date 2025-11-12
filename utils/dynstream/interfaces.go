@@ -20,11 +20,10 @@ import (
 	"time"
 )
 
-// The path interface. A path is a unique identifier of a destination.
+// Path is a unique identifier of a destination.
 type Path comparable
 
-// A path can only belong to an area. An area is a group of paths.
-// Area is normally a GID
+// Area manages a group of paths, usually a GID.
 type Area comparable
 
 // The timestamp an event carries. E.g. the commit TS of a DML.
@@ -44,6 +43,8 @@ type EventType struct {
 	// Events with different groups will not be processed in a group by the handler.
 	DataGroup int
 	Property  Property
+	// If the event is droppable, it means the event can be dropped by the memory control.
+	Droppable bool
 }
 
 func (t EventType) String() string {
@@ -86,8 +87,9 @@ func (p Property) String() string {
 
 // The handler interface. The handler processes the event.
 type Handler[A Area, P Path, T Event, D Dest] interface {
-	// Get the path of the event. This method is called once for each event.
+	// Path of the event. This method is called once for each event.
 	Path(event T) P
+
 	// Handle processes the event.
 	// The dest is included in the argument to avoid the requirement of another mapping to get the destination.
 	// If the events are processed successfully, it should return false.
@@ -98,37 +100,42 @@ type Handler[A Area, P Path, T Event, D Dest] interface {
 
 	// The methods below are optional.
 
-	// Get the size of the event. This method is called once for each event.
+	// GetSize get the size of the event. This method is called once for each event.
 	// You should return all the memory usage of the event, including the size of the event itself and the size of the data it carries.
 	// Return 0 by default implementation, if the size is not used.
 	//
 	// Used by the memory control.
 	GetSize(event T) int
-	// Returns the pause status from the upstream status.
+
+	// IsPaused Returns the pause status from the upstream status.
 	// DynamicStream sends feedbacks if the pause status of upstream is not equals to the local status.
 	//
 	// Used by the memory control, to decide whether we should send feedbacks to the upstream.
 	IsPaused(event T) bool
-	// Get the area of the path. This method is called once for each path.
+
+	// GetArea Get the area of the path. This method is called once for each path.
 	// Return zero by default implementation. I.e. all paths are in the default area.
 	//
 	// Used in deciding the handle priority of the events from different areas.
 	GetArea(path P, dest D) A
-	// Get the timestamp of the event. This method is called once for each event.
+
+	// GetTimestamp Get the timestamp of the event. This method is called once for each event.
 	// Events are processed in the order of the timestamps.
 	// Return zero by default implementation. In this case, the events are processed
 	// in the order of the arrival.
 	//
 	// Used in deciding the handle priority of the events from different paths in the same area.
 	GetTimestamp(event T) Timestamp
-	// Get the timestamp of the event. This method is called once for each event.
+
+	// GetType Get the type of the event. This method is called once for each event.
 	// Return zero by default implementation. I.e. all events are in the same type.
 	//
 	// Only the events with the same type are processed in a group.
 	GetType(event T) EventType
+
 	// OnDrop is called when an event is dropped. Could be caused by the memory control or cannot find the path.
 	// Do nothing by default implementation.
-	OnDrop(event T)
+	OnDrop(event T) interface{}
 }
 
 type PathAndDest[P Path, D Dest] struct {
@@ -137,7 +144,7 @@ type PathAndDest[P Path, D Dest] struct {
 }
 
 /*
-Dynamic stream is a stream that can process events with from different paths concurrently.
+DynamicStream is a stream that can process events with from different paths concurrently.
   - Events from the same path are processed sequentially.
   - Events from different paths are processed concurrently.
 
@@ -147,25 +154,24 @@ type DynamicStream[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]] inter
 	// Start starts the dynamic stream.
 	// It should be called before any other methods.
 	Start()
+
 	// Close closes the dynamic stream.
 	// No more events can be sent to or processed by the stream after it is closed.
 	Close()
 
-	// // In returns the channel to send events into the dynamic stream.
-	// In(path ...P) chan<- T
-	// // Wake returns the channel to mark the the path as ready to process the next event.
-	// Wake(path ...P) chan<- P
-
-	// In returns the channel to send events into the dynamic stream.
+	// Push an event to path.
 	Push(path P, event T)
-	// Wake returns the channel to mark the the path as ready to process the next event.
+
+	// Wake marks the path as ready to process the next event.
+	// It is used when the handler returns true in the Handle method.
 	Wake(path P)
 
 	// Feedback returns the channel to receive the feedbacks for the listener.
+	// Current the feedbacks are used for the memory control.
 	// Return nil if Option.EnableMemoryControl is false.
 	Feedback() <-chan Feedback[A, P, D]
 
-	// AddPaths add the path to the dynamic stream to receive the events.
+	// AddPath add the path to the dynamic stream to receive the events.
 	// An event of a path not already added will be dropped.
 	// Return ErrorTypeDuplicate if the path already exists.
 	AddPath(path P, dest D, area ...AreaSettings) error
@@ -175,15 +181,16 @@ type DynamicStream[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]] inter
 	// If the path doesn't exist, it will return ErrorTypeNotExist.
 	RemovePath(path P) error
 
+	// ReleasePath releases all the events of the path.
+	// After this call return, events in the path will be dropped.
+	Release(path P)
+
 	// SetAreaSettings sets the settings of the area. An area uses the default settings if it is not set.
 	// This method can be called at any time. But to avoid the memory leak, setting on a area without existing paths is a no-op.
 	SetAreaSettings(area A, settings AreaSettings)
 
-	GetMetrics() Metrics[A]
+	GetMetrics() Metrics[A, P]
 }
-
-// PathHasher is used to select target stream for the path.
-type PathHasher[P Path] func(path P) uint64
 
 const (
 	DefaultInputBufferSize   = 1024
@@ -233,37 +240,41 @@ func (o *Option) fix() {
 }
 
 type AreaSettings struct {
-	maxPendingSize   uint64        // The max memory usage of the pending events of the area. Must be larger than 0. By default 128 MB.
-	feedbackInterval time.Duration // The interval of sending feedbacks to the upstream. < 0 means no feedback. Must be larger than 0. By default 1 second.
-
+	component          string
+	maxPendingSize     uint64        // The max memory usage of the pending events of the area. Must be larger than 0. By default 1GB.
+	pathMaxPendingSize uint64        // The max memory usage of the pending events of the path. Must be larger than 0. By default 10% of the area max pending size.
+	feedbackInterval   time.Duration // The interval of the feedback. By default 1000ms.
 	// Remove it when we determine the v2 is working well.
-	algorithm string // The algorithm of the memory control. By default "v2".
+	algorithm int // The algorithm of the memory control.
 }
 
 func (s *AreaSettings) fix() {
 	if s.maxPendingSize <= 0 {
 		s.maxPendingSize = DefaultMaxPendingSize
 	}
+
 	if s.feedbackInterval == 0 {
 		s.feedbackInterval = DefaultFeedbackInterval
 	}
-	if s.algorithm == "" {
-		s.algorithm = "v1"
-	}
 }
 
-func NewAreaSettingsWithMaxPendingSize(size uint64, memoryControlAlgorithmVersion string) AreaSettings {
+func NewAreaSettingsWithMaxPendingSize(size uint64, memoryControlAlgorithm int, component string) AreaSettings {
+	// The path max pending size is at least 1MB.
+	pathMaxPendingSize := max(size/10, 1*1024*1024)
+
 	return AreaSettings{
-		maxPendingSize:   size,
-		feedbackInterval: DefaultFeedbackInterval,
-		algorithm:        memoryControlAlgorithmVersion,
+		component:          component,
+		feedbackInterval:   DefaultFeedbackInterval,
+		maxPendingSize:     size,
+		pathMaxPendingSize: pathMaxPendingSize,
+		algorithm:          memoryControlAlgorithm,
 	}
 }
 
 type FeedbackType int
 
 const (
-	PausePath FeedbackType = iota
+	ReleasePath FeedbackType = iota
 	ResumePath
 	PauseArea
 	ResumeArea
@@ -271,8 +282,8 @@ const (
 
 func (f FeedbackType) String() string {
 	switch f {
-	case PausePath:
-		return "PausePath"
+	case ReleasePath:
+		return "ReleasePath"
 	case ResumePath:
 		return "ResumePath"
 	case PauseArea:
@@ -296,30 +307,19 @@ func (f *Feedback[A, P, D]) String() string {
 	return fmt.Sprintf("DynamicStream Feedback{Area: %v, Path: %v, FeedbackType: %s}", f.Area, f.Path, f.FeedbackType.String())
 }
 
-func NewDynamicStream[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]](handler H, option ...Option) DynamicStream[A, P, T, D, H] {
+func NewParallelDynamicStream[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]](handler H, option ...Option) DynamicStream[A, P, T, D, H] {
 	opt := NewOption()
 	if len(option) > 0 {
 		opt = option[0]
 	}
-	opt.StreamCount = 1
-	// Since the there is only one stream, enable the buffer by default to avoid the blocking.
-	opt.UseBuffer = true
-	return newParallelDynamicStream(func(path P) uint64 { return 0 }, handler, opt)
+	return newParallelDynamicStream(handler, opt)
 }
 
-func NewParallelDynamicStream[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]](hasher PathHasher[P], handler H, option ...Option) DynamicStream[A, P, T, D, H] {
-	opt := NewOption()
-	if len(option) > 0 {
-		opt = option[0]
-	}
-	return newParallelDynamicStream(hasher, handler, opt)
-}
-
-type Metrics[A Area] struct {
+type Metrics[A Area, P Path] struct {
 	EventChanSize   int
 	PendingQueueLen int
 	AddPath         int
 	RemovePath      int
 
-	MemoryControl MemoryMetric[A]
+	MemoryControl MemoryMetric[A, P]
 }

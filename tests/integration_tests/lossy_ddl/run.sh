@@ -32,6 +32,10 @@ function check_lossy_ddl() {
 export -f check_lossy_ddl
 
 function run() {
+	# next-gen mode doesn't support lossy ddl
+	if [ "$NEXT_GEN" = 1 ]; then
+		return
+	fi
 	# Use blackhole sink to check if the DDL is lossy.
 	# So no need to run this test for other sinks.
 	if [ "$SINK_TYPE" != "storage" ]; then
@@ -46,7 +50,7 @@ function run() {
 	SINK_URI="blackhole://"
 
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --addr "127.0.0.1:8300" --pd $pd_addr
-	cdc cli changefeed create --pd=$pd_addr --sink-uri="$SINK_URI"
+	cdc_cli_changefeed create --pd=$pd_addr --sink-uri="$SINK_URI"
 
 	run_sql_file $CUR/data/prepare.sql ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 

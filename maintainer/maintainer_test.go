@@ -29,6 +29,7 @@ import (
 	appcontext "github.com/pingcap/ticdc/pkg/common/context"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
 	"github.com/pingcap/ticdc/pkg/config"
+	"github.com/pingcap/ticdc/pkg/eventservice"
 	"github.com/pingcap/ticdc/pkg/messaging"
 	"github.com/pingcap/ticdc/pkg/metrics"
 	"github.com/pingcap/ticdc/pkg/node"
@@ -299,11 +300,12 @@ func TestMaintainerSchedule(t *testing.T) {
 	mockPDClock := pdutil.NewClock4Test()
 	appcontext.SetService(appcontext.DefaultPDClock, mockPDClock)
 
-	schemaStore := &mockSchemaStore{tables: tables}
+	schemaStore := eventservice.NewMockSchemaStore()
+	schemaStore.SetTables(tables)
 	appcontext.SetService(appcontext.SchemaStore, schemaStore)
 
 	n := node.NewInfo("", "")
-	mc := messaging.NewMessageCenter(ctx, n.ID, 100, config.NewDefaultMessageCenterConfig(), nil)
+	mc := messaging.NewMessageCenter(ctx, n.ID, config.NewDefaultMessageCenterConfig(n.AdvertiseAddr), nil)
 	mc.Run(ctx)
 	defer mc.Close()
 	appcontext.SetService(appcontext.MessageCenter, mc)
@@ -311,7 +313,7 @@ func TestMaintainerSchedule(t *testing.T) {
 	nodeManager := watcher.NewNodeManager(nil, nil)
 	appcontext.SetService(watcher.NodeManagerName, nodeManager)
 	nodeManager.GetAliveNodes()[n.ID] = n
-	cfID := common.NewChangeFeedIDWithName("test")
+	cfID := common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceNamme)
 	dispatcherManager := MockDispatcherManager(mc, n.ID)
 
 	wg := &sync.WaitGroup{}
@@ -322,7 +324,6 @@ func TestMaintainerSchedule(t *testing.T) {
 	}()
 
 	taskScheduler := threadpool.NewThreadPoolDefault()
-	pdClock := pdutil.NewClock4Test()
 	maintainer := NewMaintainer(cfID,
 		&config.SchedulerConfig{
 			CheckBalanceInterval: config.TomlDuration(time.Minute),
@@ -330,7 +331,7 @@ func TestMaintainerSchedule(t *testing.T) {
 		},
 		&config.ChangeFeedInfo{
 			Config: config.GetDefaultReplicaConfig(),
-		}, n, taskScheduler, nil, pdClock, nil, 10, true)
+		}, n, taskScheduler, 10, true, common.DefaultKeyspaceID)
 
 	mc.RegisterHandler(messaging.MaintainerManagerTopic,
 		func(ctx context.Context, msg *messaging.TargetMessage) error {
@@ -354,11 +355,11 @@ func TestMaintainerSchedule(t *testing.T) {
 	}, time.Second*2, time.Millisecond*100)
 
 	require.Eventually(t, func() bool {
-		return maintainer.controller.replicationDB.GetReplicatingSize() == tableSize
+		return maintainer.controller.spanController.GetReplicatingSize() == tableSize
 	}, time.Second*2, time.Millisecond*100)
 
 	require.Eventually(t, func() bool {
-		return maintainer.controller.GetTaskSizeByNodeID(n.ID) == tableSize
+		return maintainer.controller.spanController.GetTaskSizeByNodeID(n.ID) == tableSize
 	}, time.Second*2, time.Millisecond*100)
 
 	maintainer.onRemoveMaintainer(false, false)

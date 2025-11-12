@@ -21,9 +21,10 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/pingcap/errors"
-	v2 "github.com/pingcap/tiflow/cdc/api/v2"
-	"github.com/pingcap/tiflow/cdc/model"
-	"github.com/pingcap/tiflow/pkg/api/v2/mock"
+	v2 "github.com/pingcap/ticdc/api/v2"
+	"github.com/pingcap/ticdc/pkg/api"
+	"github.com/pingcap/ticdc/pkg/api/v2/mock"
+	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,63 +40,63 @@ func TestChangefeedListCli(t *testing.T) {
 	cf.EXPECT().List(gomock.Any(), gomock.Any(), gomock.Any()).Return([]v2.ChangefeedCommonInfo{
 		{
 			UpstreamID:     1,
-			Namespace:      "default",
+			Keyspace:       "default",
 			ID:             "pending-1",
-			CheckpointTime: model.JSONTime{},
+			CheckpointTime: api.JSONTime{},
 			RunningError:   nil,
-			FeedState:      model.StateWarning,
+			FeedState:      config.StateWarning,
 		},
 		{
 			UpstreamID:     1,
-			Namespace:      "default",
+			Keyspace:       "default",
 			ID:             "normal-2",
-			CheckpointTime: model.JSONTime{},
+			CheckpointTime: api.JSONTime{},
 			RunningError:   nil,
-			FeedState:      model.StateNormal,
+			FeedState:      config.StateNormal,
 		},
 		{
 			UpstreamID:     1,
-			Namespace:      "default",
+			Keyspace:       "default",
 			ID:             "failed-3",
-			CheckpointTime: model.JSONTime{},
+			CheckpointTime: api.JSONTime{},
 			RunningError:   nil,
-			FeedState:      model.StateFailed,
+			FeedState:      config.StateFailed,
 		},
 		{
 			UpstreamID:     1,
-			Namespace:      "default",
+			Keyspace:       "default",
 			ID:             "removed-4",
-			CheckpointTime: model.JSONTime{},
+			CheckpointTime: api.JSONTime{},
 			RunningError:   nil,
-			FeedState:      model.StateRemoved,
+			FeedState:      config.StateRemoved,
 		},
 		{
 			UpstreamID:     1,
-			Namespace:      "default",
+			Keyspace:       "default",
 			ID:             "finished-5",
-			CheckpointTime: model.JSONTime{},
+			CheckpointTime: api.JSONTime{},
 			RunningError:   nil,
-			FeedState:      model.StateFinished,
+			FeedState:      config.StateFinished,
 		},
 		{
 			UpstreamID:     1,
-			Namespace:      "default",
+			Keyspace:       "default",
 			ID:             "stopped-6",
-			CheckpointTime: model.JSONTime{},
+			CheckpointTime: api.JSONTime{},
 			RunningError:   nil,
-			FeedState:      model.StateStopped,
+			FeedState:      config.StateStopped,
 		},
 		{
 			UpstreamID:     1,
-			Namespace:      "default",
+			Keyspace:       "default",
 			ID:             "warning-7",
-			CheckpointTime: model.JSONTime{},
+			CheckpointTime: api.JSONTime{},
 			RunningError:   nil,
-			FeedState:      model.StateStopped,
+			FeedState:      config.StateStopped,
 		},
 	}, nil).Times(2)
 	// when --all=false, should contains StateNormal, StateWarning, StateFailed, StateStopped changefeed
-	os.Args = []string{"list", "--all=false", "--namespace=default"}
+	os.Args = []string{"list", "--all=false", "--keyspace=default"}
 	require.Nil(t, cmd.Execute())
 	out, err := io.ReadAll(b)
 	require.Nil(t, err)
@@ -106,7 +107,7 @@ func TestChangefeedListCli(t *testing.T) {
 	require.Contains(t, string(out), "warning-7")
 
 	// when --all=true, should contains all changefeed
-	os.Args = []string{"list", "--all=true", "--namespace=default"}
+	os.Args = []string{"list", "--all=true", "--keyspace=default"}
 	require.Nil(t, cmd.Execute())
 	out, err = io.ReadAll(b)
 	require.Nil(t, err)

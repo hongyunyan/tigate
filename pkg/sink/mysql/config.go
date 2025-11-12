@@ -30,11 +30,9 @@ import (
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/config"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/security"
 	"github.com/pingcap/ticdc/pkg/util"
-	"github.com/pingcap/tidb/pkg/sessionctx/variable"
-	"github.com/pingcap/tiflow/pkg/security"
-	"github.com/pingcap/tiflow/pkg/sink"
-	pmysql "github.com/pingcap/tiflow/pkg/sink/mysql"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"go.uber.org/zap"
 )
 
@@ -85,9 +83,11 @@ const (
 	prepStmtCacheSize int = 16 * 1024
 
 	defaultHasVectorType = false
+
+	defaultEnableDDLTs = true
 )
 
-type MysqlConfig struct {
+type Config struct {
 	sinkURI                *url.URL
 	WorkerCount            int
 	MaxTxnRow              int
@@ -100,15 +100,16 @@ type MysqlConfig struct {
 	SafeMode               bool
 	Timezone               string
 	TLS                    string
-	ForceReplicate         bool
 
 	// retry number for dml
 	DMLMaxRetry uint64
 
 	IsTiDB bool // IsTiDB is true if the downstream is TiDB
-	// IsBDRModeSupported is true if the downstream is TiDB and write source is existed.
-	// write source exists when the downstream is TiDB and version is greater than or equal to v6.5.0.
-	IsWriteSourceExisted bool
+
+	// EnableDDLTs can be set in the sink URI to enable the DDL ts.
+	// it's default to true to make the mysql sink write DDL-ts
+	// for the consumer, set this to false.
+	EnableDDLTs bool
 
 	SourceID        uint64
 	BatchDMLEnable  bool
@@ -132,9 +133,9 @@ type MysqlConfig struct {
 	DryRunBlockInterval time.Duration
 }
 
-// NewConfig returns the default mysql backend config.
-func NewMysqlConfig() *MysqlConfig {
-	return &MysqlConfig{
+// New returns the default mysql backend config.
+func New() *Config {
+	return &Config{
 		WorkerCount:            DefaultWorkerCount,
 		MaxTxnRow:              DefaultMaxTxnRow,
 		MaxMultiUpdateRowCount: defaultMaxMultiUpdateRowCount,
@@ -150,13 +151,14 @@ func NewMysqlConfig() *MysqlConfig {
 		SourceID:               config.DefaultTiDBSourceID,
 		DMLMaxRetry:            8,
 		HasVectorType:          defaultHasVectorType,
+		EnableDDLTs:            defaultEnableDDLTs,
 	}
 }
 
-func (c *MysqlConfig) Apply(
+func (c *Config) Apply(
 	sinkURI *url.URL,
 	changefeedID common.ChangeFeedID,
-	config *config.ChangefeedConfig,
+	cfg *config.ChangefeedConfig,
 ) (err error) {
 	if sinkURI == nil {
 		log.Error("empty SinkURI")
@@ -164,7 +166,7 @@ func (c *MysqlConfig) Apply(
 	}
 	c.sinkURI = sinkURI
 	scheme := strings.ToLower(sinkURI.Scheme)
-	if !sink.IsMySQLCompatibleScheme(scheme) {
+	if !config.IsMySQLCompatibleScheme(scheme) {
 		return cerror.ErrMySQLInvalidConfig.GenWithStack("can't create MySQL sink with unsupported scheme: %s", scheme)
 	}
 	query := sinkURI.Query()
@@ -189,7 +191,7 @@ func (c *MysqlConfig) Apply(
 	if err = getSafeMode(query, &c.SafeMode); err != nil {
 		return err
 	}
-	if err = getTimezone(config.TimeZone, query, &c.Timezone); err != nil {
+	if err = getTimezone(cfg.TimeZone, query, &c.Timezone); err != nil {
 		return err
 	}
 	if err = getDuration(query, "read-timeout", &c.ReadTimeout); err != nil {
@@ -207,32 +209,45 @@ func (c *MysqlConfig) Apply(
 	if err = getMultiStmtEnable(query, &c.MultiStmtEnable); err != nil {
 		return err
 	}
+	if err = getHasVectorType(query, &c.HasVectorType); err != nil {
+		return err
+	}
+	if err = getCachePrepStmts(query, &c.CachePrepStmts); err != nil {
+		return err
+	}
+	if err = getEnableDDLTs(query, &c.EnableDDLTs); err != nil {
+		return err
+	}
 
 	// c.EnableOldValue = config.EnableOldValue
-	c.ForceReplicate = config.ForceReplicate
-	c.SourceID = config.SinkConfig.TiDBSourceID
-
+	// Note: The TiDBSourceID should never be 0 here, but we have found that
+	// in some problematic cases, the TiDBSourceID is 0 since something went wrong in the
+	// configuration process. So we need to check it here again.
+	// We do this is because it can cause the data to be inconsistent if the TiDBSourceID is 0
+	// in BDR Mode cluster.
+	if cfg.SinkConfig.TiDBSourceID == 0 {
+		log.Error("The TiDB source ID should never be set to 0. Please report it as a bug. The default value will be used: 1.",
+			zap.Uint64("tidbSourceID", cfg.SinkConfig.TiDBSourceID))
+		c.SourceID = config.DefaultTiDBSourceID
+	} else {
+		c.SourceID = cfg.SinkConfig.TiDBSourceID
+		log.Info("TiDB source ID is set", zap.Uint64("sourceID", c.SourceID))
+	}
 	return nil
 }
 
-func NewMySQLConfig(changefeedID common.ChangeFeedID, sinkURI *url.URL, config *config.ChangefeedConfig) (*MysqlConfig, error) {
-	cfg := NewMysqlConfig()
-	err := cfg.Apply(sinkURI, changefeedID, config)
-	if err != nil {
-		return nil, err
-	}
-	return cfg, nil
-}
-
-func NewMysqlConfigAndDB(ctx context.Context, changefeedID common.ChangeFeedID, sinkURI *url.URL, config *config.ChangefeedConfig) (*MysqlConfig, *sql.DB, error) {
+func NewMysqlConfigAndDB(
+	ctx context.Context, changefeedID common.ChangeFeedID, sinkURI *url.URL, config *config.ChangefeedConfig,
+) (*Config, *sql.DB, error) {
 	log.Info("create db connection", zap.String("sinkURI", sinkURI.String()))
 	// create db connection
-	cfg, err := NewMySQLConfig(changefeedID, sinkURI, config)
+	cfg := New()
+	err := cfg.Apply(sinkURI, changefeedID, config)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	dsnStr, err := GenerateDSN(cfg)
+	dsnStr, err := GenerateDSN(ctx, cfg)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -242,12 +257,7 @@ func NewMysqlConfigAndDB(ctx context.Context, changefeedID common.ChangeFeedID, 
 		return nil, nil, err
 	}
 
-	cfg.IsTiDB = CheckIsTiDB(ctx, db)
-
-	cfg.IsWriteSourceExisted, err = CheckIfBDRModeIsSupported(ctx, db)
-	if err != nil {
-		return nil, nil, err
-	}
+	cfg.HasVectorType = ShouldFormatVectorType(db, cfg)
 
 	// By default, cache-prep-stmts=true, an LRU cache is used for prepared statements,
 	// two connections are required to process a transaction.
@@ -269,7 +279,7 @@ func NewMysqlConfigAndDB(ctx context.Context, changefeedID common.ChangeFeedID, 
 	cachePrepStmts := cfg.CachePrepStmts
 	if cachePrepStmts {
 		// query the size of the prepared statement cache on serverside
-		maxPreparedStmtCount, err := pmysql.QueryMaxPreparedStmtCount(ctx, db)
+		maxPreparedStmtCount, err := queryMaxPreparedStmtCount(ctx, db)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -299,12 +309,12 @@ func NewMysqlConfigAndDB(ctx context.Context, changefeedID common.ChangeFeedID, 
 
 	cfg.CachePrepStmts = cachePrepStmts
 	cfg.SyncPointRetention = config.SyncPointRetention
-	cfg.MaxAllowedPacket, err = pmysql.QueryMaxAllowedPacket(ctx, db)
+	cfg.MaxAllowedPacket, err = queryMaxAllowedPacket(ctx, db)
 	if err != nil {
 		log.Warn("failed to query max_allowed_packet, use default value",
 			zap.String("changefeed", changefeedID.String()),
 			zap.Error(err))
-		cfg.MaxAllowedPacket = int64(variable.DefMaxAllowedPacket)
+		cfg.MaxAllowedPacket = int64(vardef.DefMaxAllowedPacket)
 	}
 	return cfg, db, nil
 }
@@ -316,7 +326,7 @@ func IsSinkSafeMode(sinkURI *url.URL, replicaConfig *config.ReplicaConfig) (bool
 	}
 
 	scheme := strings.ToLower(sinkURI.Scheme)
-	if !sink.IsMySQLCompatibleScheme(scheme) {
+	if !config.IsMySQLCompatibleScheme(scheme) {
 		return false, cerror.ErrMySQLInvalidConfig.GenWithStack("can't create MySQL sink with unsupported scheme: %s", scheme)
 	}
 	query := sinkURI.Query()
@@ -451,7 +461,7 @@ func getSSLCA(values url.Values, changefeedID common.ChangeFeedID, tls *string) 
 		return errors.Trace(err)
 	}
 
-	name := fmt.Sprintf("cdc_mysql_tls%s_%s", changefeedID.Namespace(), changefeedID.ID())
+	name := fmt.Sprintf("cdc_mysql_tls%s_%s", changefeedID.Keyspace(), changefeedID.ID())
 	err = dmysql.RegisterTLSConfig(name, tlsCfg)
 	if err != nil {
 		return cerror.ErrMySQLConnectionError.Wrap(err).GenWithStack("fail to open MySQL connection")
@@ -460,43 +470,8 @@ func getSSLCA(values url.Values, changefeedID common.ChangeFeedID, tls *string) 
 	return nil
 }
 
-// func getBatchReplaceEnable(values url.Values, batchReplaceEnabled *bool, batchReplaceSize *int) error {
-// 	s := values.Get("batch-replace-enable")
-// 	if len(s) > 0 {
-// 		enable, err := strconv.ParseBool(s)
-// 		if err != nil {
-// 			return cerror.WrapError(cerror.ErrMySQLInvalidConfig, err)
-// 		}
-// 		*batchReplaceEnabled = enable
-// 	}
-
-// 	if !*batchReplaceEnabled {
-// 		return nil
-// 	}
-
-// 	s = values.Get("batch-replace-size")
-// 	if len(s) == 0 {
-// 		return nil
-// 	}
-// 	size, err := strconv.Atoi(s)
-// 	if err != nil {
-// 		return cerror.WrapError(cerror.ErrMySQLInvalidConfig, err)
-// 	}
-// 	*batchReplaceSize = size
-// 	return nil
-// }
-
 func getSafeMode(values url.Values, safeMode *bool) error {
-	s := values.Get("safe-mode")
-	if len(s) == 0 {
-		return nil
-	}
-	enabled, err := strconv.ParseBool(s)
-	if err != nil {
-		return cerror.WrapError(cerror.ErrMySQLInvalidConfig, err)
-	}
-	*safeMode = enabled
-	return nil
+	return getBool(values, "safe-mode", safeMode)
 }
 
 func getTimezone(serverTimezone string, values url.Values, timezone *string) error {
@@ -547,25 +522,33 @@ func getDuration(values url.Values, key string, target *string) error {
 }
 
 func getBatchDMLEnable(values url.Values, batchDMLEnable *bool) error {
-	s := values.Get("batch-dml-enable")
-	if len(s) > 0 {
-		enable, err := strconv.ParseBool(s)
-		if err != nil {
-			return cerror.WrapError(cerror.ErrMySQLInvalidConfig, err)
-		}
-		*batchDMLEnable = enable
-	}
-	return nil
+	return getBool(values, "batch-dml-enable", batchDMLEnable)
 }
 
 func getMultiStmtEnable(values url.Values, multiStmtEnable *bool) error {
-	s := values.Get("multi-stmt-enable")
+	return getBool(values, "multi-stmt-enable", multiStmtEnable)
+}
+
+func getHasVectorType(values url.Values, hasVectorType *bool) error {
+	return getBool(values, "has-vector-type", hasVectorType)
+}
+
+func getCachePrepStmts(values url.Values, cachePrepStmts *bool) error {
+	return getBool(values, "cache-prep-stmts", cachePrepStmts)
+}
+
+func getEnableDDLTs(value url.Values, enableDDLTs *bool) error {
+	return getBool(value, "enable-ddl-ts", enableDDLTs)
+}
+
+func getBool(values url.Values, key string, target *bool) error {
+	s := values.Get(key)
 	if len(s) > 0 {
 		enable, err := strconv.ParseBool(s)
 		if err != nil {
 			return cerror.WrapError(cerror.ErrMySQLInvalidConfig, err)
 		}
-		*multiStmtEnable = enable
+		*target = enable
 	}
 	return nil
 }

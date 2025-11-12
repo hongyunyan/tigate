@@ -25,8 +25,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
-	"github.com/pingcap/tiflow/pkg/sink"
-	"github.com/pingcap/tiflow/pkg/util"
+	"github.com/pingcap/ticdc/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -118,7 +117,7 @@ func (l AtomicityLevel) validate(scheme string) error {
 		// Do nothing here to avoid modifying the persistence parameters.
 	case tableTxnAtomicity:
 		// MqSink only support `noneTxnAtomicity`.
-		if sink.IsMQScheme(scheme) {
+		if IsMQScheme(scheme) {
 			errMsg := fmt.Sprintf("%s level atomicity is not supported by %s scheme", l, scheme)
 			return cerror.ErrSinkURIInvalid.GenWithStackByArgs(errMsg)
 		}
@@ -152,8 +151,6 @@ type SinkConfig struct {
 	// FileIndexWidth is only available when the downstream is Storage
 	FileIndexWidth *int `toml:"file-index-digit,omitempty" json:"file-index-digit,omitempty"`
 
-	// EnableKafkaSinkV2 enabled then the kafka-go sink will be used.
-	// It is only available when the downstream is MQ.
 	EnableKafkaSinkV2 *bool `toml:"enable-kafka-sink-v2" json:"enable-kafka-sink-v2,omitempty"`
 
 	// OnlyOutputUpdatedColumns is only available when the downstream is MQ.
@@ -206,8 +203,8 @@ type SinkConfig struct {
 
 	CaseSensitive bool `toml:"case-sensitive" json:"case-sensitive"`
 	// Integrity is only available when the downstream is MQ.
-	Integrity      *Config `toml:"integrity" json:"integrity"`
-	ForceReplicate bool    `toml:"force-replicate" json:"force-replicate"`
+	Integrity      *IntegrityConfig `toml:"integrity" json:"integrity"`
+	ForceReplicate bool             `toml:"force-replicate" json:"force-replicate"`
 }
 
 // MaskSensitiveData masks sensitive data in SinkConfig
@@ -265,6 +262,8 @@ type CSVConfig struct {
 	OutputOldValue bool `toml:"output-old-value" json:"output-old-value"`
 	// output handle key
 	OutputHandleKey bool `toml:"output-handle-key" json:"output-handle-key"`
+	// output field header
+	OutputFieldHeader bool `toml:"output-field-header" json:"output-field-header"`
 }
 
 func (c *CSVConfig) validateAndAdjust() error {
@@ -413,6 +412,7 @@ type CodecConfig struct {
 	AvroDecimalHandlingMode        *string `toml:"avro-decimal-handling-mode" json:"avro-decimal-handling-mode,omitempty"`
 	AvroBigintUnsignedHandlingMode *string `toml:"avro-bigint-unsigned-handling-mode" json:"avro-bigint-unsigned-handling-mode,omitempty"`
 	EncodingFormat                 *string `toml:"encoding-format" json:"encoding-format,omitempty"`
+	OutputRowKey                   *bool   `toml:"output-row-key" json:"output-row-key,omitempty"`
 }
 
 // KafkaConfig represents a kafka sink configuration
@@ -712,8 +712,12 @@ func (s *SinkConfig) validateAndAdjust(sinkURI *url.URL) error {
 		return err
 	}
 
-	if sink.IsMySQLCompatibleScheme(sinkURI.Scheme) {
+	if IsMySQLCompatibleScheme(sinkURI.Scheme) {
 		return nil
+	}
+
+	if util.GetOrZero(s.EnableKafkaSinkV2) {
+		log.Warn("enable-kafka-sink-v2 is deprecated, still use the default kafka sink")
 	}
 
 	protocol, _ := ParseSinkProtocolFromString(util.GetOrZero(s.Protocol))
@@ -751,7 +755,7 @@ func (s *SinkConfig) validateAndAdjust(sinkURI *url.URL) error {
 		}
 	}
 
-	if sink.IsPulsarScheme(sinkURI.Scheme) && s.PulsarConfig == nil {
+	if IsPulsarScheme(sinkURI.Scheme) && s.PulsarConfig == nil {
 		s.PulsarConfig = &PulsarConfig{
 			SinkURI: sinkURI,
 		}
@@ -795,7 +799,7 @@ func (s *SinkConfig) validateAndAdjust(sinkURI *url.URL) error {
 	}
 
 	// validate storage sink related config
-	if sinkURI != nil && sink.IsStorageScheme(sinkURI.Scheme) {
+	if sinkURI != nil && IsStorageScheme(sinkURI.Scheme) {
 		// validate date separator
 		if len(util.GetOrZero(s.DateSeparator)) > 0 {
 			var separator DateSeparator
@@ -853,12 +857,12 @@ func (s *SinkConfig) validateAndAdjustSinkURI(sinkURI *url.URL) error {
 		zap.String("txnAtomicity", string(util.GetOrZero(s.TxnAtomicity))))
 
 	// Check that protocol config is compatible with the scheme.
-	if sink.IsMySQLCompatibleScheme(sinkURI.Scheme) && s.Protocol != nil {
+	if IsMySQLCompatibleScheme(sinkURI.Scheme) && s.Protocol != nil {
 		return cerror.ErrSinkURIInvalid.GenWithStackByArgs(fmt.Sprintf("protocol %s "+
 			"is incompatible with %s scheme", util.GetOrZero(s.Protocol), sinkURI.Scheme))
 	}
 	// For testing purposes, any protocol should be legal for blackhole.
-	if sink.IsMQScheme(sinkURI.Scheme) || sink.IsStorageScheme(sinkURI.Scheme) {
+	if IsMQScheme(sinkURI.Scheme) || IsStorageScheme(sinkURI.Scheme) {
 		return s.ValidateProtocol(sinkURI.Scheme)
 	}
 	return nil
@@ -892,9 +896,9 @@ func (s *SinkConfig) ValidateProtocol(scheme string) error {
 
 	outputRawChangeEvent := false
 	switch scheme {
-	case sink.KafkaScheme, sink.KafkaSSLScheme:
+	case KafkaScheme, KafkaSSLScheme:
 		outputRawChangeEvent = s.KafkaConfig.GetOutputRawChangeEvent()
-	case sink.PulsarScheme, sink.PulsarSSLScheme, sink.PulsarHTTPScheme, sink.PulsarHTTPSScheme:
+	case PulsarScheme, PulsarSSLScheme, PulsarHTTPScheme, PulsarHTTPSScheme:
 		outputRawChangeEvent = s.PulsarConfig.GetOutputRawChangeEvent()
 	default:
 		outputRawChangeEvent = s.CloudStorageConfig.GetOutputRawChangeEvent()

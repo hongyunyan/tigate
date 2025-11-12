@@ -14,81 +14,66 @@
 package helper
 
 import (
-	"context"
 	"net/url"
 	"strings"
-	"time"
 
-	"github.com/aws/aws-sdk-go/aws/client"
-	"github.com/aws/aws-sdk-go/aws/request"
+	commonType "github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/config"
-	cerror "github.com/pingcap/ticdc/pkg/errors"
-	"github.com/pingcap/tidb/br/pkg/storage"
-	"github.com/pingcap/tiflow/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/sink/codec/common"
+	"github.com/pingcap/ticdc/pkg/util"
 )
 
-// GetExternalStorageFromURI creates a new storage.ExternalStorage from a uri.
-func GetExternalStorageFromURI(
-	ctx context.Context, uri string,
-) (storage.ExternalStorage, error) {
-	return GetExternalStorage(ctx, uri, nil, DefaultS3Retryer())
+// DDLDispatchRule is the dispatch rule for DDL event.
+type DDLDispatchRule int
+
+const (
+	// PartitionZero means the DDL event will be dispatched to partition 0.
+	// NOTICE: Only for canal and canal-json protocol.
+	PartitionZero DDLDispatchRule = iota
+	// PartitionAll means the DDL event will be broadcast to all the partitions.
+	PartitionAll
+)
+
+func GetDDLDispatchRule(protocol config.Protocol) DDLDispatchRule {
+	switch protocol {
+	case config.ProtocolCanal, config.ProtocolCanalJSON:
+		return PartitionZero
+	default:
+	}
+	return PartitionAll
 }
 
-// GetExternalStorage creates a new storage.ExternalStorage based on the uri and options.
-func GetExternalStorage(
-	ctx context.Context, uri string,
-	opts *storage.BackendOptions,
-	retryer request.Retryer,
-) (storage.ExternalStorage, error) {
-	backEnd, err := storage.ParseBackend(uri, opts)
+// GetEncoderConfig returns the encoder config and validates the config.
+func GetEncoderConfig(
+	changefeedID commonType.ChangeFeedID,
+	sinkURI *url.URL,
+	protocol config.Protocol,
+	sinkConfig *config.SinkConfig,
+	maxMsgBytes int,
+) (*common.Config, error) {
+	encoderConfig := common.NewConfig(protocol)
+	if err := encoderConfig.Apply(sinkURI, sinkConfig); err != nil {
+		return nil, errors.WrapError(errors.ErrSinkInvalidConfig, err)
+	}
+	// Always set encoder's `MaxMessageBytes` equal to producer's `MaxMessageBytes`
+	// to prevent that the encoder generate batched message too large
+	// then cause producer meet `message too large`.
+	encoderConfig = encoderConfig.
+		WithMaxMessageBytes(maxMsgBytes).
+		WithChangefeedID(changefeedID)
+
+	tz, err := util.GetTimezone(config.GetGlobalServerConfig().TZ)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, errors.WrapError(errors.ErrSinkInvalidConfig, err)
+	}
+	encoderConfig.TimeZone = tz
+
+	if err = encoderConfig.Validate(); err != nil {
+		return nil, errors.WrapError(errors.ErrSinkInvalidConfig, err)
 	}
 
-	ret, err := storage.New(ctx, backEnd, &storage.ExternalStorageOptions{
-		SendCredentials: false,
-		S3Retryer:       retryer,
-	})
-	if err != nil {
-		retErr := errors.ErrFailToCreateExternalStorage.Wrap(errors.Trace(err))
-		return nil, retErr.GenWithStackByArgs("creating ExternalStorage for s3")
-	}
-
-	// Check the connection and ignore the returned bool value, since we don't care if the file exists.
-	_, err = ret.FileExists(ctx, "test")
-	if err != nil {
-		retErr := errors.ErrFailToCreateExternalStorage.Wrap(errors.Trace(err))
-		return nil, retErr.GenWithStackByArgs("creating ExternalStorage for s3")
-	}
-	return ret, nil
-}
-
-// retryerWithLog wraps the client.DefaultRetryer, and logs when retrying.
-type retryerWithLog struct {
-	client.DefaultRetryer
-}
-
-// DefaultS3Retryer is the default s3 retryer, maybe this function
-// should be extracted to another place.
-func DefaultS3Retryer() request.Retryer {
-	return retryerWithLog{
-		DefaultRetryer: client.DefaultRetryer{
-			NumMaxRetries:    3,
-			MinRetryDelay:    1 * time.Second,
-			MinThrottleDelay: 2 * time.Second,
-		},
-	}
-}
-
-// NewS3Retryer creates a new s3 retryer.
-func NewS3Retryer(maxRetries int, minRetryDelay, minThrottleDelay time.Duration) request.Retryer {
-	return retryerWithLog{
-		DefaultRetryer: client.DefaultRetryer{
-			NumMaxRetries:    maxRetries,
-			MinRetryDelay:    minRetryDelay,
-			MinThrottleDelay: minThrottleDelay,
-		},
-	}
+	return encoderConfig, nil
 }
 
 // GetTopic returns the topic name from the sink URI.
@@ -97,7 +82,7 @@ func GetTopic(sinkURI *url.URL) (string, error) {
 		return r == '/'
 	})
 	if topic == "" {
-		return "", cerror.ErrKafkaInvalidConfig.GenWithStack("no topic is specified in sink-uri")
+		return "", errors.ErrKafkaInvalidConfig.GenWithStack("no topic is specified in sink-uri")
 	}
 	return topic, nil
 }
@@ -106,7 +91,7 @@ func GetTopic(sinkURI *url.URL) (string, error) {
 func GetProtocol(protocolStr string) (config.Protocol, error) {
 	protocol, err := config.ParseSinkProtocolFromString(protocolStr)
 	if err != nil {
-		return protocol, cerror.WrapError(cerror.ErrKafkaInvalidConfig, err)
+		return protocol, errors.WrapError(errors.ErrKafkaInvalidConfig, err)
 	}
 
 	return protocol, nil

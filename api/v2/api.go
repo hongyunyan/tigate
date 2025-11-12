@@ -46,23 +46,31 @@ func RegisterOpenAPIV2Routes(router *gin.Engine, api OpenAPIV2) {
 
 	coordinatorMiddleware := middleware.ForwardToCoordinatorMiddleware(api.server)
 	authenticateMiddleware := middleware.AuthenticateMiddleware(api.server)
+	keyspaceCheckerMiddleware := middleware.KeyspaceCheckerMiddleware()
 	v2.GET("health", coordinatorMiddleware, api.ServerHealth)
 
 	// changefeed apis
 	changefeedGroup := v2.Group("/changefeeds")
-	changefeedGroup.GET("/:changefeed_id", coordinatorMiddleware, api.GetChangeFeed)
-	changefeedGroup.POST("", coordinatorMiddleware, authenticateMiddleware, api.CreateChangefeed)
-	changefeedGroup.GET("", coordinatorMiddleware, api.ListChangeFeeds)
-	changefeedGroup.PUT("/:changefeed_id", coordinatorMiddleware, authenticateMiddleware, api.UpdateChangefeed)
-	changefeedGroup.POST("/:changefeed_id/resume", coordinatorMiddleware, authenticateMiddleware, api.ResumeChangefeed)
-	changefeedGroup.POST("/:changefeed_id/pause", coordinatorMiddleware, authenticateMiddleware, api.PauseChangefeed)
-	changefeedGroup.DELETE("/:changefeed_id", coordinatorMiddleware, authenticateMiddleware, api.DeleteChangefeed)
-	changefeedGroup.GET("/:changefeed_id/synced", coordinatorMiddleware, authenticateMiddleware, api.syncState)
+	changefeedGroup.GET("/:changefeed_id", coordinatorMiddleware, keyspaceCheckerMiddleware, api.GetChangeFeed)
+	// The authenticateMiddleware will retire the KeyspaceMeta from the context,
+	// which is set by the keyspaceCheckerMiddleware.
+	// Therefore, the The authenticateMiddleware must be called after the keyspaceCheckerMiddleware.
+	changefeedGroup.POST("", coordinatorMiddleware, keyspaceCheckerMiddleware, authenticateMiddleware, api.CreateChangefeed)
+	changefeedGroup.GET("", coordinatorMiddleware, keyspaceCheckerMiddleware, api.ListChangeFeeds)
+	changefeedGroup.PUT("/:changefeed_id", coordinatorMiddleware, keyspaceCheckerMiddleware, authenticateMiddleware, api.UpdateChangefeed)
+	changefeedGroup.POST("/:changefeed_id/resume", coordinatorMiddleware, keyspaceCheckerMiddleware, authenticateMiddleware, api.ResumeChangefeed)
+	changefeedGroup.POST("/:changefeed_id/pause", coordinatorMiddleware, keyspaceCheckerMiddleware, authenticateMiddleware, api.PauseChangefeed)
+	changefeedGroup.DELETE("/:changefeed_id", coordinatorMiddleware, keyspaceCheckerMiddleware, authenticateMiddleware, api.DeleteChangefeed)
+	changefeedGroup.GET("/:changefeed_id/status", coordinatorMiddleware, keyspaceCheckerMiddleware, authenticateMiddleware, api.status)
+	changefeedGroup.GET("/:changefeed_id/synced", coordinatorMiddleware, keyspaceCheckerMiddleware, authenticateMiddleware, api.synced)
 
 	// internal APIs
-	changefeedGroup.POST("/:changefeed_id/move_table", authenticateMiddleware, api.MoveTable)
-	changefeedGroup.GET("/:changefeed_id/get_dispatcher_count", api.getDispatcherCount)
-	changefeedGroup.GET("/:changefeed_id/tables", api.ListTables)
+	changefeedGroup.POST("/:changefeed_id/move_table", keyspaceCheckerMiddleware, authenticateMiddleware, api.MoveTable)
+	changefeedGroup.POST("/:changefeed_id/move_split_table", keyspaceCheckerMiddleware, authenticateMiddleware, api.MoveSplitTable)
+	changefeedGroup.POST("/:changefeed_id/split_table_by_region_count", keyspaceCheckerMiddleware, authenticateMiddleware, api.SplitTableByRegionCount)
+	changefeedGroup.POST("/:changefeed_id/merge_table", keyspaceCheckerMiddleware, authenticateMiddleware, api.MergeTable)
+	changefeedGroup.GET("/:changefeed_id/get_dispatcher_count", keyspaceCheckerMiddleware, api.getDispatcherCount)
+	changefeedGroup.GET("/:changefeed_id/tables", keyspaceCheckerMiddleware, api.ListTables)
 
 	// capture apis
 	captureGroup := v2.Group("/captures")
@@ -89,7 +97,7 @@ func RegisterOpenAPIV2Routes(router *gin.Engine, api OpenAPIV2) {
 
 	// unsafe apis
 	unsafeGroup := v2.Group("/unsafe")
-	unsafeGroup.Use(coordinatorMiddleware, authenticateMiddleware)
+	unsafeGroup.Use(coordinatorMiddleware, keyspaceCheckerMiddleware, authenticateMiddleware)
 	unsafeGroup.GET("/metadata", api.CDCMetaData)
 	unsafeGroup.POST("/resolve_lock", api.ResolveLock)
 	unsafeGroup.DELETE("/service_gc_safepoint", api.DeleteServiceGcSafePoint)

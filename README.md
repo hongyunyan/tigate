@@ -1,5 +1,7 @@
-TiCDC
-====
+# TiCDC
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/pingcap/ticdc)
+
 TiCDC pulls change logs from TiDB clusters and pushes them to downstream systems, such as MySQL, TiDB, Kafka, Pulsar, and Object Storages (e.g., S3). Beginning from v9.0, we use this repository to build TiCDC instead of the old repository [tiflow](https://github.com/pingcap/tiflow). The new TiCDC in this repository has undergone a complete architectural redesign while retaining the same user interface. The architectural upgrade primarily aims to address certain drawbacks of TiCDC and propel it forward.
 
 * **Better scalability**. E.g. support over 1 million tables.
@@ -9,16 +11,31 @@ TiCDC pulls change logs from TiDB clusters and pushes them to downstream systems
 
 ## Quick Start
 
-### Find the latest tag
-Go to [pingcap/ticdc/tags](https://github.com/pingcap/ticdc/tags) to find the latest tag, e.g. `v9.0.0-alpha`
+### Obtaining TiCDC Nightly Build Download Links
 
-### Download the patch binary
-* For Linux x86-64: [https://tiup-mirrors.pingcap.com/cdc-**v9.0.0-alpha**-nightly-linux-amd64.tar.gz](https://tiup-mirrors.pingcap.com/cdc-v9.0.0-alpha-nightly-linux-amd64.tar.gz)
-* For Linux ARM64: [https://tiup-mirrors.pingcap.com/cdc-**v9.0.0-alpha**-nightly-linux-arm64.tar.gz](https://tiup-mirrors.pingcap.com/cdc-v9.0.0-alpha-nightly-linux-arm64.tar.gz)
-* For MacOS x86-64: [https://tiup-mirrors.pingcap.com/cdc-**v9.0.0-alpha**-nightly-darwin-amd64.tar.gz](https://tiup-mirrors.pingcap.com/cdc-v9.0.0-alpha-nightly-darwin-amd64.tar.gz)
-* For MacOS ARM64: [https://tiup-mirrors.pingcap.com/cdc-**v9.0.0-alpha**-nightly-darwin-arm64.tar.gz](https://tiup-mirrors.pingcap.com/cdc-v9.0.0-alpha-nightly-darwin-arm64.tar.gz)
+#### Construct the Download Link Manually
+
+1. Go to [pingcap/ticdc/tags](https://github.com/pingcap/ticdc/tags) to find the latest tag, e.g. `v9.0.0-beta.1.pre`
+2. Use the tag to build the download link for your platform: `https://tiup-mirrors.pingcap.com/cdc-${tag}-nightly-${os}-${arch}.tar.gz`, for example:
+    * For Linux x86-64: [https://tiup-mirrors.pingcap.com/cdc-**v9.0.0-beta.1.pre**-nightly-linux-amd64.tar.gz](https://tiup-mirrors.pingcap.com/cdc-v9.0.0-beta.1.pre-nightly-linux-amd64.tar.gz)
+    * For Linux ARM64: [https://tiup-mirrors.pingcap.com/cdc-**v9.0.0-beta.1.pre**-nightly-linux-arm64.tar.gz](https://tiup-mirrors.pingcap.com/cdc-v9.0.0-beta.1.pre-nightly-linux-arm64.tar.gz)
+    * For MacOS x86-64: [https://tiup-mirrors.pingcap.com/cdc-**v9.0.0-beta.1.pre**-nightly-darwin-amd64.tar.gz](https://tiup-mirrors.pingcap.com/cdc-v9.0.0-beta.1.pre-nightly-darwin-amd64.tar.gz)
+    * For MacOS ARM64: [https://tiup-mirrors.pingcap.com/cdc-**v9.0.0-beta.1.pre**-nightly-darwin-arm64.tar.gz](https://tiup-mirrors.pingcap.com/cdc-v9.0.0-beta.1.pre-nightly-darwin-arm64.tar.gz)
+
+#### Use TiUP to Retrieve the Download Link
+
+You can also use the tiup command to get the platform-specific nightly binary download link:
+
+```bash
+tiup install cdc:nightly --force
+```
+
+This command will provide the download address for the nightly build tailored to your platform.
+
+![TiUP Nightly](./docs/media/tiup-nightly-install.jpg)
 
 ### Patch to the existing TiCDC nodes
+
 Examples:
 ```bash
 # Scale out some old version TiCDC nodes, if you don't already have some
@@ -46,6 +63,7 @@ tiup cluster reload test-cluster -R cdc
 ## How to compile TiCDC from source code
 
 ### Prerequests
+
 TiCDC can be built on the following operating systems:
 
 * Linux
@@ -71,6 +89,7 @@ export PATH=$PATH:$GOPATH/bin
 ### Download the source code and compile
 
 1. Download the code
+
 ```bash
 git clone git@github.com:pingcap/ticdc.git
 cd ticdc

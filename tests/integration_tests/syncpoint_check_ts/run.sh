@@ -12,6 +12,7 @@ set -eu
 CUR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source $CUR/../_utils/test_prepare
 WORK_DIR=$OUT_DIR/$TEST_NAME
+LOG_FILE="$WORK_DIR/sql_res.$TEST_NAME.log"
 CDC_BINARY=cdc.test
 SINK_TYPE=$1
 
@@ -37,15 +38,15 @@ function run() {
 	# this test contains `set global tidb_external_ts = ?` , which requires super privilege, so we
 	# can't use the normal user
 	SINK_URI="mysql://root@127.0.0.1:3306/?max-txn-row=1"
-	run_cdc_cli changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/changefeed.toml"
+	cdc_cli_changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/changefeed.toml"
 
 	run_sql "SET GLOBAL tidb_enable_external_ts_read = off;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 	sleep 60
 
 	run_sql "SELECT primary_ts, secondary_ts FROM tidb_cdc.syncpoint_v1 order by primary_ts limit 1;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 	echo "____________________________________"
-	cat "$OUT_DIR/sql_res.$TEST_NAME.txt"
-	primary_ts=($(grep primary_ts $OUT_DIR/sql_res.$TEST_NAME.txt | awk -F ": " '{print $2}'))
+	cat "$LOG_FILE"
+	primary_ts=($(grep primary_ts $LOG_FILE | awk -F ": " '{print $2}'))
 	echo "primary_ts is " $primary_ts "start_ts is " $start_ts
 
 	shifted_primary_ts=$(($primary_ts >> 18))

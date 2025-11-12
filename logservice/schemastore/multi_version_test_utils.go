@@ -16,7 +16,7 @@ package schemastore
 import (
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/tidb/pkg/meta/model"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 )
 
 func buildCreateTableEventForTest(schemaID, tableID int64, schemaName, tableName string, finishedTs uint64) *PersistedDDLEvent {
@@ -28,7 +28,7 @@ func buildCreateTableEventForTest(schemaID, tableID int64, schemaName, tableName
 		TableName:  tableName,
 		TableInfo: &model.TableInfo{
 			ID:   tableID,
-			Name: pmodel.NewCIStr(tableName),
+			Name: ast.NewCIStr(tableName),
 		},
 		FinishedTs: finishedTs,
 	}
@@ -54,7 +54,7 @@ func buildRecoverTableEventForTest(schemaID, tableID int64, schemaName, tableNam
 		TableName:  tableName,
 		TableInfo: &model.TableInfo{
 			ID:   tableID,
-			Name: pmodel.NewCIStr(tableName),
+			Name: ast.NewCIStr(tableName),
 		},
 		FinishedTs: finishedTs,
 	}
@@ -74,12 +74,25 @@ func buildCreatePartitionTableEventForTest(schemaID, tableID int64, schemaName, 
 		SchemaName: schemaName,
 		TableName:  tableName,
 		TableInfo: &model.TableInfo{
-			ID:   tableID,
-			Name: pmodel.NewCIStr(tableName),
-			Partition: &model.PartitionInfo{
-				Definitions: partitionDefinitions,
-				Enable:      true,
-			},
+			ID:        tableID,
+			Name:      ast.NewCIStr(tableName),
+			Partition: buildPartitionDefinitionsForTest(partitionIDs),
+		},
+		FinishedTs: finishedTs,
+	}
+}
+
+func buildDropPartitionTableEventForTest(schemaID, tableID int64, schemaName, tableName string, partitionIDs []int64, finishedTs uint64) *PersistedDDLEvent {
+	return &PersistedDDLEvent{
+		Type:       byte(model.ActionDropTable),
+		SchemaID:   schemaID,
+		TableID:    tableID,
+		SchemaName: schemaName,
+		TableName:  tableName,
+		TableInfo: &model.TableInfo{
+			ID:        tableID,
+			Name:      ast.NewCIStr(tableName),
+			Partition: buildPartitionDefinitionsForTest(partitionIDs),
 		},
 		FinishedTs: finishedTs,
 	}
@@ -95,7 +108,27 @@ func buildTruncateTableEventForTest(schemaID, oldTableID, newTableID int64, sche
 		ExtraTableID: newTableID,
 		TableInfo: &model.TableInfo{
 			ID:   newTableID,
-			Name: pmodel.NewCIStr(tableName),
+			Name: ast.NewCIStr(tableName),
+		},
+		FinishedTs: finishedTs,
+	}
+}
+
+func buildTruncatePartitionTableEventForTest(
+	schemaID, oldTableID int64, newTableID int64,
+	schemaName, tableName string,
+	newPartitionIDs []int64, finishedTs uint64,
+) *PersistedDDLEvent {
+	return &PersistedDDLEvent{
+		Type:       byte(model.ActionTruncateTable),
+		SchemaID:   schemaID,
+		TableID:    oldTableID,
+		SchemaName: schemaName,
+		TableName:  tableName,
+		TableInfo: &model.TableInfo{
+			ID:        newTableID,
+			Name:      ast.NewCIStr(tableName),
+			Partition: buildPartitionDefinitionsForTest(newPartitionIDs),
 		},
 		FinishedTs: finishedTs,
 	}
@@ -113,7 +146,7 @@ func buildRenameTableEventForTest(extraSchemaID, schemaID, tableID int64, extraS
 		ExtraTableName:  extraTableName,
 		TableInfo: &model.TableInfo{
 			ID:   tableID,
-			Name: pmodel.NewCIStr(tableName),
+			Name: ast.NewCIStr(tableName),
 		},
 		FinishedTs: finishedTs,
 	}
@@ -124,12 +157,6 @@ func buildExchangePartitionTableEventForTest(
 	normalSchemaName, normalTableName, partitionSchemaName, partitionTableName string,
 	oldPartitionIDs, newPartitionIDs []int64, finishedTs uint64,
 ) *PersistedDDLEvent {
-	partitionDefinitions := make([]model.PartitionDefinition, 0, len(newPartitionIDs))
-	for _, partitionID := range newPartitionIDs {
-		partitionDefinitions = append(partitionDefinitions, model.PartitionDefinition{
-			ID: partitionID,
-		})
-	}
 	return &PersistedDDLEvent{
 		Type:            byte(model.ActionExchangeTablePartition),
 		SchemaID:        normalSchemaID,
@@ -141,18 +168,28 @@ func buildExchangePartitionTableEventForTest(
 		ExtraSchemaName: partitionSchemaName,
 		ExtraTableName:  partitionTableName,
 		TableInfo: &model.TableInfo{
-			ID:   partitionTableID,
-			Name: pmodel.NewCIStr(partitionTableName),
-			Partition: &model.PartitionInfo{
-				Definitions: partitionDefinitions,
-				Enable:      true,
-			},
+			ID:        partitionTableID,
+			Name:      ast.NewCIStr(partitionTableName),
+			Partition: buildPartitionDefinitionsForTest(newPartitionIDs),
 		},
-		ExtraTableInfo: common.WrapTableInfo(normalSchemaID, normalSchemaName, &model.TableInfo{
+		ExtraTableInfo: common.WrapTableInfo(normalSchemaName, &model.TableInfo{
 			ID:   normalTableID,
-			Name: pmodel.NewCIStr(normalTableName),
+			Name: ast.NewCIStr(normalTableName),
 		}),
 		PrevPartitions: oldPartitionIDs,
 		FinishedTs:     finishedTs,
+	}
+}
+
+func buildPartitionDefinitionsForTest(partitionIDs []int64) *model.PartitionInfo {
+	partitionDefinitions := make([]model.PartitionDefinition, 0, len(partitionIDs))
+	for _, partitionID := range partitionIDs {
+		partitionDefinitions = append(partitionDefinitions, model.PartitionDefinition{
+			ID: partitionID,
+		})
+	}
+	return &model.PartitionInfo{
+		Definitions: partitionDefinitions,
+		Enable:      true,
 	}
 }

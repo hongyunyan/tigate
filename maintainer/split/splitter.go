@@ -14,150 +14,72 @@
 package split
 
 import (
-	"bytes"
 	"context"
 
-	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
-	"github.com/pingcap/ticdc/maintainer/replica"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/config"
-	"github.com/pingcap/ticdc/pkg/pdutil"
-	"github.com/pingcap/ticdc/utils"
 	"github.com/tikv/client-go/v2/tikv"
-	"go.uber.org/zap"
 )
+
+const MaxRegionCountForWriteBytesSplit = 5000
+
+type SplitType string
 
 const (
-	// spanRegionLimit is the maximum number of regions a span can cover.
-	spanRegionLimit = 50000
-	// DefaultMaxSpanNumber is the maximum number of spans that can be split
-	// in single batch.
-	DefaultMaxSpanNumber = 100
+	SplitTypeWriteBytes  SplitType = "write_bytes"
+	SplitTypeRegionCount SplitType = "region_count"
 )
 
-// baseSpanNumberCoefficient is the base coefficient that use to
-// multiply the number of captures to get the number of spans.
-var baseSpanNumberCoefficient = replica.MinSpanNumberCoefficient + 1
+type splitter interface {
+	split(
+		ctx context.Context, span *heartbeatpb.TableSpan, spansNum int,
+	) []*heartbeatpb.TableSpan
+}
+
+type Splitter struct {
+	regionCounterSplitter *regionCountSplitter
+	writeBytesSplitter    *writeBytesSplitter
+	changefeedID          common.ChangeFeedID
+}
+
+// Now we only support Split span by region count,  each span will contains similar count of regions.
+func NewSplitter(
+	keyspaceID uint32,
+	changefeedID common.ChangeFeedID,
+	config *config.ChangefeedSchedulerConfig,
+) *Splitter {
+	return &Splitter{
+		changefeedID:          changefeedID,
+		regionCounterSplitter: newRegionCountSplitter(keyspaceID, changefeedID, config.RegionCountPerSpan, config.RegionThreshold),
+		writeBytesSplitter:    newWriteBytesSplitter(keyspaceID, changefeedID),
+	}
+}
+
+func (s *Splitter) Split(ctx context.Context,
+	span *heartbeatpb.TableSpan, spansNum int, splitType SplitType,
+) []*heartbeatpb.TableSpan {
+	switch splitType {
+	case SplitTypeWriteBytes:
+		return s.writeBytesSplitter.split(ctx, span, spansNum)
+	case SplitTypeRegionCount:
+		return s.regionCounterSplitter.split(ctx, span, spansNum)
+	}
+	return nil
+}
 
 // RegionCache is a simplified interface of tikv.RegionCache.
 // It is useful to restrict RegionCache usage and mocking in tests.
 type RegionCache interface {
 	// ListRegionIDsInKeyRange lists ids of regions in [startKey,endKey].
-	ListRegionIDsInKeyRange(
+	LoadRegionsInKeyRange(
 		bo *tikv.Backoffer, startKey, endKey []byte,
-	) (regionIDs []uint64, err error)
-	// LocateRegionByID searches for the region with ID.
-	LocateRegionByID(bo *tikv.Backoffer, regionID uint64) (*tikv.KeyLocation, error)
+	) (regions []*tikv.Region, err error)
 }
 
-type splitter interface {
-	split(
-		ctx context.Context, span *heartbeatpb.TableSpan, totalCaptures int,
-	) []*heartbeatpb.TableSpan
-}
-
-type Splitter struct {
-	splitters    []splitter
-	changefeedID common.ChangeFeedID
-}
-
-// NewSplitter returns a Splitter.
-func NewSplitter(
-	changefeedID common.ChangeFeedID,
-	pdapi pdutil.PDAPIClient,
-	regionCache RegionCache,
-	config *config.ChangefeedSchedulerConfig,
-) *Splitter {
-	baseSpanNumberCoefficient = config.SplitNumberPerNode
-	if baseSpanNumberCoefficient <= 0 {
-		log.Panic("invalid SplitNumberPerNode, please set SplitNumberPerNode larger than 0", zap.Any("SplitNumberPerNode", baseSpanNumberCoefficient))
+func GetSplitType(regionCount int) SplitType {
+	if regionCount < MaxRegionCountForWriteBytesSplit {
+		return SplitTypeWriteBytes
 	}
-	log.Info("baseSpanNumberCoefficient", zap.Any("ChangefeedID", changefeedID.Name()), zap.Any("baseSpanNumberCoefficient", baseSpanNumberCoefficient))
-	return &Splitter{
-		changefeedID: changefeedID,
-		splitters: []splitter{
-			// write splitter has the highest priority.
-			newWriteSplitter(changefeedID, pdapi, config.WriteKeyThreshold),
-			newRegionCountSplitter(changefeedID, regionCache, config.RegionThreshold),
-		},
-	}
-}
-
-func (s *Splitter) SplitSpans(ctx context.Context,
-	span *heartbeatpb.TableSpan,
-	totalCaptures int,
-) []*heartbeatpb.TableSpan {
-	spans := []*heartbeatpb.TableSpan{span}
-	for _, sp := range s.splitters {
-		spans = sp.split(ctx, span, totalCaptures)
-		if len(spans) > 1 {
-			return spans
-		}
-	}
-	return spans
-}
-
-// FindHoles returns an array of Span that are not covered in the range
-func FindHoles(currentSpan utils.Map[*heartbeatpb.TableSpan, *replica.SpanReplication], totalSpan *heartbeatpb.TableSpan) []*heartbeatpb.TableSpan {
-	lastSpan := &heartbeatpb.TableSpan{
-		TableID:  totalSpan.TableID,
-		StartKey: totalSpan.StartKey,
-		EndKey:   totalSpan.StartKey,
-	}
-	var holes []*heartbeatpb.TableSpan
-	// table span is sorted
-	currentSpan.Ascend(func(current *heartbeatpb.TableSpan, _ *replica.SpanReplication) bool {
-		ord := bytes.Compare(lastSpan.EndKey, current.StartKey)
-		if ord < 0 {
-			// Find a hole.
-			holes = append(holes, &heartbeatpb.TableSpan{
-				TableID:  totalSpan.TableID,
-				StartKey: lastSpan.EndKey,
-				EndKey:   current.StartKey,
-			})
-		} else if ord > 0 {
-			log.Panic("map is out of order",
-				zap.String("lastSpan", lastSpan.String()),
-				zap.String("current", current.String()))
-		}
-		lastSpan = current
-		return true
-	})
-	// Check if there is a hole in the end.
-	// the lastSpan not reach the totalSpan end
-	if !bytes.Equal(lastSpan.EndKey, totalSpan.EndKey) {
-		holes = append(holes, &heartbeatpb.TableSpan{
-			TableID:  totalSpan.TableID,
-			StartKey: lastSpan.EndKey,
-			EndKey:   totalSpan.EndKey,
-		})
-	}
-	return holes
-}
-
-func NextExpectedSpansNumber(oldNum int) int {
-	if oldNum < 64 {
-		return oldNum * 2
-	}
-	return min(DefaultMaxSpanNumber, oldNum*3/2)
-}
-
-// func getSpansNumber(regionNum, captureNum, expectedNum, maxSpanNum int) int {
-// 	spanNum := 1
-// 	if regionNum > 1 {
-// 		// spanNum = max(expectedNum, captureNum*baseSpanNumberCoefficient, regionNum/spanRegionLimit)
-// 		spanNum = captureNum * baseSpanNumberCoefficient
-// 	}
-// 	return min(spanNum, maxSpanNum)
-// }
-
-func getSpansNumber(regionNum, captureNum int) int {
-	basicSpanNumber := 1
-	var spanNum int
-	if regionNum > 1 {
-		// spanNum = max(expectedNum, captureNum*baseSpanNumberCoefficient, regionNum/spanRegionLimit)
-		spanNum = captureNum * baseSpanNumberCoefficient
-	}
-	return max(spanNum, basicSpanNumber)
+	return SplitTypeRegionCount
 }

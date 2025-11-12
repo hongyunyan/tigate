@@ -19,7 +19,6 @@ import (
 	"strconv"
 
 	commonType "github.com/pingcap/ticdc/pkg/common"
-	"github.com/pingcap/ticdc/pkg/common/columnselector"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
 	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/sink/codec/common"
@@ -30,7 +29,13 @@ import (
 	"github.com/pingcap/tidb/pkg/util/chunk"
 )
 
-func encodeRowChangedEvent(e *commonEvent.RowEvent, config *common.Config, largeMessageOnlyHandleKeyColumns bool, claimCheckLocationName string) ([]byte, []byte, int, error) {
+func encodeRowChangedEvent(
+	e *commonEvent.RowEvent,
+	columnFlags map[string]uint64,
+	config *common.Config,
+	largeMessageOnlyHandleKeyColumns bool,
+	claimCheckLocationName string,
+) ([]byte, []byte, int, error) {
 	var (
 		keyBuf   bytes.Buffer
 		valueBuf bytes.Buffer
@@ -51,36 +56,39 @@ func encodeRowChangedEvent(e *commonEvent.RowEvent, config *common.Config, large
 			keyWriter.WriteBoolField("ohk", false)
 			keyWriter.WriteStringField("ccl", claimCheckLocationName)
 		}
+		if e.TableInfo.IsPartitionTable() {
+			keyWriter.WriteInt64Field("ptn", e.GetTableID())
+		}
 	})
 	var err error
 	if e.IsDelete() {
 		onlyHandleKeyColumns := config.DeleteOnlyHandleKeyColumns || largeMessageOnlyHandleKeyColumns
 		valueWriter.WriteObject(func() {
 			valueWriter.WriteObjectField("d", func() {
-				err = writeColumnFieldValues(valueWriter, e.GetPreRows(), e.TableInfo, e.ColumnSelector, onlyHandleKeyColumns)
+				err = writeColumnFieldValues(valueWriter, e.GetPreRows(), e.TableInfo, columnFlags, e.ColumnSelector, onlyHandleKeyColumns)
 			})
 		})
 	} else if e.IsInsert() {
 		valueWriter.WriteObject(func() {
 			valueWriter.WriteObjectField("u", func() {
-				err = writeColumnFieldValues(valueWriter, e.GetRows(), e.TableInfo, e.ColumnSelector, largeMessageOnlyHandleKeyColumns)
+				err = writeColumnFieldValues(valueWriter, e.GetRows(), e.TableInfo, columnFlags, e.ColumnSelector, largeMessageOnlyHandleKeyColumns)
 			})
 		})
 	} else if e.IsUpdate() {
 		valueWriter.WriteObject(func() {
 			valueWriter.WriteObjectField("u", func() {
-				err = writeColumnFieldValues(valueWriter, e.GetRows(), e.TableInfo, e.ColumnSelector, largeMessageOnlyHandleKeyColumns)
+				err = writeColumnFieldValues(valueWriter, e.GetRows(), e.TableInfo, columnFlags, e.ColumnSelector, largeMessageOnlyHandleKeyColumns)
 			})
 			if err != nil {
 				return
 			}
 			if !config.OnlyOutputUpdatedColumns {
 				valueWriter.WriteObjectField("p", func() {
-					err = writeColumnFieldValues(valueWriter, e.GetPreRows(), e.TableInfo, e.ColumnSelector, largeMessageOnlyHandleKeyColumns)
+					err = writeColumnFieldValues(valueWriter, e.GetPreRows(), e.TableInfo, columnFlags, e.ColumnSelector, largeMessageOnlyHandleKeyColumns)
 				})
 			} else {
 				valueWriter.WriteObjectField("p", func() {
-					writeUpdatedColumnFieldValues(valueWriter, e.GetPreRows(), e.GetRows(), e.TableInfo, e.ColumnSelector, largeMessageOnlyHandleKeyColumns)
+					writeUpdatedColumnFieldValues(valueWriter, e.GetPreRows(), e.GetRows(), e.TableInfo, columnFlags, e.ColumnSelector, largeMessageOnlyHandleKeyColumns)
 				})
 			}
 		})
@@ -158,162 +166,100 @@ func encodeDDLEvent(e *commonEvent.DDLEvent, config *common.Config) ([]byte, []b
 	return keyOutput.Bytes(), valueOutput.Bytes(), nil
 }
 
-func encodeResolvedTs(ts uint64) ([]byte, []byte) {
-	keyBuf := &bytes.Buffer{}
-	keyWriter := util.BorrowJSONWriter(keyBuf)
-
-	keyWriter.WriteObject(func() {
-		keyWriter.WriteUint64Field("ts", ts)
-		keyWriter.WriteIntField("t", int(common.MessageTypeResolved))
-	})
-
-	util.ReturnJSONWriter(keyWriter)
-
-	key := keyBuf.Bytes()
-
-	var keyLenByte [8]byte
-	var valueLenByte [8]byte
-	var versionByte [8]byte
-	binary.BigEndian.PutUint64(keyLenByte[:], uint64(len(key)))
-	binary.BigEndian.PutUint64(valueLenByte[:], 0)
-	binary.BigEndian.PutUint64(versionByte[:], batchVersion1)
-
-	keyOutput := new(bytes.Buffer)
-
-	keyOutput.Write(versionByte[:])
-	keyOutput.Write(keyLenByte[:])
-	keyOutput.Write(key)
-
-	// todo: shall we really set value here?
-	valueOutput := new(bytes.Buffer)
-	valueOutput.Write(valueLenByte[:])
-
-	return keyOutput.Bytes(), valueOutput.Bytes()
-}
-
 func writeColumnFieldValue(
 	writer *util.JSONWriter,
 	col *model.ColumnInfo,
 	row *chunk.Row,
 	idx int,
-	tableInfo *commonType.TableInfo,
+	isHandle bool,
+	columnFlag uint64,
 ) {
-	colType := col.GetType()
-	flag := *tableInfo.GetColumnFlags()[col.ID]
-	whereHandle := flag.IsHandleKey()
-
-	writer.WriteIntField("t", int(colType))
-	if whereHandle {
-		writer.WriteBoolField("h", whereHandle)
+	fieldType := col.FieldType
+	writer.WriteIntField("t", int(fieldType.GetType()))
+	if isHandle {
+		writer.WriteBoolField("h", isHandle)
 	}
-	writer.WriteUint64Field("f", uint64(flag))
+	writer.WriteUint64Field("f", columnFlag)
 
 	if row.IsNull(idx) {
 		writer.WriteNullField("v")
 		return
 	}
 
-	switch col.GetType() {
+	switch fieldType.GetType() {
 	case mysql.TypeBit:
-		d := row.GetDatum(idx, &col.FieldType)
-		if d.IsNull() {
-			writer.WriteNullField("v")
-		} else {
-			dp := &d
-			// Encode bits as integers to avoid pingcap/tidb#10988 (which also affects MySQL itself)
-			value, _ := dp.GetBinaryLiteral().ToInt(types.DefaultStmtNoWarningContext)
-			writer.WriteUint64Field("v", value)
-		}
+		d := row.GetDatum(idx, &fieldType)
+		dp := &d
+		// Encode bits as integers to avoid pingcap/tidb#10988 (which also affects MySQL itself)
+		value, _ := dp.GetBinaryLiteral().ToInt(types.DefaultStmtNoWarningContext)
+		writer.WriteUint64Field("v", value)
 	case mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeLongBlob, mysql.TypeBlob:
 		value := row.GetBytes(idx)
-		if len(value) == 0 {
-			writer.WriteNullField("v")
-		} else {
-			writer.WriteBase64StringField("v", value)
-		}
+		writer.WriteBase64StringField("v", value)
 	case mysql.TypeVarchar, mysql.TypeVarString, mysql.TypeString:
 		value := row.GetBytes(idx)
-		if len(value) == 0 {
-			writer.WriteNullField("v")
+		if mysql.HasBinaryFlag(fieldType.GetFlag()) {
+			str := string(value)
+			str = strconv.Quote(str)
+			str = str[1 : len(str)-1]
+			writer.WriteStringField("v", str)
 		} else {
-			if flag.IsBinary() {
-				str := string(value)
-				str = strconv.Quote(str)
-				str = str[1 : len(str)-1]
-				writer.WriteStringField("v", str)
-			} else {
-				writer.WriteStringField("v", string(value))
-			}
+			writer.WriteStringField("v", string(value))
 		}
 	case mysql.TypeEnum, mysql.TypeSet:
 		value := row.GetEnum(idx).Value
-		if value == 0 {
-			writer.WriteNullField("v")
-		} else {
-			writer.WriteUint64Field("v", value)
-		}
+		writer.WriteUint64Field("v", value)
 	case mysql.TypeDate, mysql.TypeDatetime, mysql.TypeNewDate, mysql.TypeTimestamp:
 		value := row.GetTime(idx)
-		if value.IsZero() {
-			writer.WriteNullField("v")
-		} else {
-			writer.WriteStringField("v", value.String())
-		}
+		writer.WriteStringField("v", value.String())
 	case mysql.TypeDuration:
 		value := row.GetDuration(idx, 0)
-		if value.ToNumber().IsZero() {
-			writer.WriteNullField("v")
-		} else {
-			writer.WriteStringField("v", value.String())
-		}
+		writer.WriteStringField("v", value.String())
 	case mysql.TypeJSON:
 		value := row.GetJSON(idx)
-		if value.IsZero() {
-			writer.WriteNullField("v")
-		} else {
-			writer.WriteStringField("v", value.String())
-		}
+		writer.WriteStringField("v", value.String())
 	case mysql.TypeNewDecimal:
 		value := row.GetMyDecimal(idx)
-		if value.IsZero() {
-			writer.WriteNullField("v")
-		} else {
-			writer.WriteStringField("v", value.String())
-		}
+		writer.WriteStringField("v", value.String())
+	case mysql.TypeTiDBVectorFloat32:
+		value := row.GetVectorFloat32(idx).String()
+		writer.WriteStringField("v", value)
 	default:
-		d := row.GetDatum(idx, &col.FieldType)
+		d := row.GetDatum(idx, &fieldType)
 		// NOTICE: GetValue() may return some types that go sql not support, which will cause sink DML fail
 		// Make specified convert upper if you need
 		// Go sql support type ref to: https://github.com/golang/go/blob/go1.17.4/src/database/sql/driver/types.go#L236
 		value := d.GetValue()
 		writer.WriteAnyField("v", value)
 	}
-	return
 }
 
 func writeColumnFieldValues(
 	jWriter *util.JSONWriter,
 	row *chunk.Row,
 	tableInfo *commonType.TableInfo,
-	selector columnselector.Selector,
+	columnFlags map[string]uint64,
+	selector commonEvent.Selector,
 	onlyHandleKeyColumns bool,
 ) error {
-	flag := false // flag to check if any column is written
-
+	var encoded bool
 	colInfo := tableInfo.GetColumns()
-
 	for idx, col := range colInfo {
 		if selector.Select(col) {
-			if onlyHandleKeyColumns && !tableInfo.GetColumnFlags()[col.ID].IsHandleKey() {
+			if col.IsVirtualGenerated() {
 				continue
 			}
-			flag = true
+			handle := tableInfo.IsHandleKey(col.ID)
+			if onlyHandleKeyColumns && !handle {
+				continue
+			}
+			encoded = true
 			jWriter.WriteObjectField(col.Name.O, func() {
-				writeColumnFieldValue(jWriter, col, row, idx, tableInfo)
+				writeColumnFieldValue(jWriter, col, row, idx, handle, columnFlags[col.Name.O])
 			})
 		}
 	}
-	if !flag {
+	if !encoded {
 		return errors.ErrOpenProtocolCodecInvalidData.GenWithStack("not found handle key columns for the delete event")
 	}
 	return nil
@@ -324,7 +270,8 @@ func writeUpdatedColumnFieldValues(
 	preRow *chunk.Row,
 	row *chunk.Row,
 	tableInfo *commonType.TableInfo,
-	selector columnselector.Selector,
+	columnFlags map[string]uint64,
+	selector commonEvent.Selector,
 	onlyHandleKeyColumns bool,
 ) {
 	// we don't need check here whether after column selector there still exists handle key column
@@ -333,10 +280,11 @@ func writeUpdatedColumnFieldValues(
 
 	for idx, col := range colInfo {
 		if selector.Select(col) {
-			if onlyHandleKeyColumns && !tableInfo.GetColumnFlags()[col.ID].IsHandleKey() {
+			isHandle := tableInfo.IsHandleKey(col.ID)
+			if onlyHandleKeyColumns && !isHandle {
 				continue
 			}
-			writeColumnFieldValueIfUpdated(jWriter, col, preRow, row, idx, tableInfo)
+			writeColumnFieldValueIfUpdated(jWriter, col, preRow, row, idx, isHandle, columnFlags[col.Name.O])
 		}
 	}
 }
@@ -347,17 +295,17 @@ func writeColumnFieldValueIfUpdated(
 	preRow *chunk.Row,
 	row *chunk.Row,
 	idx int,
-	tableInfo *commonType.TableInfo,
+	isHandle bool,
+	columnFlag uint64,
 ) {
 	colType := col.GetType()
-	flag := *tableInfo.GetColumnFlags()[col.ID]
-	whereHandle := flag.IsHandleKey()
+	flag := col.GetFlag()
 
 	writeFunc := func(writeColumnValue func()) {
 		writer.WriteObjectField(col.Name.O, func() {
 			writer.WriteIntField("t", int(colType))
-			if whereHandle {
-				writer.WriteBoolField("h", whereHandle)
+			if isHandle {
+				writer.WriteBoolField("h", isHandle)
 			}
 			writer.WriteUint64Field("f", uint64(flag))
 			writeColumnValue()
@@ -372,7 +320,7 @@ func writeColumnFieldValueIfUpdated(
 		return
 	}
 	if !preRow.IsNull(idx) && row.IsNull(idx) {
-		writeColumnFieldValue(writer, col, preRow, idx, tableInfo)
+		writeColumnFieldValue(writer, col, preRow, idx, isHandle, columnFlag)
 		return
 	}
 
@@ -408,7 +356,7 @@ func writeColumnFieldValueIfUpdated(
 			if len(preRowValue) == 0 {
 				writeFunc(func() { writer.WriteNullField("v") })
 			} else {
-				if flag.IsBinary() {
+				if mysql.HasBinaryFlag(flag) {
 					str := string(preRowValue)
 					str = strconv.Quote(str)
 					str = str[1 : len(str)-1]

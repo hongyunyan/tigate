@@ -31,7 +31,7 @@ while ! curl -o /dev/null -v -s "http://$S3_ENDPOINT/"; do
 done
 
 stop_minio() {
-	kill -2 $MINIO_PID
+	kill -2 $MINIO_PID || true
 }
 
 stop() {
@@ -54,7 +54,7 @@ function run() {
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY
 
 	SINK_URI="mysql://normal:123456@127.0.0.1:3306/"
-	changefeed_id=$(cdc cli changefeed create --sink-uri="$SINK_URI" --config="$CUR/conf/changefeed.toml" 2>&1 | tail -n2 | head -n1 | awk '{print $2}')
+	changefeed_id=$(cdc_cli_changefeed create --sink-uri="$SINK_URI" --config="$CUR/conf/changefeed.toml" | grep '^ID:' | head -n1 | awk '{print $2}')
 
 	run_sql "CREATE DATABASE consistent_replicate_gbk;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 	run_sql "CREATE TABLE consistent_replicate_gbk.GBKTABLE (id INT,name varchar(128),country char(32),city varchar(64),description text,image tinyblob,PRIMARY KEY (id)) ENGINE = InnoDB CHARSET = gbk;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
@@ -67,7 +67,7 @@ function run() {
 	# Inject the failpoint to prevent sink execution, but the global resolved can be moved forward.
 	# Then we can apply redo log to reach an eventual consistent state in downstream.
 	cleanup_process $CDC_BINARY
-	export GO_FAILPOINTS='github.com/pingcap/tiflow/cdc/sink/dmlsink/txn/mysql/MySQLSinkHangLongTime=return(true)'
+	export GO_FAILPOINTS='github.com/pingcap/ticdc/pkg/sink/mysql/MySQLSinkHangLongTime=return(true)'
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY
 	run_sql "create table consistent_replicate_gbk.GBKTABLE2 like consistent_replicate_gbk.GBKTABLE" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 	run_sql "insert into consistent_replicate_gbk.GBKTABLE2 select * from consistent_replicate_gbk.GBKTABLE" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
@@ -86,7 +86,7 @@ function run() {
 	export AWS_SECRET_ACCESS_KEY=$MINIO_SECRET_KEY
 	cdc redo apply --tmp-dir="$WORK_DIR/apply" \
 		--storage="$storage_path" \
-		--sink-uri="mysql://normal:123456@127.0.0.1:3306/"
+		--sink-uri="mysql://normal:123456@127.0.0.1:3306/" >$WORK_DIR/cdc_redo.log
 	check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml
 }
 

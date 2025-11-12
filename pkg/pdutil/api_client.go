@@ -16,6 +16,7 @@ package pdutil
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -27,14 +28,17 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/kvproto/pkg/keyspacepb"
 	"github.com/pingcap/log"
+	"github.com/pingcap/ticdc/heartbeatpb"
+	"github.com/pingcap/ticdc/pkg/common"
+	"github.com/pingcap/ticdc/pkg/config/kerneltype"
+	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/httputil"
 	"github.com/pingcap/ticdc/pkg/retry"
-	"github.com/pingcap/ticdc/pkg/spanz"
-	"github.com/pingcap/tiflow/cdc/processor/tablepb"
-	cerror "github.com/pingcap/tiflow/pkg/errors"
-	"github.com/pingcap/tiflow/pkg/httputil"
-	"github.com/pingcap/tiflow/pkg/security"
+	"github.com/pingcap/ticdc/pkg/security"
 	pd "github.com/tikv/pd/client"
+	pdhttp "github.com/tikv/pd/client/http"
 	"go.uber.org/zap"
 )
 
@@ -90,7 +94,7 @@ const (
 )
 
 const (
-	defaultMaxRetry       = 3
+	defaultMaxRetry       = 5
 	defaultRequestTimeout = 5 * time.Second
 )
 
@@ -100,14 +104,17 @@ type PDAPIClient interface {
 	ListGcServiceSafePoint(ctx context.Context) (*ListServiceGCSafepoint, error)
 	CollectMemberEndpoints(ctx context.Context) ([]string, error)
 	Healthy(ctx context.Context, endpoint string) error
-	ScanRegions(ctx context.Context, span tablepb.Span) ([]RegionInfo, error)
+	ScanRegions(ctx context.Context, span heartbeatpb.TableSpan) ([]RegionInfo, error)
+	LoadKeyspace(ctx context.Context, name string) (*keyspacepb.KeyspaceMeta, error)
+	GetKeyspaceMetaByID(ctx context.Context, keyspaceID uint32) (*keyspacepb.KeyspaceMeta, error)
 	Close()
 }
 
 // pdAPIClient is the api client of Placement Driver, include grpc client and http client.
 type pdAPIClient struct {
-	grpcClient pd.Client
-	httpClient *httputil.Client
+	grpcClient   pd.Client
+	httpClient   *httputil.Client
+	pdHttpClient pdhttp.Client
 }
 
 // NewPDAPIClient create a new pdAPIClient.
@@ -116,10 +123,41 @@ func NewPDAPIClient(pdClient pd.Client, conf *security.Credential) (PDAPIClient,
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+
+	pdHttpClient, err := newPdHttpClient(pdClient, conf)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
 	return &pdAPIClient{
-		grpcClient: pdClient,
-		httpClient: dialClient,
+		grpcClient:   pdClient,
+		httpClient:   dialClient,
+		pdHttpClient: pdHttpClient,
 	}, nil
+}
+
+func newPdHttpClient(pdClient pd.Client, conf *security.Credential) (pdhttp.Client, error) {
+	discovery := pdClient.GetServiceDiscovery()
+	pdhttpOpts := make([]pdhttp.ClientOption, 0)
+
+	var (
+		tlsConf *tls.Config
+		err     error
+	)
+	if conf != nil {
+		tlsConf, err = conf.ToTLSConfigWithVerify()
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	}
+
+	if tlsConf != nil {
+		opt := pdhttp.WithTLSConfig(tlsConf)
+		pdhttpOpts = append(pdhttpOpts, opt)
+	}
+
+	client := pdhttp.NewClientWithServiceDiscovery("cdc", discovery, pdhttpOpts...)
+	return client, nil
 }
 
 // Close the pd api client, at the moment only close idle http connections if there is any.
@@ -141,23 +179,26 @@ func (pc *pdAPIClient) UpdateMetaLabel(ctx context.Context) error {
 
 		log.Info("Succeed to add meta region label to PD")
 		return nil
-	}, retry.WithMaxTries(defaultMaxRetry), retry.WithIsRetryableErr(func(err error) bool {
-		switch errors.Cause(err) {
-		case context.Canceled:
-			return false
-		}
-		return true
-	}))
+	}, retry.WithMaxTries(defaultMaxRetry),
+		retry.WithBackoffBaseDelay(200),
+		retry.WithBackoffMaxDelay(4000),
+		retry.WithIsRetryableErr(func(err error) bool {
+			switch errors.Cause(err) {
+			case context.Canceled:
+				return false
+			}
+			return true
+		}))
 	return err
 }
 
 // NewTestRegionInfo creates a new RegionInfo for test purpose.
 func NewTestRegionInfo(regionID uint64, start, end []byte, writtenKeys uint64) RegionInfo {
 	return RegionInfo{
-		ID:          regionID,
-		StartKey:    hex.EncodeToString(start),
-		EndKey:      hex.EncodeToString(end),
-		WrittenKeys: writtenKeys,
+		ID:           regionID,
+		StartKey:     hex.EncodeToString(start),
+		EndKey:       hex.EncodeToString(end),
+		WrittenBytes: writtenKeys,
 	}
 }
 
@@ -165,10 +206,10 @@ func NewTestRegionInfo(regionID uint64, start, end []byte, writtenKeys uint64) R
 // NOTE: This type is a copy of github.com/tikv/pd/server/api.RegionInfo.
 // To reduce dependency tree, we do not import the api package directly.
 type RegionInfo struct {
-	ID          uint64 `json:"id"`
-	StartKey    string `json:"start_key"`
-	EndKey      string `json:"end_key"`
-	WrittenKeys uint64 `json:"written_keys"`
+	ID           uint64 `json:"id"`
+	StartKey     string `json:"start_key"`
+	EndKey       string `json:"end_key"`
+	WrittenBytes uint64 `json:"written_bytes"`
 }
 
 // RegionsInfo contains some regions with the detailed region info.
@@ -180,7 +221,7 @@ type RegionsInfo struct {
 }
 
 // ScanRegions is a reentrant function that updates the meta-region label of upstream cluster.
-func (pc *pdAPIClient) ScanRegions(ctx context.Context, span tablepb.Span) ([]RegionInfo, error) {
+func (pc *pdAPIClient) ScanRegions(ctx context.Context, span heartbeatpb.TableSpan) ([]RegionInfo, error) {
 	scanLimit := 1024
 	endpoints, err := pc.CollectMemberEndpoints(ctx)
 	if err != nil {
@@ -191,7 +232,7 @@ func (pc *pdAPIClient) ScanRegions(ctx context.Context, span tablepb.Span) ([]Re
 }
 
 func (pc *pdAPIClient) scanRegions(
-	ctx context.Context, span tablepb.Span, endpoints []string, scanLimit int,
+	ctx context.Context, span heartbeatpb.TableSpan, endpoints []string, scanLimit int,
 ) ([]RegionInfo, error) {
 	scan := func(endpoint string, startKey, endKey []byte) ([]RegionInfo, error) {
 		query := url.Values{}
@@ -227,7 +268,7 @@ func (pc *pdAPIClient) scanRegions(
 	startKey := span.StartKey
 	startKeyHex := strings.ToUpper(hex.EncodeToString(startKey))
 	isFirstStartKey := true
-	for spanz.EndCompare(startKey, span.EndKey) < 0 || (len(startKey) == 0 && isFirstStartKey) {
+	for common.EndCompare(startKey, span.EndKey) < 0 || (len(startKey) == 0 && isFirstStartKey) {
 		for i, endpoint := range endpoints {
 			r, err := scan(endpoint, startKey, span.EndKey)
 			if err != nil && i+1 == len(endpoints) {
@@ -256,7 +297,7 @@ func (pc *pdAPIClient) scanRegions(
 					zap.Uint64("regionID", r[len(regions)-1].ID))
 				return nil, errors.Trace(err)
 			}
-			startKey = tablepb.Key(key)
+			startKey = key
 			startKeyHex = strings.ToUpper(hex.EncodeToString(startKey))
 			isFirstStartKey = false
 			break
@@ -271,6 +312,21 @@ func (pc *pdAPIClient) scanRegions(
 	}
 
 	return regions, nil
+}
+
+func (pc *pdAPIClient) LoadKeyspace(ctx context.Context, name string) (*keyspacepb.KeyspaceMeta, error) {
+	if kerneltype.IsClassic() {
+		return &keyspacepb.KeyspaceMeta{}, nil
+	}
+	return pc.grpcClient.LoadKeyspace(ctx, name)
+}
+
+func (pc *pdAPIClient) GetKeyspaceMetaByID(ctx context.Context, keyspaceID uint32) (*keyspacepb.KeyspaceMeta, error) {
+	if kerneltype.IsClassic() {
+		return &keyspacepb.KeyspaceMeta{}, nil
+	}
+
+	return pc.pdHttpClient.GetKeyspaceMetaByID(ctx, keyspaceID)
 }
 
 // ServiceSafePoint contains gc service safe point
@@ -343,12 +399,12 @@ func (pc *pdAPIClient) listGcServiceSafePoint(
 
 // CollectMemberEndpoints return all members' endpoint
 func (pc *pdAPIClient) CollectMemberEndpoints(ctx context.Context) ([]string, error) {
-	members, err := pc.grpcClient.GetAllMembers(ctx)
+	resp, err := pc.grpcClient.GetAllMembers(ctx)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	result := make([]string, 0, len(members))
-	for _, m := range members {
+	result := make([]string, 0, len(resp.Members))
+	for _, m := range resp.Members {
 		clientUrls := m.GetClientUrls()
 		if len(clientUrls) > 0 {
 			result = append(result, clientUrls[0])

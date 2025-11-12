@@ -32,16 +32,16 @@ function run() {
 	case $SINK_TYPE in
 	*) SINK_URI="mysql://normal:123456@127.0.0.1:3306/?max-txn-row=1" ;;
 	esac
-	run_cdc_cli changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI"
+	cdc_cli_changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI"
 
 	run_sql "CREATE TABLE changefeed_dup_error_restart.finish_mark_1 (a int primary key);"
-	check_table_exists "changefeed_dup_error_restart.finish_mark_1" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} 120
-	check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml
+	check_table_exists "changefeed_dup_error_restart.finish_mark_1" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} 300
+	check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml 300
 
 	go-ycsb load mysql -P $CUR/conf/workload -p mysql.host=${UP_TIDB_HOST} -p mysql.port=${UP_TIDB_PORT} -p mysql.user=root -p mysql.db=changefeed_dup_error_restart
 	run_sql "CREATE TABLE changefeed_dup_error_restart.finish_mark_2 (a int primary key);"
-	check_table_exists "changefeed_dup_error_restart.finish_mark_2" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} 120
-	check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml 180
+	check_table_exists "changefeed_dup_error_restart.finish_mark_2" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} 300
+	check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml 300
 
 	cleanup_process $CDC_BINARY
 }

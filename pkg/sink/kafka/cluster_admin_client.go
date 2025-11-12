@@ -33,7 +33,7 @@ type Broker struct {
 // which supports managing and inspecting topics, brokers, configurations and ACLs.
 type ClusterAdminClient interface {
 	// GetAllBrokers return all brokers among the cluster
-	GetAllBrokers(ctx context.Context) ([]Broker, error)
+	GetAllBrokers(ctx context.Context) []Broker
 
 	// GetBrokerConfig return the broker level configuration with the `configName`
 	GetBrokerConfig(ctx context.Context, configName string) (string, error)
@@ -51,6 +51,8 @@ type ClusterAdminClient interface {
 
 	// CreateTopic creates a new topic.
 	CreateTopic(ctx context.Context, detail *TopicDetail, validateOnly bool) error
+
+	Heartbeat()
 
 	// Close shuts down the admin client.
 	Close()

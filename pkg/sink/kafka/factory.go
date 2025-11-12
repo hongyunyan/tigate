@@ -19,10 +19,12 @@ import (
 
 	"github.com/IBM/sarama"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/log"
 	commonType "github.com/pingcap/ticdc/pkg/common"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/sink/codec/common"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
@@ -33,13 +35,13 @@ type Factory interface {
 	// SyncProducer creates a sync producer to writer message to kafka
 	SyncProducer() (SyncProducer, error)
 	// AsyncProducer creates an async producer to writer message to kafka
-	AsyncProducer(ctx context.Context) (AsyncProducer, error)
+	AsyncProducer() (AsyncProducer, error)
 	// MetricsCollector returns the kafka metrics collector
 	MetricsCollector(adminClient ClusterAdminClient) MetricsCollector
 }
 
 // FactoryCreator defines the type of factory creator.
-type FactoryCreator func(context.Context, *Options, commonType.ChangeFeedID) (Factory, error)
+type FactoryCreator func(context.Context, *options, commonType.ChangeFeedID) (Factory, error)
 
 // SyncProducer is the kafka sync producer
 type SyncProducer interface {
@@ -55,6 +57,8 @@ type SyncProducer interface {
 	// can succeed and fail individually; if some succeed and some fail,
 	// SendMessages will return an error.
 	SendMessages(ctx context.Context, topic string, partitionNum int32, message *common.Message) error
+
+	Heartbeat()
 
 	// Close shuts down the producer; you must call this function before a producer
 	// object passes out of scope, as it may otherwise leak memory.
@@ -75,6 +79,8 @@ type AsyncProducer interface {
 	// wish to send.
 	AsyncSend(ctx context.Context, topic string, partition int32, message *common.Message) error
 
+	Heartbeat()
+
 	// AsyncRunCallback process the messages that has sent to kafka,
 	// and run tha attached callback. the caller should call this
 	// method in a background goroutine
@@ -85,6 +91,7 @@ type saramaSyncProducer struct {
 	id       commonType.ChangeFeedID
 	client   sarama.Client
 	producer sarama.SyncProducer
+	closed   *atomic.Bool
 }
 
 func (p *saramaSyncProducer) SendMessage(
@@ -92,18 +99,35 @@ func (p *saramaSyncProducer) SendMessage(
 	topic string, partitionNum int32,
 	message *common.Message,
 ) error {
+	if p.closed.Load() {
+		return cerror.ErrKafkaProducerClosed.GenWithStackByArgs()
+	}
 	_, _, err := p.producer.SendMessage(&sarama.ProducerMessage{
 		Topic:     topic,
 		Key:       sarama.ByteEncoder(message.Key),
 		Value:     sarama.ByteEncoder(message.Value),
 		Partition: partitionNum,
 	})
-	return err
+	failpoint.Inject("KafkaSinkSyncSendMessageError", func() {
+		err = cerror.WrapError(cerror.ErrKafkaSendMessage, errors.New("kafka sink sync send message injected error"))
+	})
+	if err != nil {
+		err = AnnotateEventError(
+			p.id.Keyspace(),
+			p.id.Name(),
+			message.LogInfo,
+			err,
+		)
+	}
+	return cerror.WrapError(cerror.ErrKafkaSendMessage, err)
 }
 
 func (p *saramaSyncProducer) SendMessages(
 	_ context.Context, topic string, partitionNum int32, message *common.Message,
 ) error {
+	if p.closed.Load() {
+		return cerror.ErrKafkaProducerClosed.GenWithStackByArgs()
+	}
 	msgs := make([]*sarama.ProducerMessage, partitionNum)
 	for i := 0; i < int(partitionNum); i++ {
 		msgs[i] = &sarama.ProducerMessage{
@@ -113,59 +137,73 @@ func (p *saramaSyncProducer) SendMessages(
 			Partition: int32(i),
 		}
 	}
-	return p.producer.SendMessages(msgs)
+	err := p.producer.SendMessages(msgs)
+	failpoint.Inject("KafkaSinkSyncSendMessagesError", func() {
+		err = cerror.WrapError(cerror.ErrKafkaSendMessage, errors.New("kafka sink sync send messages injected error"))
+	})
+	if err != nil {
+		err = AnnotateEventError(
+			p.id.Keyspace(),
+			p.id.Name(),
+			message.LogInfo,
+			err,
+		)
+	}
+	return cerror.WrapError(cerror.ErrKafkaSendMessage, err)
+}
+
+func (p *saramaSyncProducer) Heartbeat() {
+	if p.closed.Load() {
+		return
+	}
+	brokers := p.client.Brokers()
+	for _, b := range brokers {
+		_, _ = b.ApiVersions(&sarama.ApiVersionsRequest{})
+	}
 }
 
 func (p *saramaSyncProducer) Close() {
-	go func() {
-		// We need to close it asynchronously. Otherwise, we might get stuck
-		// with an unhealthy(i.e. Network jitter, isolation) state of Kafka.
-		// Factory has a background thread to fetch and update the metadata.
-		// If we close the client synchronously, we might get stuck.
-		// Safety:
-		// * If the kafka cluster is running well, it will be closed as soon as possible.
-		// * If there is a problem with the kafka cluster,
-		//   no data will be lost because this is a synchronous client.
-		// * There is a risk of goroutine leakage, but it is acceptable and our main
-		//   goal is not to get stuck with the owner tick.
-		start := time.Now()
-		if err := p.client.Close(); err != nil {
-			log.Warn("Close Kafka DDL client with error",
-				zap.String("namespace", p.id.Namespace()),
-				zap.String("changefeed", p.id.Name()),
-				zap.Duration("duration", time.Since(start)),
-				zap.Error(err))
-		} else {
-			log.Info("Kafka DDL client closed",
-				zap.String("namespace", p.id.Namespace()),
-				zap.String("changefeed", p.id.Name()),
-				zap.Duration("duration", time.Since(start)))
-		}
-		start = time.Now()
-		err := p.producer.Close()
-		if err != nil {
-			log.Error("Close Kafka DDL producer with error",
-				zap.String("namespace", p.id.Namespace()),
-				zap.String("changefeed", p.id.Name()),
-				zap.Duration("duration", time.Since(start)),
-				zap.Error(err))
-		} else {
-			log.Info("Kafka DDL producer closed",
-				zap.String("namespace", p.id.Namespace()),
-				zap.String("changefeed", p.id.Name()),
-				zap.Duration("duration", time.Since(start)))
-		}
-	}()
+	if p.closed.Load() {
+		log.Warn("kafka DDL producer already closed",
+			zap.String("keyspace", p.id.Keyspace()),
+			zap.String("changefeed", p.id.Name()))
+		return
+	}
+
+	p.closed.Store(true)
+	start := time.Now()
+	// this also close the client.
+	err := p.producer.Close()
+	if err != nil {
+		log.Error("Close Kafka DDL producer with error",
+			zap.String("keyspace", p.id.Keyspace()),
+			zap.String("changefeed", p.id.Name()),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err))
+		return
+	}
+	log.Info("Kafka DDL producer closed",
+		zap.String("keyspace", p.id.Keyspace()),
+		zap.String("changefeed", p.id.Name()),
+		zap.Duration("duration", time.Since(start)))
 }
 
 type saramaAsyncProducer struct {
 	client       sarama.Client
 	producer     sarama.AsyncProducer
 	changefeedID commonType.ChangeFeedID
-	failpointCh  chan error
+
+	closed      *atomic.Bool
+	failpointCh chan *sarama.ProducerError
+}
+
+type messageMetadata struct {
+	callback func()
+	logInfo  *common.MessageLogInfo
 }
 
 func (p *saramaAsyncProducer) Close() {
+	p.closed.Store(true)
 	go func() {
 		// We need to close it asynchronously. Otherwise, we might get stuck
 		// with an unhealthy(i.e. Network jitter, isolation) state of Kafka.
@@ -188,13 +226,13 @@ func (p *saramaAsyncProducer) Close() {
 		start := time.Now()
 		if err := p.client.Close(); err != nil {
 			log.Warn("Close kafka async producer client error",
-				zap.String("namespace", p.changefeedID.Namespace()),
+				zap.String("keyspace", p.changefeedID.Keyspace()),
 				zap.String("changefeed", p.changefeedID.Name()),
 				zap.Duration("duration", time.Since(start)),
 				zap.Error(err))
 		} else {
 			log.Info("Close kafka async producer client success",
-				zap.String("namespace", p.changefeedID.Namespace()),
+				zap.String("keyspace", p.changefeedID.Keyspace()),
 				zap.String("changefeed", p.changefeedID.Name()),
 				zap.Duration("duration", time.Since(start)))
 		}
@@ -202,13 +240,13 @@ func (p *saramaAsyncProducer) Close() {
 		start = time.Now()
 		if err := p.producer.Close(); err != nil {
 			log.Warn("Close kafka async producer error",
-				zap.String("namespace", p.changefeedID.Namespace()),
+				zap.String("keyspace", p.changefeedID.Keyspace()),
 				zap.String("changefeed", p.changefeedID.Name()),
 				zap.Duration("duration", time.Since(start)),
 				zap.Error(err))
 		} else {
 			log.Info("Close kafka async producer success",
-				zap.String("namespace", p.changefeedID.Namespace()),
+				zap.String("keyspace", p.changefeedID.Keyspace()),
 				zap.String("changefeed", p.changefeedID.Name()),
 				zap.Duration("duration", time.Since(start)))
 		}
@@ -218,24 +256,30 @@ func (p *saramaAsyncProducer) Close() {
 func (p *saramaAsyncProducer) AsyncRunCallback(
 	ctx context.Context,
 ) error {
+	defer p.closed.Store(true)
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info("async producer exit since context is done",
-				zap.String("namespace", p.changefeedID.Namespace()),
+				zap.String("keyspace", p.changefeedID.Keyspace()),
 				zap.String("changefeed", p.changefeedID.Name()))
 			return errors.Trace(ctx.Err())
 		case err := <-p.failpointCh:
 			log.Warn("Receive from failpoint chan in kafka DML producer",
-				zap.String("namespace", p.changefeedID.Namespace()),
+				zap.String("keyspace", p.changefeedID.Keyspace()),
 				zap.String("changefeed", p.changefeedID.Name()),
 				zap.Error(err))
-			return errors.Trace(err)
+			return p.handleProducerError(err)
 		case ack := <-p.producer.Successes():
 			if ack != nil {
-				callback := ack.Metadata.(func())
-				if callback != nil {
-					callback()
+				switch meta := ack.Metadata.(type) {
+				case *messageMetadata:
+					if meta != nil && meta.callback != nil {
+						meta.callback()
+					}
+				default:
+					log.Error("unknown message metadata type in async producer",
+						zap.Any("metadata", ack.Metadata))
 				}
 			}
 		case err := <-p.producer.Errors():
@@ -247,8 +291,25 @@ func (p *saramaAsyncProducer) AsyncRunCallback(
 			if err == nil {
 				return nil
 			}
-			return cerror.WrapError(cerror.ErrKafkaAsyncSendMessage, err)
+			return p.handleProducerError(err)
 		}
+	}
+}
+
+func (p *saramaAsyncProducer) handleProducerError(err *sarama.ProducerError) error {
+	errWithInfo := AnnotateEventError(
+		p.changefeedID.Keyspace(),
+		p.changefeedID.Name(),
+		extractLogInfo(err.Msg),
+		err.Err,
+	)
+	return cerror.WrapError(cerror.ErrKafkaAsyncSendMessage, errWithInfo)
+}
+
+func (p *saramaAsyncProducer) Heartbeat() {
+	brokers := p.client.Brokers()
+	for _, b := range brokers {
+		_, _ = b.ApiVersions(&sarama.ApiVersionsRequest{})
 	}
 }
 
@@ -257,12 +318,33 @@ func (p *saramaAsyncProducer) AsyncRunCallback(
 func (p *saramaAsyncProducer) AsyncSend(
 	ctx context.Context, topic string, partition int32, message *common.Message,
 ) error {
+	if p.closed.Load() {
+		return cerror.ErrKafkaProducerClosed.GenWithStackByArgs()
+	}
+	failpoint.Inject("KafkaSinkAsyncSendError", func() {
+		// simulate sending message to input channel successfully but flushing
+		// message to Kafka meets error
+		log.Info("KafkaSinkAsyncSendError error injected", zap.String("keyspace", p.changefeedID.Keyspace()),
+			zap.String("changefeed", p.changefeedID.Name()))
+		p.failpointCh <- &sarama.ProducerError{
+			Err: errors.New("kafka sink injected error"),
+			Msg: &sarama.ProducerMessage{Metadata: &messageMetadata{
+				callback: message.Callback,
+				logInfo:  message.LogInfo,
+			}},
+		}
+		failpoint.Return(nil)
+	})
+	meta := &messageMetadata{
+		callback: message.Callback,
+		logInfo:  message.LogInfo,
+	}
 	msg := &sarama.ProducerMessage{
 		Topic:     topic,
 		Partition: partition,
 		Key:       sarama.StringEncoder(message.Key),
 		Value:     sarama.ByteEncoder(message.Value),
-		Metadata:  message.Callback,
+		Metadata:  meta,
 	}
 	select {
 	case <-ctx.Done():
@@ -270,4 +352,15 @@ func (p *saramaAsyncProducer) AsyncSend(
 	case p.producer.Input() <- msg:
 	}
 	return nil
+}
+
+func extractLogInfo(msg *sarama.ProducerMessage) *common.MessageLogInfo {
+	if msg == nil {
+		return nil
+	}
+	meta, ok := msg.Metadata.(*messageMetadata)
+	if !ok || meta == nil {
+		return nil
+	}
+	return meta.logInfo
 }

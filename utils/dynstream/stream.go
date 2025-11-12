@@ -14,6 +14,7 @@
 package dynstream
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,9 +26,10 @@ import (
 
 const BlockLenInPendingQueue = 32
 
-// A stream uses two goroutines
-// 1. handleLoop: to handle the events.
-// 2. reportStatLoop: to report the statistics.
+// A stream has two goroutines: receiver and handleLoop.
+// The receiver receives the events and buffers them.
+// The handleLoop handles the events.
+// While if UseBuffer is false, the receiver is not needed, and the handleLoop directly receives the events.
 type stream[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]] struct {
 	id int
 
@@ -47,11 +49,13 @@ type stream[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]] struct {
 
 	option Option
 
-	isClosed atomic.Bool
-
 	wg sync.WaitGroup
 
 	startTime time.Time
+
+	closed atomic.Bool
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func newStream[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]](
@@ -66,6 +70,7 @@ func newStream[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]](
 		option:     option,
 		startTime:  time.Now(),
 	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 
 	if option.UseBuffer {
 		s.inChan = make(chan eventWrap[A, P, T, D, H], 64)
@@ -73,34 +78,46 @@ func newStream[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]](
 
 		s.eventChan = s.outChan
 	} else {
-		s.eventChan = make(chan eventWrap[A, P, T, D, H], 64)
+		s.eventChan = make(chan eventWrap[A, P, T, D, H], 1024*16)
 	}
 	return s
 }
 
 func (s *stream[A, P, T, D, H]) addPath(path *pathInfo[A, P, T, D, H]) {
-	s.in() <- eventWrap[A, P, T, D, H]{pathInfo: path, newPath: true}
+	s.addEvent(eventWrap[A, P, T, D, H]{pathInfo: path, newPath: true})
 }
 
 func (s *stream[A, P, T, D, H]) getPendingSize() int {
 	if s.option.UseBuffer {
 		return len(s.inChan) + int(s.bufferCount.Load()) + len(s.outChan) + int(s.eventQueue.totalPendingLength.Load())
-	} else {
-		return len(s.eventChan) + int(s.eventQueue.totalPendingLength.Load())
 	}
+	return len(s.eventChan) + int(s.eventQueue.totalPendingLength.Load())
 }
 
-func (s *stream[A, P, T, D, H]) in() chan eventWrap[A, P, T, D, H] {
+func (s *stream[A, P, T, D, H]) addEvent(event eventWrap[A, P, T, D, H]) {
+	if s.closed.Load() {
+		return
+	}
+	eventChan := s.eventChan
 	if s.option.UseBuffer {
-		return s.inChan
-	} else {
-		return s.eventChan
+		eventChan = s.inChan
+	}
+	// Fast path: try direct send without blocking to avoid context check
+	select {
+	case eventChan <- event:
+		return
+	default:
+		// Slow path: with close check while waiting
+		select {
+		case <-s.ctx.Done():
+		case eventChan <- event:
+		}
 	}
 }
 
 // Start the stream.
 func (s *stream[A, P, T, D, H]) start() {
-	if s.isClosed.Load() {
+	if s.closed.Load() {
 		panic("The stream has been closed.")
 	}
 
@@ -115,29 +132,22 @@ func (s *stream[A, P, T, D, H]) start() {
 
 // Close the stream and wait for all goroutines to exit.
 // wait is by default true, which means to wait for the goroutines to exit.
-func (s *stream[A, P, T, D, H]) close(wait ...bool) {
-	if s.isClosed.CompareAndSwap(false, true) {
-		if s.option.UseBuffer {
-			close(s.inChan)
-		} else {
-			close(s.eventChan)
-		}
+func (s *stream[A, P, T, D, H]) close() {
+	if s.closed.CompareAndSwap(false, true) {
+		s.cancel()
 	}
-	if len(wait) == 0 || wait[0] {
-		s.wg.Wait()
-	}
+	s.wg.Wait()
 }
 
 func (s *stream[A, P, T, D, H]) receiver() {
 	buffer := deque.NewDeque[eventWrap[A, P, T, D, H]](BlockLenInPendingQueue)
 	defer func() {
-		// Move all remaining events in the buffer to the outChan.
+		// Move all remaining events out of the buffer.
 		for {
-			event, ok := buffer.FrontRef()
+			_, ok := buffer.FrontRef()
 			if !ok {
 				break
 			} else {
-				s.outChan <- *event
 				buffer.PopFront()
 				s.bufferCount.Add(-1)
 			}
@@ -148,14 +158,26 @@ func (s *stream[A, P, T, D, H]) receiver() {
 
 	for {
 		event, ok := buffer.FrontRef()
+		if s.closed.Load() {
+			return
+		}
 		if !ok {
-			e, ok := <-s.inChan
-			if !ok {
+			select {
+			case <-s.ctx.Done():
+				return
+			case e, ok := <-s.inChan:
+				if !ok {
+					return
+				}
+				buffer.PushBack(e)
+				s.bufferCount.Add(1)
+			}
+		} else {
+
+			if s.closed.Load() {
 				return
 			}
-			buffer.PushBack(e)
-			s.bufferCount.Add(1)
-		} else {
+
 			select {
 			case e, ok := <-s.inChan:
 				if !ok {
@@ -166,6 +188,8 @@ func (s *stream[A, P, T, D, H]) receiver() {
 			case s.outChan <- *event:
 				buffer.PopFront()
 				s.bufferCount.Add(-1)
+			case <-s.ctx.Done():
+				return
 			}
 		}
 	}
@@ -180,6 +204,8 @@ func (s *stream[A, P, T, D, H]) handleLoop() {
 			s.eventQueue.wakePath(e.pathInfo)
 		case e.newPath:
 			s.eventQueue.initPath(e.pathInfo)
+		case e.release:
+			s.eventQueue.releasePath(e.pathInfo)
 		case e.pathInfo.removed.Load():
 			// The path is removed, so we don't need to handle its events.
 			return
@@ -194,12 +220,6 @@ func (s *stream[A, P, T, D, H]) handleLoop() {
 				zap.Any("recover", r),
 				zap.Stack("stack"))
 		}
-
-		// Move remaining events in the eventChan to pendingQueue.
-		for e := range s.eventChan {
-			handleEvent(e)
-		}
-
 		s.wg.Done()
 	}()
 
@@ -228,15 +248,29 @@ func (s *stream[A, P, T, D, H]) handleLoop() {
 Loop:
 	for {
 		if eventQueueEmpty {
-			e, ok := <-s.eventChan
-			if !ok {
-				// The stream is closed.
+
+			if s.closed.Load() {
 				return
 			}
-			handleEvent(e)
-			eventQueueEmpty = false
-		} else {
+
 			select {
+			case <-s.ctx.Done():
+				return
+			case e, ok := <-s.eventChan:
+				if !ok {
+					return
+				}
+				handleEvent(e)
+				eventQueueEmpty = false
+			}
+		} else {
+			if s.closed.Load() {
+				return
+			}
+
+			select {
+			case <-s.ctx.Done():
+				return
 			case e, ok := <-s.eventChan:
 				if !ok {
 					return
@@ -249,10 +283,19 @@ Loop:
 					eventQueueEmpty = true
 					continue Loop
 				}
-				path.blocking = s.handler.Handle(path.dest, eventBuf...)
-				if path.blocking {
+				if path.removed.Load() {
+					cleanUpEventBuf()
+					continue Loop
+				}
+
+				path.lastHandleEventTs.Store(uint64(s.handler.GetTimestamp(eventBuf[0])))
+
+				path.blocking.Store(s.handler.Handle(path.dest, eventBuf...))
+
+				if path.blocking.Load() {
 					s.eventQueue.blockPath(path)
 				}
+
 				cleanUpEventBuf()
 			}
 		}
@@ -280,7 +323,7 @@ type pathInfo[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]] struct {
 	// guaranteed to see the memory change of this field.
 	removed atomic.Bool
 	// The path is blocked by the handler.
-	blocking bool
+	blocking atomic.Bool
 
 	// The pending events of the path.
 	pendingQueue *deque.Deque[eventWrap[A, P, T, D, H]]
@@ -288,20 +331,18 @@ type pathInfo[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]] struct {
 	// Fields used by the memory control.
 	areaMemStat *areaMemStat[A, P, T, D, H]
 
-	pendingSize          atomic.Int64 // The total size(bytes) of pending events in the pendingQueue of the path.
-	paused               atomic.Bool  // The path is paused to send events.
-	lastSendFeedbackTime atomic.Value
+	pendingSize atomic.Int64 // The total size(bytes) of pending events in the pendingQueue of the path.
+
+	lastHandleEventTs atomic.Uint64
 }
 
 func newPathInfo[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]](area A, path P, dest D) *pathInfo[A, P, T, D, H] {
 	pi := &pathInfo[A, P, T, D, H]{
-		area:                 area,
-		path:                 path,
-		dest:                 dest,
-		pendingQueue:         deque.NewDeque[eventWrap[A, P, T, D, H]](BlockLenInPendingQueue),
-		lastSendFeedbackTime: atomic.Value{},
+		area:         area,
+		path:         path,
+		dest:         dest,
+		pendingQueue: deque.NewDeque[eventWrap[A, P, T, D, H]](BlockLenInPendingQueue),
 	}
-	pi.lastSendFeedbackTime.Store(time.Unix(0, 0))
 	return pi
 }
 
@@ -327,9 +368,10 @@ func (pi *pathInfo[A, P, T, D, H]) appendEvent(event eventWrap[A, P, T, D, H], h
 		// If the last event is a periodic signal, we only need to keep the latest one.
 		// And we don't need to add a new signal.
 		*back = event
-		return false
+		return true
 	} else {
 		pi.pendingQueue.PushBack(event)
+		pi.updatePendingSize(int64(event.eventSize))
 		return true
 	}
 }
@@ -339,31 +381,23 @@ func (pi *pathInfo[A, P, T, D, H]) popEvent() (eventWrap[A, P, T, D, H], bool) {
 	if !ok {
 		return eventWrap[A, P, T, D, H]{}, false
 	}
-	pi.updatePendingSize(int64(-e.eventSize))
 
+	pi.updatePendingSize(int64(-e.eventSize))
 	if pi.areaMemStat != nil {
 		pi.areaMemStat.decPendingSize(pi, int64(e.eventSize))
+		if e.eventType.Property != PeriodicSignal {
+			pi.areaMemStat.lastSizeDecreaseTime.Store(time.Now())
+		}
 	}
 	return e, true
 }
 
 func (pi *pathInfo[A, P, T, D, H]) updatePendingSize(delta int64) {
-	oldSize := pi.pendingSize.Load()
-	// Check for integer overflow/underflow
-	newSize := oldSize + delta
-	if delta > 0 && newSize < oldSize {
-		log.Error("Integer overflow detected in updatePendingSize",
-			zap.Int64("oldSize", oldSize),
-			zap.Int64("delta", delta))
-		return
+	pi.pendingSize.Add(delta)
+	if pi.pendingSize.Load() < 0 {
+		log.Debug("pendingSize is negative", zap.Int64("pendingSize", pi.pendingSize.Load()))
+		pi.pendingSize.Store(0)
 	}
-	if delta < 0 && newSize > oldSize {
-		log.Error("Integer underflow detected in updatePendingSize",
-			zap.Int64("oldSize", oldSize),
-			zap.Int64("delta", delta))
-		return
-	}
-	pi.pendingSize.Store(newSize)
 }
 
 // eventWrap contains the event and the path info.
@@ -372,6 +406,7 @@ type eventWrap[A Area, P Path, T Event, D Dest, H Handler[A, P, T, D]] struct {
 	event   T
 	wake    bool
 	newPath bool
+	release bool
 
 	pathInfo *pathInfo[A, P, T, D, H]
 

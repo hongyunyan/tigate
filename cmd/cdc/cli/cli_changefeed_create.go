@@ -29,7 +29,6 @@ import (
 	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/pingcap/ticdc/pkg/filter"
 	putil "github.com/pingcap/ticdc/pkg/util"
-	"github.com/pingcap/tiflow/cdc/model"
 	"github.com/spf13/cobra"
 	"github.com/tikv/client-go/v2/oracle"
 	"go.uber.org/zap"
@@ -63,7 +62,7 @@ func (o *changefeedCommonOptions) addFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().Uint64Var(&o.targetTs, "target-ts", 0, "Target ts of changefeed")
 	cmd.PersistentFlags().StringVar(&o.sinkURI, "sink-uri", "", "sink uri")
 	cmd.PersistentFlags().StringVar(&o.configFile, "config", "", "Path of the configuration file")
-	cmd.PersistentFlags().StringVar(&o.sortEngine, "sort-engine", model.SortUnified, "sort engine used for data sort")
+	cmd.PersistentFlags().StringVar(&o.sortEngine, "sort-engine", config.SortUnified, "sort engine used for data sort")
 	cmd.PersistentFlags().StringVar(&o.sortDir, "sort-dir", "", "directory used for data sort")
 	cmd.PersistentFlags().StringVar(&o.schemaRegistry, "schema-registry", "",
 		"Avro Schema Registry URI")
@@ -103,7 +102,7 @@ type createChangefeedOptions struct {
 	apiClient               apiv2client.APIV2Interface
 
 	changefeedID            string
-	namespace               string
+	keyspace                string
 	disableGCSafePointCheck bool
 	startTs                 uint64
 	timezone                string
@@ -122,7 +121,7 @@ func newCreateChangefeedOptions(commonChangefeedOptions *changefeedCommonOptions
 // flags related to template printing to it.
 func (o *createChangefeedOptions) addFlags(cmd *cobra.Command) {
 	o.commonChangefeedOptions.addFlags(cmd)
-	cmd.PersistentFlags().StringVarP(&o.namespace, "namespace", "n", "default", "Replication task (changefeed) Namespace")
+	cmd.PersistentFlags().StringVarP(&o.keyspace, "keyspace", "k", "", "Replication task (changefeed) Keyspace")
 	cmd.PersistentFlags().StringVarP(&o.changefeedID, "changefeed-id", "c", "", "Replication task (changefeed) ID")
 	cmd.PersistentFlags().BoolVarP(&o.disableGCSafePointCheck, "disable-gc-check", "", false, "Disable GC safe point check")
 	cmd.PersistentFlags().Uint64Var(&o.startTs, "start-ts", 0, "Start ts of changefeed")
@@ -165,13 +164,13 @@ func (o *createChangefeedOptions) completeReplicaCfg() error {
 	}
 
 	switch o.commonChangefeedOptions.sortEngine {
-	case model.SortInMemory:
-	case model.SortInFile:
-	case model.SortUnified:
+	case config.SortInMemory:
+	case config.SortInFile:
+	case config.SortUnified:
 	default:
 		log.Warn("invalid sort-engine, use Unified Sorter by default",
 			zap.String("invalidSortEngine", o.commonChangefeedOptions.sortEngine))
-		o.commonChangefeedOptions.sortEngine = model.SortUnified
+		o.commonChangefeedOptions.sortEngine = config.SortUnified
 	}
 
 	if o.disableGCSafePointCheck {
@@ -186,25 +185,25 @@ func (o *createChangefeedOptions) completeReplicaCfg() error {
 // validate checks that the provided attach options are specified.
 func (o *createChangefeedOptions) validate(cmd *cobra.Command) error {
 	if o.timezone != "SYSTEM" {
-		cmd.Printf(color.HiYellowString("[WARN] --tz is deprecated in changefeed settings.\n"))
+		cmd.Printf("%s", color.HiYellowString("[WARN] --tz is deprecated in changefeed settings.\n"))
 	}
 
 	// user is not allowed to set sort-dir at changefeed level
 	if o.commonChangefeedOptions.sortDir != "" {
-		cmd.Printf(color.HiYellowString("[WARN] --sort-dir is deprecated in changefeed settings. " +
-			"Please use `cdc server --data-dir` to start the cdc server if possible, sort-dir will be set automatically. " +
+		cmd.Printf("%s", color.HiYellowString("[WARN] --sort-dir is deprecated in changefeed settings. "+
+			"Please use `cdc server --data-dir` to start the cdc server if possible, sort-dir will be set automatically. "+
 			"The --sort-dir here will be no-op\n"))
 		return errors.New("creating changefeed with `--sort-dir`, it's invalid")
 	}
 
 	switch o.commonChangefeedOptions.sortEngine {
-	case model.SortInMemory:
-	case model.SortInFile:
-	case model.SortUnified:
+	case config.SortInMemory:
+	case config.SortInFile:
+	case config.SortUnified:
 	default:
 		log.Warn("invalid sort-engine, use Unified Sorter by default",
 			zap.String("invalidSortEngine", o.commonChangefeedOptions.sortEngine))
-		o.commonChangefeedOptions.sortEngine = model.SortUnified
+		o.commonChangefeedOptions.sortEngine = config.SortUnified
 	}
 
 	return nil
@@ -215,7 +214,7 @@ func (o *createChangefeedOptions) getChangefeedConfig() *v2.ChangefeedConfig {
 	upstreamConfig := o.getUpstreamConfig()
 	return &v2.ChangefeedConfig{
 		ID:            o.changefeedID,
-		Namespace:     o.namespace,
+		Keyspace:      o.keyspace,
 		StartTs:       o.startTs,
 		TargetTs:      o.commonChangefeedOptions.targetTs,
 		SinkURI:       o.commonChangefeedOptions.sinkURI,
@@ -280,7 +279,7 @@ func (o *createChangefeedOptions) run(ctx context.Context, cmd *cobra.Command) e
 		SinkURI:       createChangefeedCfg.SinkURI,
 	}
 
-	tables, err := o.apiClient.Changefeeds().VerifyTable(ctx, verifyTableConfig)
+	tables, err := o.apiClient.Changefeeds().VerifyTable(ctx, verifyTableConfig, o.keyspace)
 	if err != nil {
 		if strings.Contains(err.Error(), "ErrInvalidIgnoreEventType") {
 			supportedEventTypes := filter.SupportedEventTypes()
@@ -321,7 +320,7 @@ func (o *createChangefeedOptions) run(ctx context.Context, cmd *cobra.Command) e
 
 	createChangefeedCfg.ReplicaConfig.IgnoreIneligibleTable = ignoreIneligibleTables
 
-	info, err := o.apiClient.Changefeeds().Create(ctx, createChangefeedCfg)
+	info, err := o.apiClient.Changefeeds().Create(ctx, createChangefeedCfg, o.keyspace)
 	if err != nil {
 		if strings.Contains(err.Error(), "ErrInvalidIgnoreEventType") {
 			supportedEventTypes := filter.SupportedEventTypes()

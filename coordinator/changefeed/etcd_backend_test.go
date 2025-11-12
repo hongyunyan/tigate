@@ -22,8 +22,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/config"
-	mock_etcd "github.com/pingcap/ticdc/pkg/etcd/mock"
-	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/ticdc/pkg/etcd"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -31,27 +30,29 @@ import (
 
 func TestGetAllChangefeeds(t *testing.T) {
 	ctrl := gomock.NewController(t)
-	cdcClient := mock_etcd.NewMockCDCEtcdClient(ctrl)
-	etcdClient := mock_etcd.NewMockClient(ctrl)
+	cdcClient := etcd.NewMockCDCEtcdClient(ctrl)
+	etcdClient := etcd.NewMockClient(ctrl)
 	cdcClient.EXPECT().GetEtcdClient().Return(etcdClient).AnyTimes()
 	cdcClient.EXPECT().GetClusterID().Return("test-cluster-id").AnyTimes()
 
 	// get changefeeds failed
 	backend := NewEtcdBackend(cdcClient)
-	etcdClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(nil, errors.New("get key failed")).
-		Times(1)
+	cdcClient.EXPECT().GetChangefeedInfoAndStatus(gomock.Any()).Return(int64(0), nil, nil, errors.New("get key failed")).Times(1)
 	resp, err := backend.GetAllChangefeeds(context.Background())
 	require.Nil(t, resp)
 	require.NotNil(t, err)
 
 	// info unmarshal failed, changefeed will be ignored
-	etcdClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(&clientv3.GetResponse{Kvs: []*mvccpb.KeyValue{
-			{Key: []byte("/tidb/cdc/default/default/changefeed/info/test"), Value: []byte("invalid json")},
-			{Key: []byte("/tidb/cdc/default/default/changefeed/status/test"), Value: []byte("{}")},
-		}}, nil).
-		Times(1)
+	cdcClient.EXPECT().GetChangefeedInfoAndStatus(gomock.Any()).Return(
+		int64(0),
+		map[common.ChangeFeedDisplayName]*mvccpb.KeyValue{
+			{Name: "test", Keyspace: "default"}: {Key: []byte("/tidb/cdc/default/default/changefeed/info/test"), Value: []byte("{}")},
+		},
+		map[common.ChangeFeedDisplayName]*mvccpb.KeyValue{
+			{Name: "test", Keyspace: "default"}: {Key: []byte("/tidb/cdc/default/default/changefeed/info/test"), Value: []byte("invalid json")},
+		},
+		nil,
+	).Times(1)
 	resp, err = backend.GetAllChangefeeds(context.Background())
 	require.NotNil(t, resp)
 	require.Nil(t, err)
@@ -59,12 +60,16 @@ func TestGetAllChangefeeds(t *testing.T) {
 
 	// status unmarshal failed, changefeed will not be ignored, and the checkpiont ts will be the start ts
 	// the old version of changefeed without gid
-	etcdClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(&clientv3.GetResponse{Kvs: []*mvccpb.KeyValue{
-			{Key: []byte("/tidb/cdc/default/default/changefeed/info/test"), Value: []byte("{\"changefeed-id\":\"test\", \"start-ts\": 1}")},
-			{Key: []byte("/tidb/cdc/default/default/changefeed/status/test"), Value: []byte("}{")},
-		}}, nil).
-		Times(1)
+	cdcClient.EXPECT().GetChangefeedInfoAndStatus(gomock.Any()).Return(
+		int64(0),
+		map[common.ChangeFeedDisplayName]*mvccpb.KeyValue{
+			{Name: "test", Keyspace: "default"}: {Key: []byte("/tidb/cdc/default/default/changefeed/info/test"), Value: []byte("}{")},
+		},
+		map[common.ChangeFeedDisplayName]*mvccpb.KeyValue{
+			{Name: "test", Keyspace: "default"}: {Key: []byte("/tidb/cdc/default/default/changefeed/info/test"), Value: []byte(`{"changefeed-id":"test", "start-ts": 1}`)},
+		},
+		nil,
+	).Times(1)
 	// put the gid and status
 	etcdClient.EXPECT().Put(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(2)
 	resp, err = backend.GetAllChangefeeds(context.Background())
@@ -77,11 +82,14 @@ func TestGetAllChangefeeds(t *testing.T) {
 	}
 
 	// has no info, changefeed will be ignored
-	etcdClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(&clientv3.GetResponse{Kvs: []*mvccpb.KeyValue{
-			{Key: []byte("/tidb/cdc/default/default/changefeed/status/test"), Value: []byte("{}")},
-		}}, nil).
-		Times(1)
+	cdcClient.EXPECT().GetChangefeedInfoAndStatus(gomock.Any()).Return(
+		int64(0),
+		map[common.ChangeFeedDisplayName]*mvccpb.KeyValue{
+			{Name: "test", Keyspace: "default"}: {Key: []byte("/tidb/cdc/default/default/changefeed/info/test"), Value: []byte("{}")},
+		},
+		nil,
+		nil,
+	).Times(1)
 	resp, err = backend.GetAllChangefeeds(context.Background())
 	require.NotNil(t, resp)
 	require.Nil(t, err)
@@ -90,8 +98,8 @@ func TestGetAllChangefeeds(t *testing.T) {
 
 func TestCreateChangefeed(t *testing.T) {
 	ctrl := gomock.NewController(t)
-	cdcClient := mock_etcd.NewMockCDCEtcdClient(ctrl)
-	etcdClient := mock_etcd.NewMockClient(ctrl)
+	cdcClient := etcd.NewMockCDCEtcdClient(ctrl)
+	etcdClient := etcd.NewMockClient(ctrl)
 	cdcClient.EXPECT().GetEtcdClient().Return(etcdClient).AnyTimes()
 	cdcClient.EXPECT().GetClusterID().Return("test-cluster-id").AnyTimes()
 	backend := NewEtcdBackend(cdcClient)
@@ -114,8 +122,8 @@ func TestCreateChangefeed(t *testing.T) {
 
 func TestUpdateChangefeed(t *testing.T) {
 	ctrl := gomock.NewController(t)
-	cdcClient := mock_etcd.NewMockCDCEtcdClient(ctrl)
-	etcdClient := mock_etcd.NewMockClient(ctrl)
+	cdcClient := etcd.NewMockCDCEtcdClient(ctrl)
+	etcdClient := etcd.NewMockClient(ctrl)
 	cdcClient.EXPECT().GetEtcdClient().Return(etcdClient).AnyTimes()
 	cdcClient.EXPECT().GetClusterID().Return("test-cluster-id").AnyTimes()
 	backend := NewEtcdBackend(cdcClient)
@@ -142,14 +150,14 @@ func TestPauseChangefeed(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	cdcClient := mock_etcd.NewMockCDCEtcdClient(ctrl)
-	etcdClient := mock_etcd.NewMockClient(ctrl)
+	cdcClient := etcd.NewMockCDCEtcdClient(ctrl)
+	etcdClient := etcd.NewMockClient(ctrl)
 	cdcClient.EXPECT().GetEtcdClient().Return(etcdClient).AnyTimes()
 	cdcClient.EXPECT().GetClusterID().Return("test-cluster-id").AnyTimes()
 	backend := NewEtcdBackend(cdcClient)
 
-	changefeedID := common.NewChangeFeedIDWithName("test")
-	info := &config.ChangeFeedInfo{State: model.StateNormal}
+	changefeedID := common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceNamme)
+	info := &config.ChangeFeedInfo{State: config.StateNormal}
 	status := &config.ChangeFeedStatus{Progress: config.ProgressStopping}
 
 	cdcClient.EXPECT().GetChangeFeedInfo(gomock.Any(), changefeedID.DisplayName).Return(info, nil).Times(1)
@@ -164,13 +172,13 @@ func TestDeleteChangefeed(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	cdcClient := mock_etcd.NewMockCDCEtcdClient(ctrl)
-	etcdClient := mock_etcd.NewMockClient(ctrl)
+	cdcClient := etcd.NewMockCDCEtcdClient(ctrl)
+	etcdClient := etcd.NewMockClient(ctrl)
 	cdcClient.EXPECT().GetEtcdClient().Return(etcdClient).AnyTimes()
 	cdcClient.EXPECT().GetClusterID().Return("test-cluster-id").AnyTimes()
 	backend := NewEtcdBackend(cdcClient)
 
-	changefeedID := common.NewChangeFeedIDWithName("test")
+	changefeedID := common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceNamme)
 
 	etcdClient.EXPECT().Txn(gomock.Any(), gomock.Any(), NewFuncMatcher(func(i interface{}) bool {
 		ops := i.([]clientv3.Op)
@@ -188,14 +196,14 @@ func TestResumeChangefeed(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	cdcClient := mock_etcd.NewMockCDCEtcdClient(ctrl)
-	etcdClient := mock_etcd.NewMockClient(ctrl)
+	cdcClient := etcd.NewMockCDCEtcdClient(ctrl)
+	etcdClient := etcd.NewMockClient(ctrl)
 	cdcClient.EXPECT().GetEtcdClient().Return(etcdClient).AnyTimes()
 	cdcClient.EXPECT().GetClusterID().Return("test-cluster-id").AnyTimes()
 	backend := NewEtcdBackend(cdcClient)
 
-	changefeedID := common.NewChangeFeedIDWithName("test")
-	info := &config.ChangeFeedInfo{State: model.StateStopped}
+	changefeedID := common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceNamme)
+	info := &config.ChangeFeedInfo{State: config.StateStopped}
 	status := &config.ChangeFeedStatus{CheckpointTs: 100}
 
 	cdcClient.EXPECT().GetChangeFeedInfo(gomock.Any(), changefeedID.DisplayName).Return(info, nil).Times(1)
@@ -210,13 +218,13 @@ func TestSetChangefeedProgress(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	cdcClient := mock_etcd.NewMockCDCEtcdClient(ctrl)
-	etcdClient := mock_etcd.NewMockClient(ctrl)
+	cdcClient := etcd.NewMockCDCEtcdClient(ctrl)
+	etcdClient := etcd.NewMockClient(ctrl)
 	cdcClient.EXPECT().GetEtcdClient().Return(etcdClient).AnyTimes()
 	cdcClient.EXPECT().GetClusterID().Return("test-cluster-id").AnyTimes()
 	backend := NewEtcdBackend(cdcClient)
 
-	changefeedID := common.NewChangeFeedIDWithName("test")
+	changefeedID := common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceNamme)
 	status := &config.ChangeFeedStatus{Progress: config.ProgressNone}
 
 	cdcClient.EXPECT().GetChangeFeedStatus(gomock.Any(), changefeedID).Return(status, int64(0), nil).Times(1)
@@ -230,14 +238,14 @@ func TestUpdateChangefeedCheckpointTs(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	cdcClient := mock_etcd.NewMockCDCEtcdClient(ctrl)
-	etcdClient := mock_etcd.NewMockClient(ctrl)
+	cdcClient := etcd.NewMockCDCEtcdClient(ctrl)
+	etcdClient := etcd.NewMockClient(ctrl)
 	cdcClient.EXPECT().GetEtcdClient().Return(etcdClient).AnyTimes()
 	cdcClient.EXPECT().GetClusterID().Return("test-cluster-id").AnyTimes()
 	backend := NewEtcdBackend(cdcClient)
 
 	cps := map[common.ChangeFeedID]uint64{
-		common.NewChangeFeedIDWithName("test1"): 100,
+		common.NewChangeFeedIDWithName("test1", common.DefaultKeyspaceNamme): 100,
 	}
 	etcdClient.EXPECT().Txn(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&clientv3.TxnResponse{Succeeded: false}, nil).Times(1)
 	err := backend.UpdateChangefeedCheckpointTs(context.Background(), cps)
@@ -245,7 +253,7 @@ func TestUpdateChangefeedCheckpointTs(t *testing.T) {
 
 	cps = make(map[common.ChangeFeedID]uint64)
 	for i := 0; i < 129; i++ {
-		cps[common.NewChangeFeedIDWithName(fmt.Sprintf("%d", i))] = 100
+		cps[common.NewChangeFeedIDWithName(fmt.Sprintf("%d", i), common.DefaultKeyspaceNamme)] = 100
 	}
 	etcdClient.EXPECT().Txn(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&clientv3.TxnResponse{Succeeded: true}, nil).Times(2)
 	err = backend.UpdateChangefeedCheckpointTs(context.Background(), cps)

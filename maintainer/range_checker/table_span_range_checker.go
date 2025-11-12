@@ -20,7 +20,7 @@ import (
 	"sync/atomic"
 
 	"github.com/google/btree"
-	"github.com/pingcap/ticdc/pkg/spanz"
+	"github.com/pingcap/ticdc/pkg/common"
 )
 
 // TableSpanRangeChecker is used to check if all ranges cover the start and end byte slices.
@@ -30,13 +30,13 @@ type TableSpanRangeChecker struct {
 }
 
 // NewTableSpanRangeChecker creates a new TableSpanRangeChecker with given start and end.
-func NewTableSpanRangeChecker(tables []int64) *TableSpanRangeChecker {
+func NewTableSpanRangeChecker(keyspaceID uint32, tables []int64) *TableSpanRangeChecker {
 	sc := &TableSpanRangeChecker{
 		tableSpans: make(map[int64]*SpanCoverageChecker),
 		covered:    atomic.Bool{},
 	}
 	for _, table := range tables {
-		span := spanz.TableIDToComparableSpan(table)
+		span := common.TableIDToComparableSpan(keyspaceID, table)
 		sc.tableSpans[table] = NewTableSpanCoverageChecker(span.StartKey, span.EndKey)
 	}
 	return sc

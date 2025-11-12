@@ -17,7 +17,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
@@ -25,7 +24,6 @@ import (
 	"github.com/pingcap/ticdc/pkg/config"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/etcd"
-	"github.com/pingcap/tiflow/cdc/model"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -46,54 +44,54 @@ func NewEtcdBackend(etcdClient etcd.CDCEtcdClient) *EtcdBackend {
 }
 
 func (b *EtcdBackend) GetAllChangefeeds(ctx context.Context) (map[common.ChangeFeedID]*ChangefeedMetaWrapper, error) {
-	changefeedPrefix := etcd.NamespacedPrefix(b.etcdClient.GetClusterID(), model.DefaultNamespace) + "/changefeed"
-
-	resp, err := b.etcdClient.GetEtcdClient().Get(ctx, changefeedPrefix, clientv3.WithPrefix())
+	_, kvStatus, kvInfo, err := b.etcdClient.GetChangefeedInfoAndStatus(ctx)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
 	statusMap := make(map[common.ChangeFeedDisplayName]*config.ChangeFeedStatus)
 	cfMap := make(map[common.ChangeFeedID]*ChangefeedMetaWrapper)
-	for _, kv := range resp.Kvs {
-		key := string(kv.Key)
-		ns, cf, isStatus := extractKeySuffix(key)
-		if isStatus {
-			status := &config.ChangeFeedStatus{}
-			err = status.Unmarshal(kv.Value)
-			if err != nil {
-				log.Warn("failed to unmarshal change feed Status, ignore",
-					zap.String("key", key), zap.Error(err))
-				continue
-			}
-			statusMap[common.NewChangeFeedDisplayName(cf, ns)] = status
-		} else {
-			detail := &config.ChangeFeedInfo{}
-			err = detail.Unmarshal(kv.Value)
-			if err != nil {
-				log.Warn("failed to unmarshal change feed Info, ignore",
-					zap.String("key", key), zap.Error(err))
-				continue
-			}
-			// we can not load the changefeed name from the value, it must an old version info
-			if detail.ChangefeedID.Name() == "" {
-				log.Warn("load a old version change feed Info, migrate it to new version",
-					zap.String("key", key))
-				detail.ChangefeedID = common.NewChangeFeedIDWithDisplayName(common.ChangeFeedDisplayName{
-					Name:      cf,
-					Namespace: ns,
-				})
-				if data, err := detail.Marshal(); err != nil {
-					log.Warn("failed to marshal change feed Info, ignore",
-						zap.Error(err))
-				} else {
-					_, _ = b.etcdClient.GetEtcdClient().Put(ctx, key, data)
-				}
-			}
 
-			cfMap[detail.ChangefeedID] = &ChangefeedMetaWrapper{Info: detail}
+	for key, kv := range kvStatus {
+		status := &config.ChangeFeedStatus{}
+		err = status.Unmarshal(kv.Value)
+		if err != nil {
+			log.Warn("failed to unmarshal change feed Status, ignore",
+				zap.Any("key", key), zap.Error(err))
+			continue
 		}
+		statusMap[key] = status
 	}
+
+	for key, kv := range kvInfo {
+		detail := &config.ChangeFeedInfo{}
+		err = detail.Unmarshal(kv.Value)
+		if err != nil {
+			log.Warn("failed to unmarshal change feed Info, ignore",
+				zap.Any("key", key), zap.Error(err))
+			continue
+		}
+
+		// we can not load the changefeed name from the value, it must an old version info
+		if detail.ChangefeedID.Name() == "" {
+			log.Warn("load a old version change feed Info, migrate it to new version",
+				zap.Any("key", key))
+			detail.ChangefeedID = common.NewChangeFeedIDWithDisplayName(common.ChangeFeedDisplayName{
+				Name:     key.Name,
+				Keyspace: key.Keyspace,
+			})
+			if data, err := detail.Marshal(); err != nil {
+				log.Warn("failed to marshal change feed Info, ignore",
+					zap.Error(err))
+			} else {
+				_, _ = b.etcdClient.GetEtcdClient().Put(ctx, string(kv.Key), data)
+			}
+		}
+
+		cfMap[detail.ChangefeedID] = &ChangefeedMetaWrapper{Info: detail}
+
+	}
+
 	for id, wrapper := range cfMap {
 		wrapper.Status = statusMap[id.DisplayName]
 	}
@@ -198,7 +196,7 @@ func (b *EtcdBackend) PauseChangefeed(ctx context.Context, id common.ChangeFeedI
 	if err != nil {
 		return errors.Trace(err)
 	}
-	info.State = model.StateStopped
+	info.State = config.StateStopped
 	infoKey := etcd.GetEtcdKeyChangeFeedInfo(b.etcdClient.GetClusterID(), id.DisplayName)
 	inforValue, err := info.Marshal()
 	if err != nil {
@@ -256,7 +254,7 @@ func (b *EtcdBackend) ResumeChangefeed(ctx context.Context,
 	if err != nil {
 		return errors.Trace(err)
 	}
-	info.State = model.StateNormal
+	info.State = config.StateNormal
 	newStr, err := info.Marshal()
 	if err != nil {
 		return errors.Trace(err)
@@ -295,6 +293,7 @@ func (b *EtcdBackend) SetChangefeedProgress(ctx context.Context, id common.Chang
 	if err != nil {
 		return errors.Trace(err)
 	}
+
 	status.Progress = progress
 	jobValue, err := status.Marshal()
 	if err != nil {
@@ -340,7 +339,7 @@ func (b *EtcdBackend) UpdateChangefeedCheckpointTs(ctx context.Context, cps map[
 		opsThen = append(opsThen, clientv3.OpPut(jobKey, jobValue))
 		batchSize++
 		if batchSize >= 128 {
-			if err := txnFunc(); err != nil {
+			if err = txnFunc(); err != nil {
 				return errors.Trace(err)
 			}
 			opsThen = opsThen[:0]
@@ -353,14 +352,6 @@ func (b *EtcdBackend) UpdateChangefeedCheckpointTs(ctx context.Context, cps map[
 		}
 	}
 	return nil
-}
-
-// extractKeySuffix extracts the suffix of an etcd key, such as extracting
-// "6a6c6dd290bc8732" from /tidb/cdc/cluster/namespace/changefeed/info/6a6c6dd290bc8732
-// or from /tidb/cdc/cluster/namespace/changefeed/status/6a6c6dd290bc8732
-func extractKeySuffix(key string) (string, string, bool) {
-	subs := strings.Split(key, "/")
-	return subs[len(subs)-4], subs[len(subs)-1], subs[len(subs)-2] == "status"
 }
 
 func logEtcdOps(ops []clientv3.Op, committed bool) {

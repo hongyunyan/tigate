@@ -15,19 +15,22 @@ package middleware
 
 import (
 	"bufio"
-	"errors"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/pingcap/kvproto/pkg/keyspacepb"
 	"github.com/pingcap/log"
+	"github.com/pingcap/ticdc/pkg/api"
+	appcontext "github.com/pingcap/ticdc/pkg/common/context"
 	"github.com/pingcap/ticdc/pkg/config"
+	"github.com/pingcap/ticdc/pkg/config/kerneltype"
+	"github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/httputil"
+	"github.com/pingcap/ticdc/pkg/keyspace"
 	"github.com/pingcap/ticdc/pkg/node"
 	"github.com/pingcap/ticdc/pkg/server"
-	"github.com/pingcap/tiflow/cdc/api"
-	"github.com/pingcap/tiflow/cdc/model"
-	"github.com/pingcap/tiflow/pkg/httputil"
 	"go.uber.org/zap"
 )
 
@@ -43,6 +46,8 @@ const (
 // ClientVersionHeader is the header name of client version
 const ClientVersionHeader = "X-client-version"
 
+const ctxKeyspaceKey = "ctx-keyspace"
+
 // ErrorHandleMiddleware puts the error into response
 func ErrorHandleMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -54,9 +59,9 @@ func ErrorHandleMiddleware() gin.HandlerFunc {
 			err := lastError.Err
 			// put the error into response
 			if api.IsHTTPBadRequestError(err) {
-				c.IndentedJSON(http.StatusBadRequest, model.NewHTTPError(err))
+				c.IndentedJSON(http.StatusBadRequest, api.NewHTTPError(err))
 			} else {
-				c.IndentedJSON(http.StatusInternalServerError, model.NewHTTPError(err))
+				c.IndentedJSON(http.StatusInternalServerError, api.NewHTTPError(err))
 			}
 			c.Abort()
 			return
@@ -215,4 +220,52 @@ func ForwardToServer(c *gin.Context, fromID node.ID, toAddr string) {
 		_ = c.Error(err)
 		return
 	}
+}
+
+// KeyspaceCheckerMiddleware check if the request keyspace is valid
+func KeyspaceCheckerMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// we not need to check keyspace for classic mode
+		// if the classic mode supports multiple keyspaces in future
+		// we need to remove this if block
+		if kerneltype.IsClassic() {
+			c.Next()
+			return
+		}
+
+		ks := c.Query(api.APIOpVarKeyspace)
+		if ks == "" {
+			c.IndentedJSON(http.StatusBadRequest, errors.ErrAPIInvalidParam)
+			c.Abort()
+			return
+		}
+
+		keyspaceManager := appcontext.GetService[keyspace.Manager](appcontext.KeyspaceManager)
+		meta, err := keyspaceManager.LoadKeyspace(c.Request.Context(), ks)
+		if errors.IsKeyspaceNotExistError(err) {
+			c.IndentedJSON(http.StatusBadRequest, errors.ErrAPIInvalidParam)
+			c.Abort()
+			return
+		} else if err != nil {
+			c.IndentedJSON(http.StatusInternalServerError, api.NewHTTPError(err))
+			c.Abort()
+			return
+		}
+
+		c.Set(ctxKeyspaceKey, meta)
+
+		c.Next()
+	}
+}
+
+func GetKeyspaceFromContext(c *gin.Context) *keyspacepb.KeyspaceMeta {
+	meta := &keyspacepb.KeyspaceMeta{}
+	obj, ok := c.Get(ctxKeyspaceKey)
+	if ok {
+		meta, ok = obj.(*keyspacepb.KeyspaceMeta)
+		if ok {
+			return meta
+		}
+	}
+	return meta
 }

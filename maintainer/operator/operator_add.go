@@ -19,6 +19,7 @@ import (
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/maintainer/replica"
+	"github.com/pingcap/ticdc/maintainer/span"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/messaging"
 	"github.com/pingcap/ticdc/pkg/node"
@@ -28,22 +29,25 @@ import (
 
 // AddDispatcherOperator is an operator to schedule a table span to a dispatcher
 type AddDispatcherOperator struct {
-	replicaSet *replica.SpanReplication
-	dest       node.ID
-	finished   atomic.Bool
-	removed    atomic.Bool
-	db         *replica.ReplicationDB
+	replicaSet     *replica.SpanReplication
+	dest           node.ID
+	finished       atomic.Bool
+	removed        atomic.Bool
+	spanController *span.Controller
+
+	sendThrottler sendThrottler
 }
 
 func NewAddDispatcherOperator(
-	db *replica.ReplicationDB,
+	spanController *span.Controller,
 	replicaSet *replica.SpanReplication,
 	dest node.ID,
 ) *AddDispatcherOperator {
 	return &AddDispatcherOperator{
-		replicaSet: replicaSet,
-		dest:       dest,
-		db:         db,
+		replicaSet:     replicaSet,
+		dest:           dest,
+		spanController: spanController,
+		sendThrottler:  newSendThrottler(),
 	}
 }
 
@@ -73,6 +77,11 @@ func (m *AddDispatcherOperator) Schedule() *messaging.TargetMessage {
 	if m.finished.Load() || m.removed.Load() {
 		return nil
 	}
+
+	if !m.sendThrottler.shouldSend() {
+		return nil
+	}
+
 	msg, err := m.replicaSet.NewAddDispatcherMessage(m.dest)
 	if err != nil {
 		log.Warn("generate dispatcher message failed, retry later", zap.String("operator", m.String()), zap.Error(err))
@@ -107,15 +116,15 @@ func (m *AddDispatcherOperator) OnTaskRemoved() {
 }
 
 func (m *AddDispatcherOperator) Start() {
-	m.db.BindSpanToNode("", m.dest, m.replicaSet)
+	m.spanController.BindSpanToNode("", m.dest, m.replicaSet)
 }
 
 func (m *AddDispatcherOperator) PostFinish() {
 	if !m.removed.Load() {
-		m.db.MarkSpanReplicating(m.replicaSet)
+		m.spanController.MarkSpanReplicating(m.replicaSet)
 	} else {
-		if m.db.GetTaskByID(m.replicaSet.ID) != nil { // TODO:what that is ?
-			m.db.MarkSpanAbsent(m.replicaSet)
+		if m.spanController.GetTaskByID(m.replicaSet.ID) != nil {
+			m.spanController.MarkSpanAbsent(m.replicaSet)
 		}
 	}
 }
@@ -127,4 +136,8 @@ func (m *AddDispatcherOperator) String() string {
 
 func (m *AddDispatcherOperator) Type() string {
 	return "add"
+}
+
+func (m *AddDispatcherOperator) BlockTsForward() bool {
+	return true
 }

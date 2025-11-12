@@ -30,9 +30,9 @@ import (
 	"github.com/linkedin/goavro/v2"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/httputil"
+	"github.com/pingcap/ticdc/pkg/security"
 	"github.com/pingcap/ticdc/pkg/sink/codec/common"
-	"github.com/pingcap/tiflow/pkg/httputil"
-	"github.com/pingcap/tiflow/pkg/security"
 	"go.uber.org/zap"
 )
 
@@ -83,7 +83,8 @@ func NewConfluentSchemaManager(
 	}
 	resp, err := httpCli.Get(ctx, registryURL)
 	if err != nil {
-		log.Error("Test connection to Schema Registry failed", zap.Error(err))
+		log.Error("Test connection to Schema Registry failed",
+			zap.String("registryURL", registryURL), zap.Error(err))
 		return nil, errors.WrapError(errors.ErrAvroSchemaAPIError, err)
 	}
 	defer resp.Body.Close()
@@ -266,7 +267,7 @@ func (m *confluentSchemaManager) Lookup(
 	}
 
 	cacheEntry := new(schemaCacheEntry)
-	cacheEntry.codec, err = goavro.NewCodec(jsonResp.Schema)
+	cacheEntry.codec, err = GenCodec(jsonResp.Schema)
 	if err != nil {
 		log.Error("Creating Avro codec failed", zap.Error(err))
 		return nil, errors.WrapError(errors.ErrAvroSchemaAPIError, err)
@@ -313,7 +314,7 @@ func (m *confluentSchemaManager) GetCachedOrRegister(
 		return nil, nil, err
 	}
 
-	codec, err := goavro.NewCodec(schema)
+	codec, err := GenCodec(schema)
 	if err != nil {
 		log.Error("GetCachedOrRegister: Could not make goavro codec", zap.Error(err))
 		return nil, nil, errors.WrapError(errors.ErrAvroSchemaAPIError, err)

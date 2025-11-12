@@ -24,7 +24,6 @@ import (
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
 	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/sink/codec/common"
-	"github.com/pingcap/tiflow/cdc/model"
 	"go.uber.org/zap"
 )
 
@@ -107,10 +106,10 @@ func (b *bootstrapWorker) run(ctx context.Context) error {
 
 func (b *bootstrapWorker) addEvent(
 	ctx context.Context,
-	key model.TopicPartitionKey,
-	row *commonEvent.RowChangedEvent,
+	key commonEvent.TopicPartitionKey,
+	row *commonEvent.RowEvent,
 ) error {
-	table, ok := b.activeTables.Load(row.GetTableID())
+	table, ok := b.activeTables.Load(row.TableInfo.TableName.TableID)
 	if !ok {
 		tb := newTableStatistic(key, row)
 		b.activeTables.Store(tb.id, tb)
@@ -154,10 +153,9 @@ func (b *bootstrapWorker) sendBootstrapMsg(ctx context.Context, table *tableStat
 
 func NewBootstrapDDLEvent(tableInfo *commonType.TableInfo) *commonEvent.DDLEvent {
 	return &commonEvent.DDLEvent{
-		// StartTs:  0,
-		FinishedTs: 0,
-		// TableInfo:   tableInfo,
-		// IsBootstrap: true,
+		FinishedTs:  0,
+		TableInfo:   tableInfo,
+		IsBootstrap: true,
 	}
 }
 
@@ -178,7 +176,7 @@ func (b *bootstrapWorker) generateEvents(
 	}
 	for i := int32(0); i < totalPartition; i++ {
 		f := &future{
-			Key: model.TopicPartitionKey{
+			Key: commonEvent.TopicPartitionKey{
 				Topic:     topic,
 				Partition: i,
 			},
@@ -230,16 +228,16 @@ type tableStatistic struct {
 	tableInfo atomic.Value
 }
 
-func newTableStatistic(key model.TopicPartitionKey, row *commonEvent.RowChangedEvent) *tableStatistic {
+func newTableStatistic(key commonEvent.TopicPartitionKey, row *commonEvent.RowEvent) *tableStatistic {
 	res := &tableStatistic{
-		id:    row.GetTableID(),
+		id:    row.TableInfo.TableName.TableID,
 		topic: key.Topic,
 	}
 	res.totalPartition.Store(key.TotalPartition)
 	res.counter.Add(1)
 	res.lastMsgReceivedTime.Store(time.Now())
 	res.lastSendTime.Store(time.Unix(0, 0))
-	res.version.Store(row.TableInfo.UpdateTS())
+	res.version.Store(row.TableInfo.GetUpdateTS())
 	res.tableInfo.Store(row.TableInfo)
 	return res
 }
@@ -253,15 +251,15 @@ func (t *tableStatistic) shouldSendBootstrapMsg(
 		t.counter.Load() >= sendBootstrapMsgCountInterval
 }
 
-func (t *tableStatistic) update(row *commonEvent.RowChangedEvent, totalPartition int32) {
+func (t *tableStatistic) update(row *commonEvent.RowEvent, totalPartition int32) {
 	t.counter.Add(1)
 	t.lastMsgReceivedTime.Store(time.Now())
 
 	// Note(dongmen): Rename Table DDL is a special case,
 	// the TableInfo.Name is changed but the TableInfo.UpdateTs is not changed.
-	if t.version.Load() != row.TableInfo.UpdateTS() ||
+	if t.version.Load() != row.TableInfo.GetUpdateTS() ||
 		t.tableInfo.Load().(*commonType.TableInfo).TableName.Table != row.TableInfo.TableName.Table {
-		t.version.Store(row.TableInfo.UpdateTS())
+		t.version.Store(row.TableInfo.GetUpdateTS())
 		t.tableInfo.Store(row.TableInfo)
 	}
 	if t.totalPartition.Load() != totalPartition {

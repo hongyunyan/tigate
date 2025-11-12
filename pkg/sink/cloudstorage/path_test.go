@@ -23,24 +23,23 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/pingcap/ticdc/downstreamadapter/sink/helper"
+	"github.com/pingcap/ticdc/pkg/clock"
 	commonType "github.com/pingcap/ticdc/pkg/common"
 	appcontext "github.com/pingcap/ticdc/pkg/common/context"
 	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/pingcap/ticdc/pkg/pdutil"
 	"github.com/pingcap/ticdc/pkg/util"
 	timodel "github.com/pingcap/tidb/pkg/meta/model"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/parser/types"
-	"github.com/pingcap/tiflow/engine/pkg/clock"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/oracle"
 )
 
 func testFilePathGenerator(ctx context.Context, t *testing.T, dir string) *FilePathGenerator {
 	uri := fmt.Sprintf("file:///%s?flush-interval=2s", dir)
-	storage, err := helper.GetExternalStorageFromURI(ctx, uri)
+	storage, err := util.GetExternalStorageWithDefaultTimeout(ctx, uri)
 	require.NoError(t, err)
 
 	sinkURI, err := url.Parse(uri)
@@ -303,27 +302,42 @@ func TestCheckOrWriteSchema(t *testing.T) {
 	ft := types.NewFieldType(mysql.TypeLong)
 	ft.SetFlag(mysql.PriKeyFlag | mysql.NotNullFlag)
 	col := &timodel.ColumnInfo{
-		Name:         pmodel.NewCIStr("Id"),
+		Name:         ast.NewCIStr("Id"),
 		FieldType:    *ft,
 		DefaultValue: 10,
 	}
 	columns = append(columns, col)
-	tableInfo := commonType.WrapTableInfo(101, "test", &timodel.TableInfo{Columns: columns})
+	tidbInfo := &timodel.TableInfo{
+		ID:      20,
+		Name:    ast.NewCIStr("table1"),
+		Columns: columns,
+		Version: 100,
+	}
+	tableInfo := commonType.WrapTableInfo("test", tidbInfo)
 
 	table := VersionedTableName{
 		TableNameWithPhysicTableID: tableInfo.TableName,
 		TableInfoVersion:           100,
 	}
 
-	err := f.CheckOrWriteSchema(ctx, table, tableInfo)
+	hasNewerSchemaVersion, err := f.CheckOrWriteSchema(ctx, table, tableInfo)
 	require.NoError(t, err)
+	require.False(t, hasNewerSchemaVersion)
 	require.Equal(t, table.TableInfoVersion, f.versionMap[table])
+
+	// test old dml file can be ignored
+	table.TableInfoVersion = 99
+	hasNewerSchemaVersion, err = f.CheckOrWriteSchema(ctx, table, tableInfo)
+	require.NoError(t, err)
+	require.True(t, hasNewerSchemaVersion)
+	require.Equal(t, 1, len(f.versionMap))
 
 	// test only table version changed, schema file should be reused
 	table.TableInfoVersion = 101
-	err = f.CheckOrWriteSchema(ctx, table, tableInfo)
+	hasNewerSchemaVersion, err = f.CheckOrWriteSchema(ctx, table, tableInfo)
 	require.NoError(t, err)
-	require.Equal(t, table.TableInfoVersion, f.versionMap[table])
+	require.False(t, hasNewerSchemaVersion)
+	require.Equal(t, uint64(tidbInfo.Version), f.versionMap[table])
 
 	dir = filepath.Join(dir, "test/table1/meta")
 	files, err := os.ReadDir(dir)
@@ -338,8 +352,9 @@ func TestCheckOrWriteSchema(t *testing.T) {
 	err = os.Remove(filepath.Join(dir, files[0].Name()))
 	require.NoError(t, err)
 	delete(f.versionMap, table)
-	err = f.CheckOrWriteSchema(ctx, table, tableInfo)
+	hasNewerSchemaVersion, err = f.CheckOrWriteSchema(ctx, table, tableInfo)
 	require.NoError(t, err)
+	require.False(t, hasNewerSchemaVersion)
 	require.Equal(t, table.TableInfoVersion, f.versionMap[table])
 
 	files, err = os.ReadDir(dir)
@@ -354,7 +369,7 @@ func TestRemoveExpiredFilesWithoutPartition(t *testing.T) {
 	defer cancel()
 	dir := t.TempDir()
 	uri := fmt.Sprintf("file:///%s?flush-interval=2s", dir)
-	storage, err := helper.GetExternalStorageFromURI(ctx, uri)
+	storage, err := util.GetExternalStorageWithDefaultTimeout(ctx, uri)
 	require.NoError(t, err)
 	sinkURI, err := url.Parse(uri)
 	require.NoError(t, err)

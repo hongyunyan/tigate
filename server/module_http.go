@@ -23,8 +23,7 @@ import (
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/api"
 	"github.com/pingcap/ticdc/pkg/common"
-	"github.com/pingcap/ticdc/pkg/errors"
-	clogutil "github.com/pingcap/tiflow/pkg/logutil"
+	"github.com/pingcap/ticdc/pkg/logger"
 	"go.uber.org/zap"
 	"golang.org/x/net/netutil"
 )
@@ -51,7 +50,7 @@ func NewHttpServer(c *server, lis net.Listener) common.SubModule {
 	// We use it here to limit the max concurrent connections of statusServer.
 	lis = netutil.LimitListener(lis, maxHTTPConnection)
 
-	logWritter := clogutil.InitGinLogWritter()
+	logWritter := logger.InitGinLogWritter()
 	router := gin.New()
 	// add gin.RecoveryWithWriter() to handle unexpected panic (logging and
 	// returning status code 500)
@@ -74,15 +73,35 @@ func NewHttpServer(c *server, lis net.Listener) common.SubModule {
 
 func (s *HttpServer) Run(ctx context.Context) error {
 	log.Info("http server is running", zap.String("addr", s.listener.Addr().String()))
-	err := s.server.Serve(s.listener)
-	if err != nil {
-		log.Error("http server error", zap.Error(err))
+	defer func() {
+		log.Info("http server exited")
+	}()
+	// we must to exit if the context is done.
+	ch := make(chan error)
+	go func() {
+		err := s.server.Serve(s.listener)
+		if err != nil {
+			log.Error("http server error", zap.Error(err))
+		}
+		ch <- err
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-ch:
+		return err
 	}
-	return errors.WrapError(errors.ErrServeHTTP, err)
 }
 
 func (s *HttpServer) Close(ctx context.Context) error {
-	return s.server.Shutdown(ctx)
+	log.Info("http server is closing")
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	err := s.server.Shutdown(ctx)
+	if err != nil {
+		log.Warn("close http server failed", zap.Error(err))
+	}
+	return err
 }
 
 func (s *HttpServer) Name() string {

@@ -20,9 +20,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/ticdc/pkg/config"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/version"
-	"github.com/pingcap/tiflow/cdc/model"
 )
 
 type ID string
@@ -33,6 +33,10 @@ func (s ID) String() string {
 
 func (s ID) GetSize() int64 {
 	return int64(len(s))
+}
+
+func (s ID) IsEmpty() bool {
+	return s == ""
 }
 
 func NewID() ID {
@@ -86,7 +90,7 @@ func (c *Info) Unmarshal(data []byte) error {
 		"unmarshal data: %v", data)
 }
 
-func CaptureInfoToNodeInfo(captureInfo *model.CaptureInfo) *Info {
+func CaptureInfoToNodeInfo(captureInfo *config.CaptureInfo) *Info {
 	return &Info{
 		ID:             ID(captureInfo.ID),
 		AdvertiseAddr:  captureInfo.AdvertiseAddr,
@@ -97,7 +101,7 @@ func CaptureInfoToNodeInfo(captureInfo *model.CaptureInfo) *Info {
 	}
 }
 
-func CaptureInfosToNodeInfos(captureInfos map[model.CaptureID]*model.CaptureInfo) map[ID]*Info {
+func CaptureInfosToNodeInfos(captureInfos map[config.CaptureID]*config.CaptureInfo) map[ID]*Info {
 	nodeInfos := make(map[ID]*Info)
 	for _, ci := range captureInfos {
 		nodeInfos[ID(ci.ID)] = CaptureInfoToNodeInfo(ci)

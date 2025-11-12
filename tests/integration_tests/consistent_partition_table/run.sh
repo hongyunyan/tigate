@@ -31,7 +31,7 @@ function run() {
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix partition_table.server1
 
 	SINK_URI="mysql://normal:123456@127.0.0.1:3306/"
-	changefeed_id=$(cdc cli changefeed create --sink-uri="$SINK_URI" --config="$CUR/conf/changefeed.toml" 2>&1 | tail -n2 | head -n1 | awk '{print $2}')
+	changefeed_id=$(cdc_cli_changefeed create --sink-uri="$SINK_URI" --config="$CUR/conf/changefeed.toml" | grep '^ID:' | head -n1 | awk '{print $2}')
 
 	run_sql_file $CUR/data/create.sql ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 	check_table_exists "partition_table2.t2" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} 120
@@ -39,7 +39,7 @@ function run() {
 	cleanup_process $CDC_BINARY
 	# Inject the failpoint to prevent sink execution, but the global resolved can be moved forward.
 	# Then we can apply redo log to reach an eventual consistent state in downstream.
-	export GO_FAILPOINTS='github.com/pingcap/tiflow/cdc/sink/dmlsink/txn/mysql/MySQLSinkHangLongTime=return(true);github.com/pingcap/tiflow/cdc/sink/ddlsink/mysql/MySQLSinkExecDDLDelay=return(true)'
+	export GO_FAILPOINTS='github.com/pingcap/ticdc/pkg/sink/mysql/MySQLSinkHangLongTime=return(true);github.com/pingcap/ticdc/pkg/sink/mysql/MySQLSinkExecDDLDelay=return(true)'
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix partition_table.server2
 
 	run_sql_file $CUR/data/prepare.sql ${UP_TIDB_HOST} ${UP_TIDB_PORT}
@@ -57,7 +57,7 @@ function run() {
 	cat $WORK_DIR/diff_config.toml
 	cdc redo apply --tmp-dir="$tmp_download_path/apply" \
 		--storage="$storage_path" \
-		--sink-uri="mysql://normal:123456@127.0.0.1:3306/"
+		--sink-uri="mysql://normal:123456@127.0.0.1:3306/" >$WORK_DIR/cdc_redo.log
 
 	# check_table_exists "partition_table.finish_mark" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} 120
 	check_sync_diff $WORK_DIR $WORK_DIR/diff_config.toml

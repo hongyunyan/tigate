@@ -17,7 +17,7 @@ import (
 	"strings"
 
 	"github.com/pingcap/log"
-	"github.com/pingcap/tiflow/pkg/quotes"
+	"github.com/pingcap/ticdc/pkg/common"
 	"go.uber.org/zap"
 )
 
@@ -135,7 +135,7 @@ func GenUpdateSQL(changes ...*RowChange) (string, []any) {
 		whenCaseStmts[i] = whereBuf.String()
 	}
 
-	// Build gegerated columns lower name set to accelerate the following check
+	// Build generated columns lower name set to accelerate the following check
 	targetGeneratedColSet := generatedColumnsNameSet(first.targetTableInfo.GetColumns())
 
 	// Generate `ColumnName`=CASE WHEN .. THEN .. END
@@ -152,7 +152,7 @@ func GenUpdateSQL(changes ...*RowChange) (string, []any) {
 			buf.WriteString(", ")
 		}
 
-		buf.WriteString(quotes.QuoteName(column.Name.String()) + "=CASE")
+		buf.WriteString(common.QuoteName(column.Name.String()) + "=CASE")
 		for i := range changes {
 			buf.WriteString(" WHEN ")
 			buf.WriteString(whenCaseStmts[i])
@@ -246,7 +246,7 @@ func GenInsertSQL(tp DMLType, changes ...*RowChange) (string, []interface{}) {
 	columnNum := 0
 	var skipColIdx []int
 
-	// build gegerated columns lower name set to accelerate the following check
+	// build generated columns lower name set to accelerate the following check
 	generatedColumns := generatedColumnsNameSet(first.targetTableInfo.GetColumns())
 	for i, col := range first.sourceTableInfo.GetColumns() {
 		if _, ok := generatedColumns[col.Name.L]; ok {
@@ -258,7 +258,7 @@ func GenInsertSQL(tp DMLType, changes ...*RowChange) (string, []interface{}) {
 			buf.WriteByte(',')
 		}
 		columnNum++
-		buf.WriteString(quotes.QuoteName(col.Name.O))
+		buf.WriteString(common.QuoteName(col.Name.O))
 	}
 	buf.WriteString(") VALUES ")
 	holder := valuesHolder(columnNum)
@@ -284,7 +284,7 @@ func GenInsertSQL(tp DMLType, changes ...*RowChange) (string, []interface{}) {
 			}
 			writtenFirstCol = true
 
-			colName := quotes.QuoteName(col.Name.O)
+			colName := common.QuoteName(col.Name.O)
 			buf.WriteString(colName + "=VALUES(" + colName + ")")
 		}
 	}

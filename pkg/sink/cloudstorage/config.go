@@ -25,9 +25,8 @@ import (
 	"github.com/imdario/mergo"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/config"
+	cerror "github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/util"
-	cerror "github.com/pingcap/tiflow/pkg/errors"
-	psink "github.com/pingcap/tiflow/pkg/sink"
 	"go.uber.org/zap"
 )
 
@@ -39,7 +38,7 @@ const (
 	// defaultFlushInterval is the default value of flush-interval.
 	defaultFlushInterval = 5 * time.Second
 	// the lower limit of flush-interval.
-	minFlushInterval = 2 * time.Second
+	minFlushInterval = 100 * time.Millisecond
 	// the upper limit of flush-interval.
 	maxFlushInterval = 10 * time.Minute
 	// defaultFlushConcurrency is the default value of flush-concurrency.
@@ -51,7 +50,7 @@ const (
 	// defaultFileSize is the default value of file-size.
 	defaultFileSize = 64 * 1024 * 1024
 	// the lower limit of file size
-	minFileSize = 1024 * 1024
+	minFileSize = 1 * 1024
 	// the upper limit of file size
 	maxFileSize = 512 * 1024 * 1024
 
@@ -105,7 +104,7 @@ func (c *Config) Apply(
 	}
 
 	scheme := strings.ToLower(sinkURI.Scheme)
-	if !psink.IsStorageScheme(scheme) {
+	if !config.IsStorageScheme(scheme) {
 		return cerror.ErrStorageSinkInvalidConfig.GenWithStack(
 			"can't create cloud storage sink with unsupported scheme: %s", scheme)
 	}

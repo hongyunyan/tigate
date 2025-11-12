@@ -14,7 +14,9 @@
 package logcoordinator
 
 import (
+	"bytes"
 	"context"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -25,28 +27,24 @@ import (
 	"github.com/pingcap/ticdc/pkg/common"
 	appcontext "github.com/pingcap/ticdc/pkg/common/context"
 	"github.com/pingcap/ticdc/pkg/messaging"
+	"github.com/pingcap/ticdc/pkg/metrics"
 	"github.com/pingcap/ticdc/pkg/node"
-	"github.com/pingcap/ticdc/pkg/spanz"
+	"github.com/pingcap/ticdc/pkg/pdutil"
 	"github.com/pingcap/ticdc/server/watcher"
-	"github.com/pingcap/tiflow/pkg/chann"
+	"github.com/pingcap/ticdc/utils/chann"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/tikv/client-go/v2/oracle"
 	"go.uber.org/zap"
+)
+
+const (
+	eventStoreTopic           = messaging.EventStoreTopic
+	logCoordinatorTopic       = messaging.LogCoordinatorTopic
+	logCoordinatorClientTopic = messaging.LogCoordinatorClientTopic
 )
 
 type LogCoordinator interface {
 	Run(ctx context.Context) error
-}
-
-type subscriptionState struct {
-	subID        uint64
-	span         *heartbeatpb.TableSpan
-	checkpointTs uint64
-	resolvedTs   uint64
-}
-
-type subscriptionStates []*subscriptionState // sorted by subID for easy update
-
-type eventStoreState struct {
-	subscriptionStates map[int64]subscriptionStates
 }
 
 type requestAndTarget struct {
@@ -54,17 +52,34 @@ type requestAndTarget struct {
 	target node.ID
 }
 
+type changefeedState struct {
+	cfID       common.ChangeFeedID
+	nodeStates map[node.ID]uint64
+
+	// equal to min puller resolved ts
+	minLogServiceResolvedTs uint64
+	resolvedTsGauge         prometheus.Gauge
+	resolvedTsLagGauge      prometheus.Gauge
+}
+
 type logCoordinator struct {
 	messageCenter messaging.MessageCenter
+	pdClock       pdutil.Clock
 
 	nodes struct {
-		sync.RWMutex
+		sync.Mutex
 		m map[node.ID]*node.Info
 	}
 
 	eventStoreStates struct {
-		sync.RWMutex
-		m map[node.ID]*eventStoreState
+		sync.Mutex
+		m map[node.ID]*logservicepb.EventStoreState
+	}
+
+	changefeedStates struct {
+		sync.Mutex
+		// GID -> changefeedState
+		m map[common.GID]*changefeedState
 	}
 
 	requestChan *chann.DrainableChann[requestAndTarget]
@@ -74,13 +89,15 @@ func New() LogCoordinator {
 	messageCenter := appcontext.GetService[messaging.MessageCenter](appcontext.MessageCenter)
 	c := &logCoordinator{
 		messageCenter: messageCenter,
+		pdClock:       appcontext.GetService[pdutil.Clock](appcontext.DefaultPDClock),
 		requestChan:   chann.NewAutoDrainChann[requestAndTarget](),
 	}
 	c.nodes.m = make(map[node.ID]*node.Info)
-	c.eventStoreStates.m = make(map[node.ID]*eventStoreState)
+	c.eventStoreStates.m = make(map[node.ID]*logservicepb.EventStoreState)
+	c.changefeedStates.m = make(map[common.GID]*changefeedState)
 
 	// recv and handle messages
-	messageCenter.RegisterHandler(messaging.LogCoordinatorTopic, c.handleMessage)
+	messageCenter.RegisterHandler(logCoordinatorTopic, c.handleMessage)
 	// watch node changes
 	nodeManager := appcontext.GetService[*watcher.NodeManager](watcher.NodeManagerName)
 	nodes := nodeManager.GetAliveNodes()
@@ -92,22 +109,26 @@ func New() LogCoordinator {
 }
 
 func (c *logCoordinator) Run(ctx context.Context) error {
-	tick := time.NewTicker(time.Second)
+	broadcastTick := time.NewTicker(time.Second)
+	defer broadcastTick.Stop()
+	metricTick := time.NewTicker(1 * time.Second)
+	defer metricTick.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-tick.C:
+		case <-broadcastTick.C:
 			// send broadcast message to all nodes
-			c.nodes.RLock()
+			c.nodes.Lock()
 			messages := make([]*messaging.TargetMessage, 0, 2*len(c.nodes.m))
 			for id := range c.nodes.m {
-				messages = append(messages, messaging.NewSingleTargetMessage(id, messaging.EventStoreTopic, &common.LogCoordinatorBroadcastRequest{}))
-				messages = append(messages, messaging.NewSingleTargetMessage(id, messaging.EventCollectorTopic, &common.LogCoordinatorBroadcastRequest{}))
+				messages = append(messages, messaging.NewSingleTargetMessage(id, eventStoreTopic, &common.LogCoordinatorBroadcastRequest{}))
+				messages = append(messages, messaging.NewSingleTargetMessage(id, logCoordinatorClientTopic, &common.LogCoordinatorBroadcastRequest{}))
 			}
-			c.nodes.RUnlock()
+			c.nodes.Unlock()
 			for _, message := range messages {
-				// just ignore messagees fail to send
+				// just ignore messages fail to send
 				if err := c.messageCenter.SendEvent(message); err != nil {
 					log.Debug("send broadcast message to node failed", zap.Error(err))
 				}
@@ -118,26 +139,50 @@ func (c *logCoordinator) Run(ctx context.Context) error {
 				ID:    req.req.GetID(),
 				Nodes: nodes,
 			}
-			c.messageCenter.SendEvent(messaging.NewSingleTargetMessage(req.target, messaging.EventCollectorTopic, response))
+			err := c.messageCenter.SendEvent(messaging.NewSingleTargetMessage(req.target, logCoordinatorClientTopic, response))
+			if err != nil {
+				log.Warn("send reusable event service response failed", zap.Error(err))
+			}
+		case <-metricTick.C:
+			c.reportChangefeedMetrics()
 		}
 	}
 }
 
 func (c *logCoordinator) handleMessage(_ context.Context, targetMessage *messaging.TargetMessage) error {
 	for _, msg := range targetMessage.Message {
-		switch msg.(type) {
+		switch msg := msg.(type) {
 		case *logservicepb.EventStoreState:
-			c.updateEventStoreState(targetMessage.From, msg.(*logservicepb.EventStoreState))
+			c.updateEventStoreState(targetMessage.From, msg)
+		case *logservicepb.ChangefeedStates:
+			c.updateChangefeedStates(targetMessage.From, msg)
 		case *logservicepb.ReusableEventServiceRequest:
 			c.requestChan.In() <- requestAndTarget{
-				req:    msg.(*logservicepb.ReusableEventServiceRequest),
+				req:    msg,
 				target: targetMessage.From,
 			}
+		case *heartbeatpb.LogCoordinatorResolvedTsRequest:
+			c.sendResolvedTsToCoordinator(targetMessage.From, common.NewChangefeedIDFromPB(msg.ChangefeedID))
 		default:
-			log.Panic("invalid message type", zap.Any("msg", msg))
+			log.Warn("unknown message type, ignore it",
+				zap.String("type", targetMessage.Type.String()),
+				zap.Any("msg", msg))
 		}
 	}
 	return nil
+}
+
+func (c *logCoordinator) sendResolvedTsToCoordinator(id node.ID, changefeedID common.ChangeFeedID) {
+	resolvedTs := c.getMinLogServiceResolvedTs(changefeedID)
+	msg := messaging.NewSingleTargetMessage(
+		id,
+		messaging.CoordinatorTopic,
+		&heartbeatpb.LogCoordinatorResolvedTsResponse{
+			ChangefeedID: changefeedID.ToPB(),
+			ResolvedTs:   resolvedTs,
+		},
+	)
+	c.messageCenter.SendEvent(msg)
 }
 
 func (c *logCoordinator) handleNodeChange(allNodes map[node.ID]*node.Info) {
@@ -147,6 +192,17 @@ func (c *logCoordinator) handleNodeChange(allNodes map[node.ID]*node.Info) {
 		if _, ok := allNodes[id]; !ok {
 			delete(c.nodes.m, id)
 			log.Info("log coordinator detect node removed", zap.String("nodeId", id.String()))
+
+			// Clean up states for the removed node.
+			c.eventStoreStates.Lock()
+			delete(c.eventStoreStates.m, id)
+			c.eventStoreStates.Unlock()
+
+			c.changefeedStates.Lock()
+			for _, state := range c.changefeedStates.m {
+				delete(state.nodeStates, id)
+			}
+			c.changefeedStates.Unlock()
 		}
 	}
 	for id, node := range allNodes {
@@ -157,95 +213,188 @@ func (c *logCoordinator) handleNodeChange(allNodes map[node.ID]*node.Info) {
 	}
 }
 
-func (c *logCoordinator) updateEventStoreState(nodeId node.ID, state *logservicepb.EventStoreState) {
+func (c *logCoordinator) updateEventStoreState(nodeID node.ID, newState *logservicepb.EventStoreState) {
 	c.eventStoreStates.Lock()
 	defer c.eventStoreStates.Unlock()
 
-	// TODO: avoid remove all, only update related subscription states
-	delete(c.eventStoreStates.m, nodeId)
-	eventStoreState := &eventStoreState{
-		subscriptionStates: make(map[int64]subscriptionStates),
+	c.eventStoreStates.m[nodeID] = newState
+}
+
+func (c *logCoordinator) updateChangefeedStates(from node.ID, states *logservicepb.ChangefeedStates) {
+	c.changefeedStates.Lock()
+	defer c.changefeedStates.Unlock()
+
+	// Create a set of incoming changefeed GIDs for efficient lookup.
+	incomingGIDs := make(map[common.GID]struct{})
+	for _, state := range states.States {
+		cfID := common.NewChangefeedIDFromPB(state.GetChangefeedID())
+		incomingGIDs[cfID.ID()] = struct{}{}
 	}
-	count := 0
-	for tableId, subscriptions := range state.GetSubscriptions() {
-		subs := subscriptions.GetSubscriptions()
-		subStates := make(subscriptionStates, 0, len(subs))
-		count += len(subs)
-		for _, subscription := range subs {
-			subscriptionState := &subscriptionState{
-				subID:        subscription.GetSubID(),
-				span:         subscription.GetSpan(),
-				checkpointTs: subscription.GetCheckpointTs(),
-				resolvedTs:   subscription.GetResolvedTs(),
+
+	// First, handle changefeeds that might have been removed from the reporting node.
+	for gid, state := range c.changefeedStates.m {
+		// If the node was previously reporting for this changefeed...
+		if _, exists := state.nodeStates[from]; exists {
+			// ...but is no longer in the incoming message, it means the changefeed was removed from this node.
+			if _, incoming := incomingGIDs[gid]; !incoming {
+				delete(state.nodeStates, from)
+				log.Info("changefeed removed from node",
+					zap.Stringer("changefeedID", state.cfID),
+					zap.String("nodeID", string(from)),
+					zap.Uint64("changefeedGIDLow", gid.Low),
+					zap.Uint64("changefeedGIDHigh", gid.High))
+				// If the changefeed has no more nodes, remove the changefeed state and its associated metrics.
+				if len(state.nodeStates) == 0 {
+					metrics.ChangefeedResolvedTsGauge.DeleteLabelValues(state.cfID.Keyspace(), state.cfID.Name())
+					metrics.ChangefeedResolvedTsLagGauge.DeleteLabelValues(state.cfID.Keyspace(), state.cfID.Name())
+					delete(c.changefeedStates.m, gid)
+					log.Info("changefeed state removed as it has no active nodes",
+						zap.Stringer("changefeedID", state.cfID),
+						zap.Uint64("changefeedGIDLow", gid.Low),
+						zap.Uint64("changefeedGIDHigh", gid.High))
+				}
 			}
-			subStates = append(subStates, subscriptionState)
 		}
-		eventStoreState.subscriptionStates[tableId] = subStates
 	}
-	c.eventStoreStates.m[nodeId] = eventStoreState
+
+	// Then, update with the new states from the message.
+	for _, state := range states.States {
+		cfID := common.NewChangefeedIDFromPB(state.GetChangefeedID())
+		gid := cfID.ID()
+		if _, ok := c.changefeedStates.m[gid]; !ok {
+			log.Info("new changefeed states added",
+				zap.Stringer("changefeedID", cfID),
+				zap.Uint64("changefeedGIDLow", gid.Low),
+				zap.Uint64("changefeedGIDHigh", gid.High))
+			// Initialize metrics for the new changefeed.
+			c.changefeedStates.m[gid] = &changefeedState{
+				cfID:               cfID,
+				nodeStates:         make(map[node.ID]uint64),
+				resolvedTsGauge:    metrics.ChangefeedResolvedTsGauge.WithLabelValues(cfID.Keyspace(), cfID.Name()),
+				resolvedTsLagGauge: metrics.ChangefeedResolvedTsLagGauge.WithLabelValues(cfID.Keyspace(), cfID.Name()),
+			}
+		}
+		c.changefeedStates.m[gid].nodeStates[from] = state.GetResolvedTs()
+	}
+}
+
+func (c *logCoordinator) reportChangefeedMetrics() {
+	pdTime := c.pdClock.CurrentTime()
+	pdPhyTs := oracle.GetPhysical(pdTime)
+
+	c.changefeedStates.Lock()
+	defer c.changefeedStates.Unlock()
+
+	for _, state := range c.changefeedStates.m {
+		if len(state.nodeStates) == 0 {
+			continue
+		}
+
+		minResolvedTs := uint64(math.MaxUint64)
+		for _, resolvedTs := range state.nodeStates {
+			if resolvedTs < minResolvedTs {
+				minResolvedTs = resolvedTs
+			}
+		}
+
+		if minResolvedTs == math.MaxUint64 {
+			log.Warn("minResolvedTs is MaxUint64, this should not happen",
+				zap.Stringer("changefeedID", state.cfID))
+			continue
+		}
+
+		phyResolvedTs := oracle.ExtractPhysical(minResolvedTs)
+		state.minLogServiceResolvedTs = minResolvedTs
+		state.resolvedTsGauge.Set(float64(phyResolvedTs))
+		lag := float64(pdPhyTs-phyResolvedTs) / 1e3
+		state.resolvedTsLagGauge.Set(lag)
+	}
+}
+
+func (c *logCoordinator) getMinLogServiceResolvedTs(cfID common.ChangeFeedID) uint64 {
+	c.changefeedStates.Lock()
+	defer c.changefeedStates.Unlock()
+
+	gid := cfID.ID()
+	if state, exists := c.changefeedStates.m[gid]; exists {
+		return state.minLogServiceResolvedTs
+	}
+	return 0
 }
 
 // getCandidateNode return all nodes(exclude the request node) which may contain data for `span` from `startTs`,
 // and the return slice should be sorted by resolvedTs(largest first).
 func (c *logCoordinator) getCandidateNodes(requestNodeID node.ID, span *heartbeatpb.TableSpan, startTs uint64) []string {
-	c.eventStoreStates.RLock()
-	defer c.eventStoreStates.RUnlock()
-
-	// TODO: support incomplete span
-	if !isCompleteSpan(span) {
-		return nil
+	type candidateSubscription struct {
+		nodeID         node.ID
+		subscriptionID uint64
+		resolvedTs     uint64
 	}
-
-	type candidateNode struct {
-		nodeID     node.ID
-		resolvedTs uint64
-	}
-	var candidates []candidateNode
-	for nodeID, state := range c.eventStoreStates.m {
+	var candidateSubs []candidateSubscription
+	c.eventStoreStates.Lock()
+	for nodeID, eventStoreState := range c.eventStoreStates.m {
 		if nodeID == requestNodeID {
 			continue
 		}
-		subscriptionStates, ok := state.subscriptionStates[span.GetTableID()]
+		subStates, ok := eventStoreState.GetTableStates()[span.GetTableID()]
 		if !ok {
 			continue
 		}
 		// Find the maximum resolvedTs for the current nodeID
-		var maxResolvedTs uint64
+		var maxResolvedTs, subID uint64
 		found := false
-		for _, subscriptionState := range subscriptionStates {
-			if subscriptionState.checkpointTs <= startTs {
-				if !found || subscriptionState.resolvedTs > maxResolvedTs {
-					maxResolvedTs = subscriptionState.resolvedTs
+		for _, subsState := range subStates.GetSubscriptions() {
+			if bytes.Compare(subsState.Span.StartKey, span.StartKey) <= 0 &&
+				bytes.Compare(span.EndKey, subsState.Span.EndKey) <= 0 &&
+				subsState.CheckpointTs <= startTs {
+				if !found || subsState.ResolvedTs > maxResolvedTs {
+					maxResolvedTs = subsState.ResolvedTs
+					subID = subsState.SubID
 					found = true
 				}
 			}
 		}
+		// Check maxResolveTs is not significantly smaller than request startTs to filter out invalid nodes
+		const maxTimeDiff = 3600000 // 1 hour in milliseconds
+		if found &&
+			startTs > maxResolvedTs &&
+			(oracle.ExtractPhysical(startTs)-oracle.ExtractPhysical(maxResolvedTs)) > maxTimeDiff {
+			found = false
+		}
 
 		// If a valid subscription with checkpointTs <= startTs was found, add to candidates
 		if found {
-			candidates = append(candidates, candidateNode{
-				nodeID:     nodeID,
-				resolvedTs: maxResolvedTs,
+			candidateSubs = append(candidateSubs, candidateSubscription{
+				nodeID:         nodeID,
+				subscriptionID: subID,
+				resolvedTs:     maxResolvedTs,
 			})
 		}
 	}
+	c.eventStoreStates.Unlock()
 
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].resolvedTs > candidates[j].resolvedTs
+	// return candidate nodes sorted by resolvedTs in descending order
+	sort.Slice(candidateSubs, func(i, j int) bool {
+		return candidateSubs[i].resolvedTs > candidateSubs[j].resolvedTs
 	})
-
+	var subIDs []uint64
 	var candidateNodes []string
-	for _, candidate := range candidates {
-		candidateNodes = append(candidateNodes, string(candidate.nodeID))
+	if len(candidateSubs) > 0 {
+		c.nodes.Lock()
+		for _, candidate := range candidateSubs {
+			if c.nodes.m[candidate.nodeID] != nil {
+				subIDs = append(subIDs, candidate.subscriptionID)
+				candidateNodes = append(candidateNodes, string(candidate.nodeID))
+			}
+		}
+		c.nodes.Unlock()
 	}
+	log.Info("log coordinator get candidate nodes",
+		zap.String("requestNodeID", requestNodeID.String()),
+		zap.String("span", common.FormatTableSpan(span)),
+		zap.Uint64("startTs", startTs),
+		zap.Strings("candidateNodes", candidateNodes),
+		zap.Uint64s("subscriptionIDs", subIDs))
 
 	return candidateNodes
-}
-
-func isCompleteSpan(tableSpan *heartbeatpb.TableSpan) bool {
-	startKey, endKey := spanz.GetTableRange(tableSpan.TableID)
-	if spanz.StartCompare(startKey, tableSpan.StartKey) == 0 && spanz.EndCompare(endKey, tableSpan.EndKey) == 0 {
-		return true
-	}
-	return false
 }

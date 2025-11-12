@@ -117,6 +117,20 @@ func (g *replicationGroup[T, R]) MarkReplicaReplicating(replica R) {
 	g.replicating.Set(replica.GetID(), replica)
 }
 
+func (g *replicationGroup[T, R]) AddSchedulingReplica(replica R, targetNodeID node.ID) {
+	g.mustVerifyGroupID(replica.GetGroupID())
+	log.Info("scheduler: add scheduling replica",
+		zap.String("schedulerID", g.id),
+		zap.String("group", g.groupName),
+		zap.String("replica", replica.GetID().String()))
+	replica.SetNodeID(targetNodeID)
+	g.absent.Delete(replica.GetID())
+	g.replicating.Delete(replica.GetID())
+	g.scheduling.Set(replica.GetID(), replica)
+	g.updateNodeMap("", targetNodeID, replica)
+	g.checker.AddReplica(replica)
+}
+
 func (g *replicationGroup[T, R]) BindReplicaToNode(old, new node.ID, replica R) {
 	g.mustVerifyGroupID(replica.GetGroupID())
 	log.Info("scheduler: bind replica to node",
@@ -202,10 +216,9 @@ func (g *replicationGroup[T, R]) GetAbsentSize() int {
 func (g *replicationGroup[T, R]) GetAbsent() []R {
 	res := make([]R, 0, g.absent.Len())
 	g.absent.Range(func(_ T, r R) bool {
-		if !r.ShouldRun() {
-			return true
+		if r.ShouldRun() {
+			res = append(res, r)
 		}
-		res = append(res, r)
 		return true
 	})
 	return res
@@ -228,6 +241,10 @@ func (g *replicationGroup[T, R]) GetReplicatingSize() int {
 	return g.replicating.Len()
 }
 
+func (g *replicationGroup[T, R]) GetSize() int {
+	return g.replicating.Len() + g.scheduling.Len() + g.absent.Len()
+}
+
 func (g *replicationGroup[T, R]) GetReplicating() []R {
 	res := make([]R, 0, g.replicating.Len())
 	g.replicating.Range(func(_ T, r R) bool {
@@ -245,12 +262,21 @@ func (g *replicationGroup[T, R]) GetTaskSizePerNode() map[node.ID]int {
 	return res
 }
 
+func (g *replicationGroup[T, R]) IsReplicating(replica R) bool {
+	return g.replicating.Find(replica.GetID())
+}
+
 type iMap[T ReplicationID, R Replication[T]] struct {
 	inner sync.Map
 }
 
 func newIMap[T ReplicationID, R Replication[T]]() *iMap[T, R] {
 	return &iMap[T, R]{inner: sync.Map{}}
+}
+
+func (m *iMap[T, R]) Find(key T) bool {
+	_, exists := m.inner.Load(key)
+	return exists
 }
 
 func (m *iMap[T, R]) Get(key T) (R, bool) {

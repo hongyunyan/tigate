@@ -14,7 +14,7 @@ BASE_URL1 = "https://127.0.0.1:8301/api/v2"
 
 
 TLS_PD_ADDR = "https://127.0.0.1:2579"
-SINK_URI="mysql://normal:123456@127.0.0.1:3306/"
+SINK_URI = "mysql://normal:123456@127.0.0.1:3306/"
 
 physicalShiftBits = 18
 
@@ -22,7 +22,7 @@ physicalShiftBits = 18
 def assert_status_code(resp, expected_code, url):
     """
     Assert response status code matches expected code with detailed error message
-    
+
     Args:
         resp: Response object
         expected_code: Expected status code
@@ -44,6 +44,7 @@ def assert_status_code(resp, expected_code, url):
     URL: {url}
     """
 
+
 def requests_get_with_retry(url, max_retries=RETRY_TIME, delay_seconds=1):
     """
     requests get with retry
@@ -55,22 +56,23 @@ def requests_get_with_retry(url, max_retries=RETRY_TIME, delay_seconds=1):
     """
     for retry in range(max_retries):
         try:
-            response =  rq.get(url, cert=CERT, verify=VERIFY)
+            response = rq.get(url, cert=CERT, verify=VERIFY)
             if response.status_code == 200 or response.status_code == 202:
                 return response
         except RequestException as e:
-            logging.info(f"request fails {retry + 1}/{max_retries} time retry...")
+            logging.info(
+                f"request fails {retry + 1}/{max_retries} time retry...")
             time.sleep(delay_seconds)
     return None
 
 
 # we should write some SQLs in the run.sh after call create_changefeed
 def create_changefeed(sink_uri):
-    url = BASE_URL1+"/changefeeds"
+    url = BASE_URL1 + "/changefeeds?keyspace=keyspace1"
     # create changefeed
     for i in range(1, 5):
         data = {
-            "changefeed_id": "changefeed-test"+str(i),
+            "changefeed_id": "changefeed-test" + str(i),
             "sink_uri": "blackhole://",
             "ignore_ineligible_table": True
         }
@@ -80,7 +82,8 @@ def create_changefeed(sink_uri):
 
         data = json.dumps(data)
         headers = {"Content-Type": "application/json"}
-        resp = rq.post(url, data=data, headers=headers, cert=CERT, verify=VERIFY)
+        resp = rq.post(url, data=data, headers=headers,
+                       cert=CERT, verify=VERIFY)
         assert resp.status_code == rq.codes.ok
 
     # create changefeed fail because sink_uri is invalid
@@ -93,12 +96,34 @@ def create_changefeed(sink_uri):
     resp = rq.post(url, data=data, headers=headers, cert=CERT, verify=VERIFY)
     assert resp.status_code == rq.codes.bad_request
 
+    # create changefeed fail because dispatcher is invalid
+    url = BASE_URL1 + "/changefeeds?keyspace=keyspace1"
+    data = json.dumps({
+        "changefeed_id": "changefeed-test-v2",
+        "sink_uri": "kafka://127.0.0.1:9092/http_api_tls?protocol=simple",
+        "replica_config": {
+            "sink": {
+                "dispatchers": [
+                    {
+                        "matcher": ["*.*"],
+                        "partition": "columns",
+                        "columns": ["a.b"]
+                    }
+                ]
+            }
+        }
+    })
+    headers = {"Content-Type": "application/json"}
+    resp = rq.post(url, data=data, headers=headers,
+                   cert=CERT, verify=VERIFY)
+    assert "ErrDispatcherFailed" in resp.text, f"{resp.text}"
+
     print("pass test: create changefeed")
 
 
 def list_changefeed():
     # test state: all
-    url = BASE_URL0+"/changefeeds?state=all"
+    url = BASE_URL0 + "/changefeeds?state=all&keyspace=keyspace1"
     # Add retry logic to wait for changefeeds
     # We need to retry because the coordinator need some time to sync the changefeed infos from etcd
     for _ in range(RETRY_TIME):
@@ -109,12 +134,12 @@ def list_changefeed():
             break
         logging.info("No changefeeds found, retrying...")
         time.sleep(1)
-    
+
     assert len(changefeeds) > 0, "No changefeeds found after retries"
 
     # test state: normal
     # test state: normal
-    url = BASE_URL0+"/changefeeds?state=normal"
+    url = BASE_URL0 + "/changefeeds?state=normal&keyspace=keyspace1"
     resp = rq.get(url, cert=CERT, verify=VERIFY)
     assert_status_code(resp, rq.codes.ok, url)
     data = resp.json()
@@ -123,7 +148,7 @@ def list_changefeed():
         assert cf["state"] == "normal"
 
     # test state: stopped
-    url = BASE_URL0+"/changefeeds?state=stopped"
+    url = BASE_URL0 + "/changefeeds?state=stopped&keyspace=keyspace1"
     resp = rq.get(url, cert=CERT, verify=VERIFY)
     assert_status_code(resp, rq.codes.ok, url)
     data = resp.json()
@@ -133,14 +158,15 @@ def list_changefeed():
 
     print("pass test: list changefeed")
 
+
 def get_changefeed():
     # test get changefeed success
-    url = BASE_URL0+"/changefeeds/changefeed-test1"
+    url = BASE_URL0 + "/changefeeds/changefeed-test1?keyspace=keyspace1"
     resp = rq.get(url, cert=CERT, verify=VERIFY)
     assert resp.status_code == rq.codes.ok
 
     # test get changefeed failed
-    url = BASE_URL0+"/changefeeds/changefeed-not-exists"
+    url = BASE_URL0 + "/changefeeds/changefeed-not-exists?keyspace=keyspace1"
     resp = rq.get(url, cert=CERT, verify=VERIFY)
     assert resp.status_code == rq.codes.bad_request
     data = resp.json()
@@ -151,7 +177,7 @@ def get_changefeed():
 
 def pause_changefeed():
     # pause changefeed
-    url = BASE_URL0+"/changefeeds/changefeed-test2/pause"
+    url = BASE_URL0 + "/changefeeds/changefeed-test2/pause?keyspace=keyspace1"
     for i in range(RETRY_TIME):
         resp = rq.post(url, cert=CERT, verify=VERIFY)
         if resp.status_code == rq.codes.ok:
@@ -159,7 +185,7 @@ def pause_changefeed():
         time.sleep(1)
     assert resp.status_code == rq.codes.ok
     # check if pause changefeed success
-    url = BASE_URL0+"/changefeeds/changefeed-test2"
+    url = BASE_URL0 + "/changefeeds/changefeed-test2?keyspace=keyspace1"
     for i in range(RETRY_TIME):
         resp = rq.get(url, cert=CERT, verify=VERIFY)
         assert resp.status_code == rq.codes.ok
@@ -169,7 +195,7 @@ def pause_changefeed():
         time.sleep(1)
     assert data["state"] == "stopped"
     # test pause changefeed failed
-    url = BASE_URL0+"/changefeeds/changefeed-not-exists/pause"
+    url = BASE_URL0 + "/changefeeds/changefeed-not-exists/pause?keyspace=keyspace1"
     resp = rq.post(url, cert=CERT, verify=VERIFY)
     assert resp.status_code == rq.codes.bad_request
     data = resp.json()
@@ -177,17 +203,18 @@ def pause_changefeed():
 
     print("pass test: pause changefeed")
 
+
 def update_changefeed():
     # update fail
     # can only update a stopped changefeed
-    url = BASE_URL0+"/changefeeds/changefeed-test1"
+    url = BASE_URL0 + "/changefeeds/changefeed-test1?keyspace=keyspace1"
     data = json.dumps({"mounter_worker_num": 32})
     headers = {"Content-Type": "application/json"}
     resp = rq.put(url, data=data, headers=headers, cert=CERT, verify=VERIFY)
     assert resp.status_code == rq.codes.bad_request
 
     # update success
-    url = BASE_URL0+"/changefeeds/changefeed-test2"
+    url = BASE_URL0 + "/changefeeds/changefeed-test2?keyspace=keyspace1"
     data = json.dumps({"mounter_worker_num": 32})
     headers = {"Content-Type": "application/json"}
     resp = rq.put(url, data=data, headers=headers, cert=CERT, verify=VERIFY)
@@ -195,23 +222,44 @@ def update_changefeed():
 
     # update fail
     # can't update start_ts
-    url = BASE_URL0+"/changefeeds/changefeed-test2"
+    url = BASE_URL0 + "/changefeeds/changefeed-test2?keyspace=keyspace1"
     data = json.dumps({"start_ts": 1})
     headers = {"Content-Type": "application/json"}
     resp = rq.put(url, data=data, headers=headers, cert=CERT, verify=VERIFY)
     assert_status_code(resp, rq.codes.bad_request, url)
+
+    # can't update dispatchers
+    url = BASE_URL0 + "/changefeeds/changefeed-test2?keyspace=keyspace1"
+    data = json.dumps({
+        "sink_uri": "kafka://127.0.0.1:9092/http_api_tls?protocol=simple",
+        "replica_config": {
+            "sink": {
+                "dispatchers": [
+                    {
+                        "matcher": ["*.*"],
+                        "partition": "columns",
+                        "columns": ["a.b"]
+                    }
+                ]
+            }
+        }
+    })
+    headers = {"Content-Type": "application/json"}
+    resp = rq.put(url, data=data, headers=headers,
+                  cert=CERT, verify=VERIFY)
+    assert "ErrDispatcherFailed" in resp.text, f"{resp.text}"
 
     print("pass test: update changefeed")
 
 
 def resume_changefeed():
     # resume changefeed
-    url = BASE_URL1+"/changefeeds/changefeed-test2/resume"
+    url = BASE_URL1 + "/changefeeds/changefeed-test2/resume?keyspace=keyspace1"
     resp = rq.post(url, cert=CERT, verify=VERIFY)
     assert resp.status_code == rq.codes.ok
 
     # check if resume changefeed success
-    url = BASE_URL1+"/changefeeds/changefeed-test2"
+    url = BASE_URL1 + "/changefeeds/changefeed-test2?keyspace=keyspace1"
     for i in range(RETRY_TIME):
         resp = rq.get(url, cert=CERT, verify=VERIFY)
         assert resp.status_code == rq.codes.ok
@@ -222,7 +270,7 @@ def resume_changefeed():
     assert data["state"] == "normal"
 
     # test resume changefeed failed
-    url = BASE_URL0+"/changefeeds/changefeed-not-exists/resume"
+    url = BASE_URL0 + "/changefeeds/changefeed-not-exists/resume?keyspace=keyspace1"
     resp = rq.post(url, cert=CERT, verify=VERIFY)
     assert resp.status_code == rq.codes.bad_request
     data = resp.json()
@@ -231,19 +279,19 @@ def resume_changefeed():
     print("pass test: resume changefeed")
 
 
-def remove_changefeed(cfID = "changefeed-test3"):
+def remove_changefeed(cfID="changefeed-test3"):
     # remove changefeed
-    url = BASE_URL0+"/changefeeds/" + cfID
+    url = BASE_URL0 + "/changefeeds/" + cfID + "?keyspace=keyspace1"
     resp = rq.delete(url, cert=CERT, verify=VERIFY)
     assert_status_code(resp, rq.codes.ok, url)
 
-
     # test remove non-exists changefeed, it should return 200 and do nothing
-    url = BASE_URL0+"/changefeeds/changefeed-not-exists"
+    url = BASE_URL0 + "/changefeeds/changefeed-not-exists?keyspace=keyspace1"
     resp = rq.delete(url, cert=CERT, verify=VERIFY)
     assert_status_code(resp, rq.codes.ok, url)
 
     print("pass test: remove changefeed")
+
 
 def move_table():
     # FIXME: Enable this test case after we fully support move table API
@@ -265,6 +313,7 @@ def list_capture():
 
     print("pass test: list captures")
 
+
 def check_health():
     url = BASE_URL0 + "/health"
     for i in range(RETRY_TIME):
@@ -279,7 +328,7 @@ def check_health():
 
 def get_status():
     url = BASE_URL0 + "/status"
-    resp = rq.get(url,cert=CERT, verify=VERIFY)
+    resp = rq.get(url, cert=CERT, verify=VERIFY)
     assert resp.status_code == rq.codes.ok
     assert resp.json()["is_owner"]
 
@@ -299,47 +348,47 @@ def set_log_level():
 
     print("pass test: set log level")
 
+
 def verify_table():
-    # FIXME: Enable this test case after we fully support verify table API
-    print("pass test: verify table")
-    return 
-    url = BASE_URL0+"/tso"
+    url = BASE_URL0 + "/tso"
     # we need to retry since owner resign before this func call
     i = 0
     while i < 10:
         try:
             data = json.dumps({})
             headers = {"Content-Type": "application/json"}
-            resp = rq.post(url, data=data, headers=headers, cert=CERT, verify=VERIFY, timeout=5)
+            resp = rq.post(url, data=data, headers=headers,
+                           cert=CERT, verify=VERIFY, timeout=5)
             if resp.status_code == rq.codes.ok:
-              break
+                break
             else:
-                 continue
+                continue
         except rq.exceptions.RequestException:
             i += 1
     assert resp.status_code == rq.codes.ok
 
     ps = resp.json()["timestamp"]
     ls = resp.json()["logic_time"]
-    tso = compose_tso(ps,ls)
+    tso = compose_tso(ps, ls)
 
-    url = BASE_URL0 + "/verify_table"
+    url = BASE_URL0 + "/verify_table?keyspace=keyspace1"
     data = json.dumps({
-    "pd_addrs": [TLS_PD_ADDR],
-    "ca_path":CA_PEM_PATH,
-    "cert_path":CLIENT_PEM_PATH,
-    "key_path":CLIENT_KEY_PEM_PATH,
-    "cert_allowed_cn":["client"],
-    "start_ts": tso,
-    "replica_config": {
-        "filter": {
-            "rules": ["test.verify*"]
+        "pd_addrs": [TLS_PD_ADDR],
+        "ca_path": CA_PEM_PATH,
+        "cert_path": CLIENT_PEM_PATH,
+        "key_path": CLIENT_KEY_PEM_PATH,
+        "cert_allowed_cn": ["client"],
+        "start_ts": tso,
+        "replica_config": {
+            "filter": {
+                "rules": ["test.verify*"]
             }
         }
     })
     headers = {"Content-Type": "application/json"}
     for i in range(RETRY_TIME):
-        resp = rq.post(url, data=data, headers=headers, cert=CERT, verify=VERIFY)
+        resp = rq.post(url, data=data, headers=headers,
+                       cert=CERT, verify=VERIFY)
         if resp.status_code == rq.codes.ok:
             break
         time.sleep(1)
@@ -353,7 +402,7 @@ def verify_table():
 
 
 def get_tso():
-    url = BASE_URL0+"/tso"
+    url = BASE_URL0 + "/tso"
     data = json.dumps({})
     headers = {"Content-Type": "application/json"}
     resp = rq.post(url, data=data, headers=headers, cert=CERT, verify=VERIFY)
@@ -365,21 +414,21 @@ def get_tso():
 def unsafe_apis():
     # FIXME: Enable this test case after we fully support unsafe APIs
     print("pass test: unsafe apis")
-    return 
-    url = BASE_URL1+"/unsafe/metadata"
+    return
+    url = BASE_URL1 + "/unsafe/metadata"
     resp = rq.get(url, cert=CERT, verify=VERIFY)
     assert resp.status_code == rq.codes.ok
     print("status code", resp.status_code)
     print("pass test: show metadata")
 
     # service_gc_safepoint 1
-    url = BASE_URL1+"/unsafe/service_gc_safepoint"
+    url = BASE_URL1 + "/unsafe/service_gc_safepoint?keyspace=keyspace1"
     data = {
         "pd_addrs": [TLS_PD_ADDR],
-        "ca_path":CA_PEM_PATH,
-        "cert_path":CLIENT_PEM_PATH,
-        "key_path":CLIENT_KEY_PEM_PATH,
-        "cert_allowed_cn":["client"],
+        "ca_path": CA_PEM_PATH,
+        "cert_path": CLIENT_PEM_PATH,
+        "key_path": CLIENT_KEY_PEM_PATH,
+        "cert_allowed_cn": ["client"],
     }
     data = json.dumps(data)
     headers = {"Content-Type": "application/json"}
@@ -396,7 +445,7 @@ def unsafe_apis():
 
     # create changefeed fail because sink_uri is invalid
     data = json.dumps({})
-    url = BASE_URL1+"/unsafe/resolve_lock"
+    url = BASE_URL1 + "/unsafe/resolve_lock?keyspace=keyspace1"
     headers = {"Content-Type": "application/json"}
     resp = rq.post(url, data=data, headers=headers, cert=CERT, verify=VERIFY)
     print("status code", resp.status_code)
@@ -410,6 +459,7 @@ def unsafe_apis():
 def compose_tso(ps, ls):
     return (ps << physicalShiftBits) + ls
 
+
 # arg1: test case name
 # arg2: cetificates dir
 # arg3: sink uri
@@ -419,8 +469,8 @@ if __name__ == "__main__":
     CLIENT_PEM_PATH = CERTIFICATE_PATH + '/client.pem'
     CLIENT_KEY_PEM_PATH = CERTIFICATE_PATH + '/client-key.pem'
     CA_PEM_PATH = CERTIFICATE_PATH + '/ca.pem'
-    CERT=(CLIENT_PEM_PATH, CLIENT_KEY_PEM_PATH)
-    VERIFY=(CA_PEM_PATH)
+    CERT = (CLIENT_PEM_PATH, CLIENT_KEY_PEM_PATH)
+    VERIFY = (CA_PEM_PATH)
 
     # test all the case as the order list in this map
     FUNC_MAP = {
@@ -446,7 +496,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         logging.error("Please provide a test case name")
         sys.exit(1)
-    
+
     # get the test case name
     test_case_name = sys.argv[1]
     arg = sys.argv[3:]
@@ -454,7 +504,7 @@ if __name__ == "__main__":
     if test_case_name not in FUNC_MAP:
         logging.error(f"Test case {test_case_name} not found")
         sys.exit(1)
-    
+
     # get the test case function
     test_case_func = FUNC_MAP[test_case_name]
     # run the test case

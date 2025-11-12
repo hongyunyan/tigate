@@ -30,8 +30,8 @@ type MetricsCollector interface {
 }
 
 const (
-	// RefreshMetricsInterval specifies the interval of refresh kafka client metrics.
-	RefreshMetricsInterval = 5 * time.Second
+	// refreshMetricsInterval specifies the interval of refresh kafka client metrics.
+	refreshMetricsInterval = 5 * time.Second
 	// refreshClusterMetaInterval specifies the interval of refresh kafka cluster meta.
 	// Do not set it too small, because it will cause too many requests to kafka cluster.
 	// Every request will get all topics and all brokers information.
@@ -67,7 +67,7 @@ func (m *saramaMetricsCollector) Run(ctx context.Context) {
 	// Initialize brokers.
 	m.updateBrokers(ctx)
 
-	refreshMetricsTicker := time.NewTicker(RefreshMetricsInterval)
+	refreshMetricsTicker := time.NewTicker(refreshMetricsInterval)
 	refreshClusterMetaTicker := time.NewTicker(refreshClusterMetaInterval)
 	defer func() {
 		refreshMetricsTicker.Stop()
@@ -78,8 +78,8 @@ func (m *saramaMetricsCollector) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info("Kafka metrics collector stopped",
-				zap.String("namespace", m.changefeedID.Namespace()),
+			log.Info("kafka metrics collector stopped",
+				zap.String("keyspace", m.changefeedID.Keyspace()),
 				zap.String("changefeed", m.changefeedID.Name()))
 			return
 		case <-refreshMetricsTicker.C:
@@ -92,48 +92,37 @@ func (m *saramaMetricsCollector) Run(ctx context.Context) {
 }
 
 func (m *saramaMetricsCollector) updateBrokers(ctx context.Context) {
-	start := time.Now()
-	brokers, err := m.adminClient.GetAllBrokers(ctx)
-	if err != nil {
-		log.Warn("Get Kafka brokers failed, "+
-			"use historical brokers to collect kafka broker level metrics",
-			zap.String("namespace", m.changefeedID.Namespace()),
-			zap.String("changefeed", m.changefeedID.Name()),
-			zap.Duration("duration", time.Since(start)),
-			zap.Error(err))
-		return
-	}
-
+	brokers := m.adminClient.GetAllBrokers(ctx)
 	for _, b := range brokers {
 		m.brokers[b.ID] = struct{}{}
 	}
 }
 
 func (m *saramaMetricsCollector) collectProducerMetrics() {
-	namespace := m.changefeedID.Namespace()
+	keyspace := m.changefeedID.Keyspace()
 	changefeedID := m.changefeedID.Name()
 	compressionRatioMetric := m.registry.Get(compressionRatioMetricName)
 	if histogram, ok := compressionRatioMetric.(metrics.Histogram); ok {
 		compressionRatioGauge.
-			WithLabelValues(namespace, changefeedID, avg).
+			WithLabelValues(keyspace, changefeedID, avg).
 			Set(histogram.Snapshot().Mean())
-		compressionRatioGauge.WithLabelValues(namespace, changefeedID, p99).
+		compressionRatioGauge.WithLabelValues(keyspace, changefeedID, p99).
 			Set(histogram.Snapshot().Percentile(0.99))
 	}
 
 	recordsPerRequestMetric := m.registry.Get(recordsPerRequestMetricName)
 	if histogram, ok := recordsPerRequestMetric.(metrics.Histogram); ok {
 		recordsPerRequestGauge.
-			WithLabelValues(namespace, changefeedID, avg).
+			WithLabelValues(keyspace, changefeedID, avg).
 			Set(histogram.Snapshot().Mean())
 		recordsPerRequestGauge.
-			WithLabelValues(namespace, changefeedID, p99).
+			WithLabelValues(keyspace, changefeedID, p99).
 			Set(histogram.Snapshot().Percentile(0.99))
 	}
 }
 
 func (m *saramaMetricsCollector) collectBrokerMetrics() {
-	namespace := m.changefeedID.Namespace()
+	keyspace := m.changefeedID.Keyspace()
 	changefeedID := m.changefeedID.Name()
 	for id := range m.brokers {
 		brokerID := strconv.Itoa(int(id))
@@ -141,7 +130,7 @@ func (m *saramaMetricsCollector) collectBrokerMetrics() {
 			getBrokerMetricName(outgoingByteRateMetricNamePrefix, brokerID))
 		if meter, ok := outgoingByteRateMetric.(metrics.Meter); ok {
 			OutgoingByteRateGauge.
-				WithLabelValues(namespace, changefeedID, brokerID).
+				WithLabelValues(keyspace, changefeedID, brokerID).
 				Set(meter.Snapshot().Rate1())
 		}
 
@@ -149,7 +138,7 @@ func (m *saramaMetricsCollector) collectBrokerMetrics() {
 			getBrokerMetricName(requestRateMetricNamePrefix, brokerID))
 		if meter, ok := requestRateMetric.(metrics.Meter); ok {
 			RequestRateGauge.
-				WithLabelValues(namespace, changefeedID, brokerID).
+				WithLabelValues(keyspace, changefeedID, brokerID).
 				Set(meter.Snapshot().Rate1())
 		}
 
@@ -157,10 +146,10 @@ func (m *saramaMetricsCollector) collectBrokerMetrics() {
 			getBrokerMetricName(requestLatencyInMsMetricNamePrefix, brokerID))
 		if histogram, ok := requestLatencyMetric.(metrics.Histogram); ok {
 			RequestLatencyGauge.
-				WithLabelValues(namespace, changefeedID, brokerID, avg).
+				WithLabelValues(keyspace, changefeedID, brokerID, avg).
 				Set(histogram.Snapshot().Mean() / 1000)
 			RequestLatencyGauge.
-				WithLabelValues(namespace, changefeedID, brokerID, p99).
+				WithLabelValues(keyspace, changefeedID, brokerID, p99).
 				Set(histogram.Snapshot().Percentile(0.99) / 1000)
 		}
 
@@ -168,7 +157,7 @@ func (m *saramaMetricsCollector) collectBrokerMetrics() {
 			requestsInFlightMetricNamePrefix, brokerID))
 		if counter, ok := requestsInFlightMetric.(metrics.Counter); ok {
 			requestsInFlightGauge.
-				WithLabelValues(namespace, changefeedID, brokerID).
+				WithLabelValues(keyspace, changefeedID, brokerID).
 				Set(float64(counter.Snapshot().Count()))
 		}
 
@@ -176,7 +165,7 @@ func (m *saramaMetricsCollector) collectBrokerMetrics() {
 			responseRateMetricNamePrefix, brokerID))
 		if meter, ok := responseRateMetric.(metrics.Meter); ok {
 			responseRateGauge.
-				WithLabelValues(namespace, changefeedID, brokerID).
+				WithLabelValues(keyspace, changefeedID, brokerID).
 				Set(meter.Snapshot().Rate1())
 		}
 	}
@@ -188,33 +177,33 @@ func getBrokerMetricName(prefix, brokerID string) string {
 
 func (m *saramaMetricsCollector) cleanupProducerMetrics() {
 	compressionRatioGauge.
-		DeleteLabelValues(m.changefeedID.Namespace(), m.changefeedID.Name(), avg)
+		DeleteLabelValues(m.changefeedID.Keyspace(), m.changefeedID.Name(), avg)
 	compressionRatioGauge.
-		DeleteLabelValues(m.changefeedID.Namespace(), m.changefeedID.Name(), p99)
+		DeleteLabelValues(m.changefeedID.Keyspace(), m.changefeedID.Name(), p99)
 
 	recordsPerRequestGauge.
-		DeleteLabelValues(m.changefeedID.Namespace(), m.changefeedID.Name(), avg)
+		DeleteLabelValues(m.changefeedID.Keyspace(), m.changefeedID.Name(), avg)
 	recordsPerRequestGauge.
-		DeleteLabelValues(m.changefeedID.Namespace(), m.changefeedID.Name(), p99)
+		DeleteLabelValues(m.changefeedID.Keyspace(), m.changefeedID.Name(), p99)
 }
 
 func (m *saramaMetricsCollector) cleanupBrokerMetrics() {
-	namespace := m.changefeedID.Namespace()
+	keyspace := m.changefeedID.Keyspace()
 	changefeedID := m.changefeedID.Name()
 	for id := range m.brokers {
 		brokerID := strconv.Itoa(int(id))
 		OutgoingByteRateGauge.
-			DeleteLabelValues(namespace, changefeedID, brokerID)
+			DeleteLabelValues(keyspace, changefeedID, brokerID)
 		RequestRateGauge.
-			DeleteLabelValues(namespace, changefeedID, brokerID)
+			DeleteLabelValues(keyspace, changefeedID, brokerID)
 		RequestLatencyGauge.
-			DeleteLabelValues(namespace, changefeedID, brokerID, avg)
+			DeleteLabelValues(keyspace, changefeedID, brokerID, avg)
 		RequestLatencyGauge.
-			DeleteLabelValues(namespace, changefeedID, brokerID, p99)
+			DeleteLabelValues(keyspace, changefeedID, brokerID, p99)
 		requestsInFlightGauge.
-			DeleteLabelValues(namespace, changefeedID, brokerID)
+			DeleteLabelValues(keyspace, changefeedID, brokerID)
 		responseRateGauge.
-			DeleteLabelValues(namespace, changefeedID, brokerID)
+			DeleteLabelValues(keyspace, changefeedID, brokerID)
 
 	}
 }

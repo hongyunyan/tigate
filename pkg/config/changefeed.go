@@ -14,6 +14,7 @@
 package config
 
 import (
+	"database/sql/driver"
 	"encoding/json"
 	"math"
 	"net/url"
@@ -23,13 +24,160 @@ import (
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/common"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/util"
 	"github.com/pingcap/ticdc/pkg/version"
-	"github.com/pingcap/tiflow/cdc/model"
-	"github.com/pingcap/tiflow/pkg/sink"
-	"github.com/pingcap/tiflow/pkg/util"
 	"github.com/tikv/client-go/v2/oracle"
 	"go.uber.org/zap"
 )
+
+// SortEngine is the sorter engine
+type SortEngine = string
+
+// sort engines
+const (
+	SortInMemory SortEngine = "memory"
+	SortInFile   SortEngine = "file"
+	SortUnified  SortEngine = "unified"
+)
+
+// FeedState represents the running state of a changefeed
+type FeedState string
+
+// All FeedStates
+// Only `StateNormal` and `StatePending` changefeed is running,
+// others are stopped.
+const (
+	StateNormal   FeedState = "normal"
+	StatePending  FeedState = "pending"
+	StateFailed   FeedState = "failed"
+	StateStopped  FeedState = "stopped"
+	StateRemoved  FeedState = "removed"
+	StateFinished FeedState = "finished"
+	StateWarning  FeedState = "warning"
+	// StateUnInitialized is used for the changefeed that has not been initialized
+	// it only exists in memory for a short time and will not be persisted to storage
+	StateUnInitialized FeedState = ""
+)
+
+// ToInt return an int for each `FeedState`, only use this for metrics.
+func (s FeedState) ToInt() int {
+	switch s {
+	case StateNormal:
+		return 0
+	case StatePending:
+		return 1
+	case StateFailed:
+		return 2
+	case StateStopped:
+		return 3
+	case StateFinished:
+		return 4
+	case StateRemoved:
+		return 5
+	case StateWarning:
+		return 6
+	case StateUnInitialized:
+		return 7
+	}
+	// -1 for unknown feed state
+	return -1
+}
+
+// IsNeeded return true if the given feedState matches the listState.
+func (s FeedState) IsNeeded(need string) bool {
+	if need == "all" {
+		return true
+	}
+	if need == "" {
+		switch s {
+		case StateNormal:
+			return true
+		case StateStopped:
+			return true
+		case StateFailed:
+			return true
+		case StateWarning:
+			return true
+		case StatePending:
+			return true
+		}
+	}
+	return need == string(s)
+}
+
+// IsRunning return true if the feedState represents a running state.
+func (s FeedState) IsRunning() bool {
+	return s == StateNormal || s == StateWarning
+}
+
+// RunningError represents some running error from cdc components, such as processor.
+type RunningError struct {
+	Time    time.Time `json:"time"`
+	Addr    string    `json:"addr"`
+	Code    string    `json:"code"`
+	Message string    `json:"message"`
+}
+
+// Value implements the driver.Valuer interface
+func (e RunningError) Value() (driver.Value, error) {
+	return json.Marshal(e)
+}
+
+// Scan implements the sql.Scanner interface
+func (e *RunningError) Scan(value interface{}) error {
+	b, ok := value.([]byte)
+	if !ok {
+		return errors.New("type assertion to []byte failed")
+	}
+
+	return json.Unmarshal(b, e)
+}
+
+// AdminJobType represents for admin job type, both used in owner and processor
+type AdminJobType int
+
+// AdminJob holds an admin job
+type AdminJob struct {
+	CfID                  common.ChangeFeedID
+	Type                  AdminJobType
+	Error                 *RunningError
+	OverwriteCheckpointTs uint64
+}
+
+// All AdminJob types
+const (
+	AdminNone AdminJobType = iota
+	AdminStop
+	AdminResume
+	AdminRemove
+	AdminFinish
+)
+
+// String implements fmt.Stringer interface.
+func (t AdminJobType) String() string {
+	switch t {
+	case AdminNone:
+		return "noop"
+	case AdminStop:
+		return "stop changefeed"
+	case AdminResume:
+		return "resume changefeed"
+	case AdminRemove:
+		return "remove changefeed"
+	case AdminFinish:
+		return "finish changefeed"
+	}
+	return "unknown"
+}
+
+// IsStopState returns whether changefeed is in stop state with give admin job
+func (t AdminJobType) IsStopState() bool {
+	switch t {
+	case AdminStop, AdminRemove, AdminFinish:
+		return true
+	}
+	return false
+}
 
 type ChangefeedConfig struct {
 	ChangefeedID common.ChangeFeedID `json:"changefeed_id"`
@@ -45,12 +193,16 @@ type ChangefeedConfig struct {
 	MemoryQuota    uint64        `toml:"memory-quota" json:"memory-quota"`
 	// sync point related
 	// TODO: Is syncPointRetention|default can be removed?
-	EnableSyncPoint    bool          `json:"enable_sync_point" default:"false"`
-	SyncPointInterval  time.Duration `json:"sync_point_interval" default:"1m"`
-	SyncPointRetention time.Duration `json:"sync_point_retention" default:"24h"`
-	SinkConfig         *SinkConfig   `json:"sink_config"`
+	EnableSyncPoint       bool          `json:"enable_sync_point" default:"false"`
+	SyncPointInterval     time.Duration `json:"sync_point_interval" default:"1m"`
+	SyncPointRetention    time.Duration `json:"sync_point_retention" default:"24h"`
+	SinkConfig            *SinkConfig   `json:"sink_config"`
+	EnableSplittableCheck bool          `json:"enable_splittable_check" default:"false"`
 	// Epoch is the epoch of a changefeed, changes on every restart.
-	Epoch uint64 `json:"epoch"`
+	Epoch   uint64 `json:"epoch"`
+	BDRMode bool   `json:"bdr_mode" default:"false"`
+	// redo releated
+	Consistent *ConsistentConfig `toml:"consistent" json:"consistent,omitempty"`
 }
 
 // String implements fmt.Stringer interface, but hide some sensitive information
@@ -86,39 +238,46 @@ type ChangeFeedInfo struct {
 	// The ChangeFeed will exits until sync to timestamp TargetTs
 	TargetTs uint64 `json:"target-ts"`
 	// used for admin job notification, trigger watch event in capture
-	AdminJobType model.AdminJobType `json:"admin-job-type"`
-	Engine       model.SortEngine   `json:"sort-engine"`
+	AdminJobType AdminJobType `json:"admin-job-type"`
+	Engine       SortEngine   `json:"sort-engine"`
 	// SortDir is deprecated
 	// it cannot be set by user in changefeed level, any assignment to it should be ignored.
 	// but can be fetched for backward compatibility
 	SortDir string `json:"sort-dir"`
 
-	UpstreamInfo *UpstreamInfo       `json:"upstream-info"`
-	Config       *ReplicaConfig      `json:"config"`
-	State        model.FeedState     `json:"state"`
-	Error        *model.RunningError `json:"error"`
-	Warning      *model.RunningError `json:"warning"`
+	UpstreamInfo *UpstreamInfo  `json:"upstream-info"`
+	Config       *ReplicaConfig `json:"config"`
+	State        FeedState      `json:"state"`
+	Error        *RunningError  `json:"error"`
+	Warning      *RunningError  `json:"warning"`
 
 	CreatorVersion string `json:"creator-version"`
 	// Epoch is the epoch of a changefeed, changes on every restart.
 	Epoch uint64 `json:"epoch"`
+
+	// The changefeed belongs to the keyspace.  In classic mode, it will always be 0.
+	KeyspaceID uint32 `json:"keyspace-id"`
 }
 
 func (info *ChangeFeedInfo) ToChangefeedConfig() *ChangefeedConfig {
 	return &ChangefeedConfig{
-		ChangefeedID:       info.ChangefeedID,
-		StartTS:            info.StartTs,
-		TargetTS:           info.TargetTs,
-		SinkURI:            info.SinkURI,
-		CaseSensitive:      info.Config.CaseSensitive,
-		ForceReplicate:     info.Config.ForceReplicate,
-		SinkConfig:         info.Config.Sink,
-		Filter:             info.Config.Filter,
-		EnableSyncPoint:    util.GetOrZero(info.Config.EnableSyncPoint),
-		SyncPointInterval:  util.GetOrZero(info.Config.SyncPointInterval),
-		SyncPointRetention: util.GetOrZero(info.Config.SyncPointRetention),
-		MemoryQuota:        info.Config.MemoryQuota,
-		Epoch:              info.Epoch,
+		ChangefeedID:          info.ChangefeedID,
+		StartTS:               info.StartTs,
+		TargetTS:              info.TargetTs,
+		SinkURI:               info.SinkURI,
+		CaseSensitive:         info.Config.CaseSensitive,
+		ForceReplicate:        info.Config.ForceReplicate,
+		SinkConfig:            info.Config.Sink,
+		Filter:                info.Config.Filter,
+		EnableSyncPoint:       util.GetOrZero(info.Config.EnableSyncPoint),
+		SyncPointInterval:     util.GetOrZero(info.Config.SyncPointInterval),
+		SyncPointRetention:    util.GetOrZero(info.Config.SyncPointRetention),
+		EnableSplittableCheck: info.Config.Scheduler.EnableSplittableCheck,
+		MemoryQuota:           info.Config.MemoryQuota,
+		Epoch:                 info.Epoch,
+		BDRMode:               util.GetOrZero(info.Config.BDRMode),
+		TimeZone:              GetGlobalServerConfig().TZ,
+		Consistent:            info.Config.Consistent,
 		// other fields are not necessary for dispatcherManager
 	}
 }
@@ -127,11 +286,11 @@ func (info *ChangeFeedInfo) ToChangefeedConfig() *ChangefeedConfig {
 // Note: if the changefeed is failed by GC, it should not block the GC safepoint.
 func (info *ChangeFeedInfo) NeedBlockGC() bool {
 	switch info.State {
-	case model.StateNormal, model.StateStopped, model.StatePending, model.StateWarning:
+	case StateNormal, StateStopped, StatePending, StateWarning:
 		return true
-	case model.StateFailed:
+	case StateFailed:
 		return !info.isFailedByGC()
-	case model.StateFinished, model.StateRemoved:
+	case StateFinished, StateRemoved:
 	default:
 	}
 	return false
@@ -151,13 +310,13 @@ func (info *ChangeFeedInfo) String() (str string) {
 	str, err = info.Marshal()
 	if err != nil {
 		log.Error("failed to marshal changefeed info", zap.Error(err))
-		return
+		return str
 	}
 	clone := new(ChangeFeedInfo)
 	err = clone.Unmarshal([]byte(str))
 	if err != nil {
 		log.Error("failed to unmarshal changefeed info", zap.Error(err))
-		return
+		return str
 	}
 
 	clone.SinkURI = util.MaskSensitiveDataInURI(clone.SinkURI)
@@ -169,7 +328,7 @@ func (info *ChangeFeedInfo) String() (str string) {
 	if err != nil {
 		log.Error("failed to marshal changefeed info", zap.Error(err))
 	}
-	return
+	return str
 }
 
 // GetStartTs returns StartTs if it's specified or using the
@@ -183,7 +342,7 @@ func (info *ChangeFeedInfo) GetStartTs() uint64 {
 }
 
 // GetCheckpointTs returns CheckpointTs if it's specified in ChangeFeedStatus, otherwise StartTs is returned.
-func (info *ChangeFeedInfo) GetCheckpointTs(status *model.ChangeFeedStatus) uint64 {
+func (info *ChangeFeedInfo) GetCheckpointTs(status *ChangeFeedStatus) uint64 {
 	if status != nil {
 		return status.CheckpointTs
 	}
@@ -200,7 +359,23 @@ func (info *ChangeFeedInfo) GetTargetTs() uint64 {
 
 // Marshal returns the json marshal format of a ChangeFeedInfo
 func (info *ChangeFeedInfo) Marshal() (string, error) {
-	data, err := json.Marshal(info)
+	return info.MarshalWithTruncation(true)
+}
+
+// MarshalWithTruncation allows controlling whether to truncate error messages
+func (info *ChangeFeedInfo) MarshalWithTruncation(truncateError bool) (string, error) {
+	var dataToMarshal interface{} = info
+
+	if truncateError && info.Error != nil && len(info.Error.Message) > 100 {
+		infoToMarshal := *info
+		// Create a complete deep copy error message to avoid any data races
+		errorCopy := *infoToMarshal.Error
+		errorCopy.Message = errorCopy.Message[:100] + "..."
+		infoToMarshal.Error = &errorCopy
+		dataToMarshal = &infoToMarshal
+	}
+
+	data, err := json.Marshal(dataToMarshal)
 	return string(data), cerror.WrapError(cerror.ErrMarshalFailed, err)
 }
 
@@ -216,7 +391,8 @@ func (info *ChangeFeedInfo) Unmarshal(data []byte) error {
 
 // Clone returns a cloned ChangeFeedInfo
 func (info *ChangeFeedInfo) Clone() (*ChangeFeedInfo, error) {
-	s, err := info.Marshal()
+	// Use MarshalWithTruncation(false) to preserve original data in clones
+	s, err := info.MarshalWithTruncation(false)
 	if err != nil {
 		return nil, err
 	}
@@ -244,6 +420,12 @@ func (info *ChangeFeedInfo) VerifyAndComplete() {
 	}
 	if info.Config.Scheduler == nil {
 		info.Config.Scheduler = defaultConfig.Scheduler
+	} else {
+		info.Config.Scheduler.FillMissingWithDefaults(defaultConfig.Scheduler)
+	}
+
+	if info.Config.MemoryQuota == uint64(0) {
+		info.fixMemoryQuota()
 	}
 
 	if info.Config.Integrity == nil {
@@ -272,10 +454,10 @@ func (info *ChangeFeedInfo) RmUnusedFields() {
 		return
 	}
 	// blackhole is for testing purpose, no need to remove fields
-	if sink.IsBlackHoleScheme(uri.Scheme) {
+	if IsBlackHoleScheme(uri.Scheme) {
 		return
 	}
-	if !sink.IsMQScheme(uri.Scheme) {
+	if !IsMQScheme(uri.Scheme) {
 		info.rmMQOnlyFields()
 	} else {
 		// remove schema registry for MQ downstream with
@@ -285,11 +467,11 @@ func (info *ChangeFeedInfo) RmUnusedFields() {
 		}
 	}
 
-	if !sink.IsStorageScheme(uri.Scheme) {
+	if !IsStorageScheme(uri.Scheme) {
 		info.rmStorageOnlyFields()
 	}
 
-	if !sink.IsMySQLCompatibleScheme(uri.Scheme) {
+	if !IsMySQLCompatibleScheme(uri.Scheme) {
 		info.rmDBOnlyFields()
 	} else {
 		// remove fields only being used by MQ and Storage downstream
@@ -300,12 +482,11 @@ func (info *ChangeFeedInfo) RmUnusedFields() {
 
 func (info *ChangeFeedInfo) rmMQOnlyFields() {
 	log.Info("since the downstream is not a MQ, remove MQ only fields",
-		zap.String("namespace", info.ChangefeedID.Namespace()),
+		zap.String("keyspace", info.ChangefeedID.Keyspace()),
 		zap.String("changefeed", info.ChangefeedID.Name()))
 	info.Config.Sink.DispatchRules = nil
 	info.Config.Sink.SchemaRegistry = nil
 	info.Config.Sink.EncoderConcurrency = nil
-	info.Config.Sink.EnableKafkaSinkV2 = nil
 	info.Config.Sink.OnlyOutputUpdatedColumns = nil
 	info.Config.Sink.DeleteOnlyOutputHandleKeyColumns = nil
 	info.Config.Sink.ContentCompatible = nil
@@ -325,7 +506,6 @@ func (info *ChangeFeedInfo) rmDBOnlyFields() {
 	info.Config.BDRMode = nil
 	info.Config.SyncPointInterval = nil
 	info.Config.SyncPointRetention = nil
-	info.Config.Consistent = nil
 	info.Config.Sink.SafeMode = nil
 	info.Config.Sink.MySQLConfig = nil
 }
@@ -378,23 +558,23 @@ func (info *ChangeFeedInfo) fixState() {
 	state := info.State
 	// Upgrading from an old owner, we need to deal with cases where the state is normal,
 	// but actually contains errors and does not match the admin job type.
-	if state == model.StateNormal {
+	if state == StateNormal {
 		switch info.AdminJobType {
 		// This corresponds to the case of failure or error.
-		case model.AdminNone, model.AdminResume:
+		case AdminNone, AdminResume:
 			if info.Error != nil {
 				if cerror.IsChangefeedGCFastFailErrorCode(errors.RFCErrorCode(info.Error.Code)) {
-					state = model.StateFailed
+					state = StateFailed
 				} else {
-					state = model.StateWarning
+					state = StateWarning
 				}
 			}
-		case model.AdminStop:
-			state = model.StateStopped
-		case model.AdminFinish:
-			state = model.StateFinished
-		case model.AdminRemove:
-			state = model.StateRemoved
+		case AdminStop:
+			state = StateStopped
+		case AdminFinish:
+			state = StateFinished
+		case AdminRemove:
+			state = StateRemoved
 		}
 	}
 
@@ -419,7 +599,7 @@ func (info *ChangeFeedInfo) fixMySQLSinkProtocol() {
 		return
 	}
 
-	if sink.IsMQScheme(uri.Scheme) {
+	if IsMQScheme(uri.Scheme) {
 		return
 	}
 
@@ -444,7 +624,7 @@ func (info *ChangeFeedInfo) fixMQSinkProtocol() {
 		return
 	}
 
-	if !sink.IsMQScheme(uri.Scheme) {
+	if !IsMQScheme(uri.Scheme) {
 		return
 	}
 
@@ -515,6 +695,19 @@ type ChangeFeedStatus struct {
 	// MaintainerAddr is the address of the changefeed's maintainer
 	// It is used to identify the changefeed's maintainer, and it is not stored in etcd.
 	maintainerAddr string `json:"-"`
+	// minTableBarrierTs is the minimum commitTs of all DDL events and is only
+	// used to check whether there is a pending DDL job at the checkpointTs when
+	// initializing the changefeed.
+	MinTableBarrierTs uint64 `json:"min-table-barrier-ts"`
+	// TODO: remove this filed after we don't use ChangeFeedStatus to
+	// control processor. This is too ambiguous.
+	AdminJobType AdminJobType `json:"admin-job-type"`
+	// LastSyncedTs is the last synced max timestamp of the changefeed.
+	// It is used to indicate the progress of the changefeed.
+	// It is not stored in etcd.
+	LastSyncedTs uint64 `json:"-"`
+	// LogCoordinatorResolvedTs is the resolved timestamp from the log coordinator.
+	LogCoordinatorResolvedTs uint64 `json:"-"`
 }
 
 // Marshal returns json encoded string of ChangeFeedStatus, only contains necessary fields stored in storage

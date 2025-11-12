@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/filter"
+	"github.com/pingcap/ticdc/pkg/txnutil/gc"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	pd "github.com/tikv/pd/client"
@@ -37,21 +39,34 @@ import (
 )
 
 // The parent folder to store schema data
-const dataDir = "schema_store"
+const (
+	dataDir                       = "schema_store"
+	defaultSchemaStoreGcServiceID = "cdc_schema_store"
+	defaultGcServiceTTL           = 60 * 60 * 2 // 2 hours
+)
 
 // persistentStorage stores the following kinds of data on disk:
 //  1. table info and database info from upstream snapshot
 //  2. incremental ddl jobs
 //  3. metadata which describes the valid data range on disk
 type persistentStorage struct {
+	rootDir string
+
+	keyspaceID uint32
+
 	pdCli pd.Client
 
 	kvStorage kv.Storage
 
 	db *pebble.DB
+	wg sync.WaitGroup
+
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	mu sync.RWMutex
 
+	BDRMode bool
 	// the current gcTs on disk
 	gcTs uint64
 
@@ -124,21 +139,13 @@ func openDB(dbPath string) *pebble.DB {
 func newPersistentStorage(
 	ctx context.Context,
 	root string,
+	keyspaceID uint32,
 	pdCli pd.Client,
 	storage kv.Storage,
-) *persistentStorage {
-	gcSafePoint, err := pdCli.UpdateServiceGCSafePoint(ctx, "cdc-new-store", 0, 0)
-	if err != nil {
-		log.Panic("get ts failed", zap.Error(err))
-	}
-
-	dbPath := fmt.Sprintf("%s/%s", root, dataDir)
-	// FIXME: currently we don't try to reuse data at restart, when we need, just remove the following line
-	if err := os.RemoveAll(dbPath); err != nil {
-		log.Panic("fail to remove path")
-	}
-
+) (*persistentStorage, error) {
 	dataStorage := &persistentStorage{
+		rootDir:                root,
+		keyspaceID:             keyspaceID,
 		pdCli:                  pdCli,
 		kvStorage:              storage,
 		tableMap:               make(map[int64]*BasicTableInfo),
@@ -148,6 +155,56 @@ func newPersistentStorage(
 		tableTriggerDDLHistory: make([]uint64, 0),
 		tableInfoStoreMap:      make(map[int64]*versionedTableInfoStore),
 		tableRegisteredCount:   make(map[int64]int),
+	}
+	dataStorage.ctx, dataStorage.cancel = context.WithCancel(ctx)
+	err := dataStorage.initialize(ctx)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	return dataStorage, nil
+}
+
+func (p *persistentStorage) getGcSafePoint(ctx context.Context) (uint64, error) {
+	return gc.UnifyGetServiceGCSafepoint(ctx, p.pdCli, p.keyspaceID, defaultSchemaStoreGcServiceID)
+}
+
+func (p *persistentStorage) initialize(ctx context.Context) error {
+	var gcSafePoint uint64
+	fakeChangefeedID := common.NewChangefeedID(defaultSchemaStoreGcServiceID)
+	for {
+		var err error
+		gcSafePoint, err = p.getGcSafePoint(ctx)
+		if err == nil {
+			log.Info("get gc safepoint success", zap.Uint32("keyspaceID", p.keyspaceID), zap.Any("gcSafePoint", gcSafePoint))
+			// Ensure the start ts is valid during the gc service ttl
+			err = gc.EnsureChangefeedStartTsSafety(
+				ctx,
+				p.pdCli,
+				defaultSchemaStoreGcServiceID,
+				p.keyspaceID,
+				fakeChangefeedID,
+				defaultGcServiceTTL, gcSafePoint+1)
+			if err == nil {
+				break
+			}
+		}
+
+		log.Warn("get ts failed, will retry in 1s", zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return errors.Trace(err)
+		case <-time.After(time.Second):
+		}
+	}
+
+	defer gc.UndoEnsureChangefeedStartTsSafety(ctx, p.pdCli, p.keyspaceID, defaultSchemaStoreGcServiceID, fakeChangefeedID)
+
+	dbPath := fmt.Sprintf("%s/%s/%d", p.rootDir, dataDir, p.keyspaceID)
+
+	// FIXME: currently we don't try to reuse data at restart, when we need, just remove the following line
+	if err := os.RemoveAll(dbPath); err != nil {
+		log.Panic("fail to remove path", zap.String("dbPath", dbPath), zap.Error(err))
 	}
 
 	isDataReusable := false
@@ -160,7 +217,7 @@ func newPersistentStorage(
 			isDataReusable = false
 		}
 		if gcSafePoint < gcTs {
-			log.Panic("gc safe point should never go back")
+			return errors.New(fmt.Sprintf("gc safe point %d is smaller than gcTs %d on disk", gcSafePoint, gcTs))
 		}
 		upperBound, err := readUpperBoundMeta(db)
 		if err != nil {
@@ -171,22 +228,21 @@ func newPersistentStorage(
 		}
 
 		if isDataReusable {
-			dataStorage.db = db
-			dataStorage.gcTs = gcTs
-			dataStorage.upperBound = upperBound
-			dataStorage.initializeFromDisk()
+			p.db = db
+			p.gcTs = gcTs
+			p.upperBound = upperBound
+			p.initializeFromDisk()
 		} else {
-			db.Close()
+			_ = db.Close()
 		}
 	}
 	if !isDataReusable {
-		dataStorage.initializeFromKVStorage(dbPath, storage, gcSafePoint)
+		p.initializeFromKVStorage(dbPath, gcSafePoint)
 	}
-
-	return dataStorage
+	return nil
 }
 
-func (p *persistentStorage) initializeFromKVStorage(dbPath string, storage kv.Storage, gcTs uint64) {
+func (p *persistentStorage) initializeFromKVStorage(dbPath string, gcTs uint64) {
 	now := time.Now()
 	if err := os.RemoveAll(dbPath); err != nil {
 		log.Fatal("fail to remove path in initializeFromKVStorage")
@@ -197,10 +253,11 @@ func (p *persistentStorage) initializeFromKVStorage(dbPath string, storage kv.St
 		zap.Uint64("snapTs", gcTs))
 
 	var err error
-	if p.databaseMap, p.tableMap, err = writeSchemaSnapshotAndMeta(p.db, storage, gcTs, true); err != nil {
+	if p.databaseMap, p.tableMap, p.partitionMap, err = persistSchemaSnapshot(p.db, p.kvStorage, gcTs, true); err != nil {
 		// TODO: retry
-		log.Fatal("fail to initialize from kv snapshot")
+		log.Fatal("fail to initialize from kv snapshot", zap.Error(err))
 	}
+
 	p.gcTs = gcTs
 	p.upperBound = UpperBoundMeta{
 		FinishedDDLTs: 0,
@@ -208,6 +265,7 @@ func (p *persistentStorage) initializeFromKVStorage(dbPath string, storage kv.St
 	}
 	writeUpperBoundMeta(p.db, p.upperBound)
 	log.Info("schema store initialize from kv storage done",
+		zap.Uint64("gcTs", gcTs),
 		zap.Int("databaseMapLen", len(p.databaseMap)),
 		zap.Int("tableMapLen", len(p.tableMap)),
 		zap.Any("duration(s)", time.Since(now).Seconds()))
@@ -239,7 +297,16 @@ func (p *persistentStorage) initializeFromDisk() {
 	}
 }
 
+func (p *persistentStorage) run() error {
+	p.wg.Add(2)
+	go p.gc(p.ctx)
+	go p.persistUpperBoundPeriodically(p.ctx)
+	return nil
+}
+
 func (p *persistentStorage) close() error {
+	p.cancel()
+	p.wg.Wait()
 	return p.db.Close()
 }
 
@@ -353,7 +420,8 @@ func (p *persistentStorage) getMaxEventCommitTs(tableID int64, ts uint64) uint64
 }
 
 // TODO: not all ddl in p.tablesDDLHistory should be sent to the dispatcher, verify dispatcher will set the right range
-func (p *persistentStorage) fetchTableDDLEvents(tableID int64, tableFilter filter.Filter, start, end uint64) ([]commonEvent.DDLEvent, error) {
+// fetch table ddl events in the range (start, end]
+func (p *persistentStorage) fetchTableDDLEvents(dispatcherID common.DispatcherID, tableID int64, tableFilter filter.Filter, start, end uint64) ([]commonEvent.DDLEvent, error) {
 	// TODO: check a dispatcher won't fetch the ddl events that create it(create table/rename table)
 	p.mu.RLock()
 	// fast check
@@ -391,17 +459,28 @@ func (p *persistentStorage) fetchTableDDLEvents(tableID int64, tableFilter filte
 	events := make([]commonEvent.DDLEvent, 0, len(allTargetTs))
 	for _, ts := range allTargetTs {
 		rawEvent := readPersistedDDLEvent(storageSnap, ts)
-		ddlEvent, ok := buildDDLEvent(&rawEvent, tableFilter)
+		ddlEvent, ok, err := buildDDLEvent(&rawEvent, tableFilter, tableID)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
 		if ok {
 			events = append(events, ddlEvent)
+		} else {
+			log.Info("skip fetch ddl event",
+				zap.Stringer("dispatcherID", dispatcherID),
+				zap.Int64("tableID", tableID),
+				zap.Uint64("ts", ts),
+				zap.String("type", model.ActionType(rawEvent.Type).String()),
+				zap.String("query", rawEvent.Query))
 		}
 	}
-	// log.Info("fetchTableDDLEvents",
-	// 	zap.Int64("tableID", tableID),
-	// 	zap.Uint64("start", start),
-	// 	zap.Uint64("end", end),
-	// 	zap.Any("history", history),
-	// 	zap.Any("allTargetTs", allTargetTs))
+	log.Debug("fetchTableDDLEvents",
+		zap.Stringer("dispatcherID", dispatcherID),
+		zap.Int64("tableID", tableID),
+		zap.Uint64("start", start),
+		zap.Uint64("end", end),
+		zap.Int("eventsLen", len(events)),
+		zap.Uint64s("allTargetTs", allTargetTs))
 
 	return events, nil
 }
@@ -450,7 +529,11 @@ func (p *persistentStorage) fetchTableTriggerDDLEvents(tableFilter filter.Filter
 		p.mu.RUnlock()
 		for _, ts := range allTargetTs {
 			rawEvent := readPersistedDDLEvent(storageSnap, ts)
-			ddlEvent, ok := buildDDLEvent(&rawEvent, tableFilter)
+			// the tableID of buildDDLEvent is not used in this function, set it to 0
+			ddlEvent, ok, err := buildDDLEvent(&rawEvent, tableFilter, 0)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
 			if ok {
 				events = append(events, ddlEvent)
 			}
@@ -499,14 +582,15 @@ func addTableInfoFromKVSnap(
 	return nil
 }
 
-func (p *persistentStorage) gc(ctx context.Context) error {
+func (p *persistentStorage) gc(ctx context.Context) {
+	defer p.wg.Done()
 	ticker := time.NewTicker(5 * time.Minute)
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case <-ticker.C:
-			gcSafePoint, err := p.pdCli.UpdateServiceGCSafePoint(ctx, "cdc-new-store", 0, 0)
+			gcSafePoint, err := p.getGcSafePoint(ctx)
 			if err != nil {
 				log.Warn("get ts failed", zap.Error(err))
 				continue
@@ -516,51 +600,46 @@ func (p *persistentStorage) gc(ctx context.Context) error {
 	}
 }
 
-func (p *persistentStorage) doGc(gcTs uint64) error {
+func (p *persistentStorage) doGc(gcTs uint64) {
 	p.mu.Lock()
 	if gcTs > p.upperBound.ResolvedTs {
-		log.Panic("gc safe point is larger than resolvedTs",
+		// It might happen when all changefeed is removed in the maintainer side,
+		// the gc safe point thus advanced.
+		log.Warn("gc safe point is larger than resolvedTs, ignore it",
 			zap.Uint64("gcTs", gcTs),
 			zap.Uint64("resolvedTs", p.upperBound.ResolvedTs))
 	}
 	if gcTs <= p.gcTs {
 		p.mu.Unlock()
-		return nil
+		return
 	}
 	oldGcTs := p.gcTs
 	p.mu.Unlock()
 
 	serverConfig := config.GetGlobalServerConfig()
 	if !serverConfig.Debug.SchemaStore.EnableGC {
-		log.Info("gc is disabled",
-			zap.Uint64("gcTs", gcTs))
-		return nil
+		log.Info("gc is disabled", zap.Uint64("gcTs", gcTs))
+		return
 	}
 
 	start := time.Now()
-	_, _, err := writeSchemaSnapshotAndMeta(p.db, p.kvStorage, gcTs, false)
+	_, _, _, err := persistSchemaSnapshot(p.db, p.kvStorage, gcTs, false)
 	if err != nil {
 		log.Warn("fail to write kv snapshot during gc",
-			zap.Uint64("gcTs", gcTs))
+			zap.Uint64("gcTs", gcTs), zap.Error(err))
 		// TODO: return err and retry?
-		return nil
+		return
 	}
 	log.Info("gc finish write schema snapshot",
-		zap.Uint64("gcTs", gcTs),
-		zap.Any("duration", time.Since(start)))
+		zap.Uint64("gcTs", gcTs), zap.Any("duration", time.Since(start)))
 
 	// clean data in memory before clean data on disk
 	p.cleanObsoleteDataInMemory(gcTs)
 	log.Info("gc finish clean in memory data",
-		zap.Uint64("gcTs", gcTs),
-		zap.Any("duration", time.Since(start)))
+		zap.Uint64("gcTs", gcTs), zap.Any("duration", time.Since(start)))
 
 	cleanObsoleteData(p.db, oldGcTs, gcTs)
-	log.Info("gc finish",
-		zap.Uint64("gcTs", gcTs),
-		zap.Any("duration", time.Since(start)))
-
-	return nil
+	log.Info("gc finish", zap.Uint64("gcTs", gcTs), zap.Any("duration", time.Since(start)))
 }
 
 func (p *persistentStorage) cleanObsoleteDataInMemory(gcTs uint64) {
@@ -617,12 +696,13 @@ func (p *persistentStorage) getUpperBound() UpperBoundMeta {
 	return p.upperBound
 }
 
-func (p *persistentStorage) persistUpperBoundPeriodically(ctx context.Context) error {
+func (p *persistentStorage) persistUpperBoundPeriodically(ctx context.Context) {
+	defer p.wg.Done()
 	ticker := time.NewTicker(10 * time.Second)
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case <-ticker.C:
 			p.mu.Lock()
 			if !p.upperBoundChanged {
@@ -647,11 +727,18 @@ func (p *persistentStorage) handleDDLJob(job *model.Job) error {
 		return nil
 	}
 
+	// ALTER TABLE t2 ADD FULLTEXT INDEX (b) WITH PARSER standard;
+	// TODO: remove this after ADD FULLTEXT INDEX has a dedicated action type in tidb repo
+	if strings.Contains(strings.ToUpper(job.Query), "ADD FULLTEXT INDEX") {
+		job.Type = filter.ActionAddFullTextIndex
+	}
+
 	handler, ok := allDDLHandlers[job.Type]
 	if !ok {
 		log.Error("unknown ddl type, ignore it", zap.Any("ddlType", job.Type), zap.String("query", job.Query))
 		return nil
 	}
+
 	ddlEvent := handler.buildPersistedDDLEventFunc(buildPersistedDDLEventFuncArgs{
 		job:          job,
 		databaseMap:  p.databaseMap,
@@ -663,6 +750,7 @@ func (p *persistentStorage) handleDDLJob(job *model.Job) error {
 
 	// TODO: do we have a better way to do this?
 	if ddlEvent.Type == byte(model.ActionExchangeTablePartition) {
+		// ExtraTableInfo is the normal table info before exchange
 		ddlEvent.ExtraTableInfo, _ = p.forceGetTableInfo(ddlEvent.TableID, ddlEvent.FinishedTs)
 	}
 
@@ -722,25 +810,27 @@ func shouldSkipDDL(job *model.Job, tableMap map[int64]*BasicTableInfo) bool {
 	case model.ActionCreateTable:
 		// Note: partition table's logical table id is also in tableMap
 		if _, ok := tableMap[job.BinlogInfo.TableInfo.ID]; ok {
-			log.Info("table already exists. ignore DDL",
-				zap.String("DDL", job.Query),
-				zap.Int64("jobID", job.ID),
+			log.Debug("table already exists. ignore DDL",
 				zap.Int64("schemaID", job.SchemaID),
-				zap.Int64("tableID", job.BinlogInfo.TableInfo.ID),
-				zap.Uint64("finishedTs", job.BinlogInfo.FinishedTS),
-				zap.Int64("jobSchemaVersion", job.BinlogInfo.SchemaVersion))
+				zap.String("schemaName", job.SchemaName),
+				zap.Int64("tableID", job.TableID),
+				zap.String("tableName", job.TableName),
+				zap.String("DDL", job.Query),
+				zap.Int64("schemaVersion", job.BinlogInfo.SchemaVersion),
+				zap.Uint64("finishedTs", job.BinlogInfo.FinishedTS))
 			return true
 		}
 	case model.ActionCreateTables:
 		// For duplicate create tables ddl job, the tables in the job should be same, check the first table is enough
 		if _, ok := tableMap[job.BinlogInfo.MultipleTableInfos[0].ID]; ok {
-			log.Info("table already exists. ignore DDL",
-				zap.String("DDL", job.Query),
-				zap.Int64("jobID", job.ID),
+			log.Debug("table already exists. ignore DDL",
 				zap.Int64("schemaID", job.SchemaID),
-				zap.Int64("tableID", job.BinlogInfo.MultipleTableInfos[0].ID),
-				zap.Uint64("finishedTs", job.BinlogInfo.FinishedTS),
-				zap.Int64("jobSchemaVersion", job.BinlogInfo.SchemaVersion))
+				zap.String("schemaName", job.SchemaName),
+				zap.Int64("tableID", job.TableID),
+				zap.String("tableName", job.TableName),
+				zap.String("DDL", job.Query),
+				zap.Int64("schemaVersion", job.BinlogInfo.SchemaVersion),
+				zap.Uint64("finishedTs", job.BinlogInfo.FinishedTS))
 			return true
 		}
 	// DDLs ignored
@@ -782,10 +872,13 @@ func shouldSkipDDL(job *model.Job, tableMap map[int64]*BasicTableInfo) bool {
 	return false
 }
 
-func buildDDLEvent(rawEvent *PersistedDDLEvent, tableFilter filter.Filter) (commonEvent.DDLEvent, bool) {
+// NOTE: tableID is only used in fetchTableDDLEvents to fetch exchange table partition and rename tables DDL
+// for the corresponding dispatcher.
+// It's not used in fetchTableTriggerDDLEvents, so it can be 0.
+func buildDDLEvent(rawEvent *PersistedDDLEvent, tableFilter filter.Filter, tableID int64) (commonEvent.DDLEvent, bool, error) {
 	handler, ok := allDDLHandlers[model.ActionType(rawEvent.Type)]
 	if !ok {
 		log.Panic("unknown ddl type", zap.Any("ddlType", rawEvent.Type), zap.String("query", rawEvent.Query))
 	}
-	return handler.buildDDLEventFunc(rawEvent, tableFilter)
+	return handler.buildDDLEventFunc(rawEvent, tableFilter, tableID)
 }

@@ -29,14 +29,12 @@ import (
 	"github.com/pingcap/log"
 	commonType "github.com/pingcap/ticdc/pkg/common"
 	appcontext "github.com/pingcap/ticdc/pkg/common/context"
+	"github.com/pingcap/ticdc/pkg/config"
+	"github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/hash"
 	"github.com/pingcap/ticdc/pkg/pdutil"
+	"github.com/pingcap/ticdc/pkg/util"
 	"github.com/pingcap/tidb/br/pkg/storage"
-	"github.com/pingcap/tiflow/cdc/model"
-	"github.com/pingcap/tiflow/engine/pkg/clock"
-	"github.com/pingcap/tiflow/pkg/config"
-	"github.com/pingcap/tiflow/pkg/errors"
-	"github.com/pingcap/tiflow/pkg/hash"
-	"github.com/pingcap/tiflow/pkg/util"
 	"github.com/tikv/client-go/v2/oracle"
 	"go.uber.org/zap"
 )
@@ -155,12 +153,6 @@ func NewFilePathGenerator(
 	extension string,
 ) *FilePathGenerator {
 	pdClock := appcontext.GetService[pdutil.Clock](appcontext.DefaultPDClock)
-	if pdClock == nil {
-		pdClock = pdutil.NewMonotonicClock(clock.New())
-		log.Warn("pd clock is not set in storage sink, use local clock instead",
-			zap.String("namespace", changefeedID.Namespace()),
-			zap.Stringer("changefeedID", changefeedID.ID()))
-	}
 	return &FilePathGenerator{
 		changefeedID: changefeedID,
 		config:       config,
@@ -175,13 +167,14 @@ func NewFilePathGenerator(
 
 // CheckOrWriteSchema checks whether the schema file exists in the storage and
 // write scheme.json if necessary.
+// It returns true if there is a newer schema version in storage than the passed table version.
 func (f *FilePathGenerator) CheckOrWriteSchema(
 	ctx context.Context,
 	table VersionedTableName,
 	tableInfo *commonType.TableInfo,
-) error {
+) (bool, error) {
 	if _, ok := f.versionMap[table]; ok {
-		return nil
+		return false, nil
 	}
 
 	var def TableDefinition
@@ -189,25 +182,25 @@ func (f *FilePathGenerator) CheckOrWriteSchema(
 	if !def.IsTableSchema() {
 		// only check schema for table
 		log.Error("invalid table schema",
-			zap.String("namespace", f.changefeedID.Namespace()),
+			zap.String("keyspace", f.changefeedID.Keyspace()),
 			zap.Stringer("changefeedID", f.changefeedID.ID()),
 			zap.Any("versionedTableName", table),
 			zap.Any("tableInfo", tableInfo))
-		return errors.ErrInternalCheckFailed.GenWithStackByArgs("invalid table schema in FilePathGenerator")
+		return false, errors.ErrInternalCheckFailed.GenWithStackByArgs("invalid table schema in FilePathGenerator")
 	}
 
 	// Case 1: point check if the schema file exists.
 	tblSchemaFile, err := def.GenerateSchemaFilePath()
 	if err != nil {
-		return err
+		return false, err
 	}
 	exist, err := f.storage.FileExists(ctx, tblSchemaFile)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if exist {
 		f.versionMap[table] = table.TableInfoVersion
-		return nil
+		return false, nil
 	}
 
 	// walk the table meta path to find the last schema file
@@ -216,9 +209,10 @@ func (f *FilePathGenerator) CheckOrWriteSchema(
 	lastVersion := uint64(0)
 	subDir := fmt.Sprintf(tableSchemaPrefix, def.Schema, def.Table)
 	checksumSuffix := fmt.Sprintf("%010d.json", checksum)
+	hasNewerSchemaVersion := false
 	err = f.storage.WalkDir(ctx, &storage.WalkOption{
 		SubDir:    subDir, /* use subDir to prevent walk the whole storage */
-		ObjPrefix: subDir + "schema_",
+		ObjPrefix: "schema_",
 	}, func(path string, _ int64) error {
 		schemaFileCnt++
 		if !strings.HasSuffix(path, checksumSuffix) {
@@ -227,12 +221,15 @@ func (f *FilePathGenerator) CheckOrWriteSchema(
 		version, parsedChecksum := mustParseSchemaName(path)
 		if parsedChecksum != checksum {
 			log.Error("invalid schema file name",
-				zap.String("namespace", f.changefeedID.Namespace()),
+				zap.String("keyspace", f.changefeedID.Keyspace()),
 				zap.Stringer("changefeedID", f.changefeedID.ID()),
 				zap.String("path", path), zap.Any("checksum", checksum))
 			errMsg := fmt.Sprintf("invalid schema filename in storage sink, "+
 				"expected checksum: %d, actual checksum: %d", checksum, parsedChecksum)
 			return errors.ErrInternalCheckFailed.GenWithStackByArgs(errMsg)
+		}
+		if version > table.TableInfoVersion {
+			hasNewerSchemaVersion = true
 		}
 		if version > lastVersion {
 			lastVersion = version
@@ -240,13 +237,24 @@ func (f *FilePathGenerator) CheckOrWriteSchema(
 		return nil
 	})
 	if err != nil {
-		return err
+		return false, err
+	}
+	if hasNewerSchemaVersion {
+		return true, nil
 	}
 
 	// Case 2: the table meta path is not empty.
 	if schemaFileCnt != 0 && lastVersion != 0 {
+		log.Info("table schema file with exact version not found, using latest available",
+			zap.String("keyspace", f.changefeedID.Keyspace()),
+			zap.Stringer("changefeedID", f.changefeedID.ID()),
+			zap.Any("versionedTableName", table),
+			zap.Uint64("tableVersion", lastVersion),
+			zap.Uint32("checksum", checksum))
+		// record the last version of the table schema file.
+		// we don't need to write schema file to external storage again.
 		f.versionMap[table] = lastVersion
-		return nil
+		return false, nil
 	}
 
 	// Case 3: the table meta path is empty, which happens when:
@@ -254,17 +262,17 @@ func (f *FilePathGenerator) CheckOrWriteSchema(
 	//  b. the schema file is deleted by the consumer. We write schema file to external storage too.
 	if schemaFileCnt != 0 && lastVersion == 0 {
 		log.Warn("no table schema file found in an non-empty meta path",
-			zap.String("namespace", f.changefeedID.Namespace()),
+			zap.String("keyspace", f.changefeedID.Keyspace()),
 			zap.Stringer("changefeedID", f.changefeedID.ID()),
 			zap.Any("versionedTableName", table),
 			zap.Uint32("checksum", checksum))
 	}
 	encodedDetail, err := def.MarshalWithQuery()
 	if err != nil {
-		return err
+		return false, err
 	}
 	f.versionMap[table] = table.TableInfoVersion
-	return f.storage.WriteFile(ctx, tblSchemaFile, encodedDetail)
+	return false, f.storage.WriteFile(ctx, tblSchemaFile, encodedDetail)
 }
 
 // SetClock is used for unit test
@@ -440,7 +448,7 @@ func RemoveExpiredFiles(
 	_ commonType.ChangeFeedID,
 	storage storage.ExternalStorage,
 	cfg *Config,
-	checkpointTs model.Ts,
+	checkpointTs uint64,
 ) (uint64, error) {
 	if cfg.DateSeparator != config.DateSeparatorDay.String() {
 		return 0, nil
@@ -486,7 +494,7 @@ func RemoveEmptyDirs(
 			files, err := os.ReadDir(path)
 			if err == nil && len(files) == 0 {
 				log.Debug("Deleting empty directory",
-					zap.String("namespace", id.Namespace()),
+					zap.String("keyspace", id.Keyspace()),
 					zap.Stringer("changeFeedID", id.ID()),
 					zap.String("path", path))
 				os.Remove(path)

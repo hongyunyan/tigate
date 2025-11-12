@@ -20,12 +20,12 @@ import (
 	"github.com/benbjohnson/clock"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/pkg/common"
-	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/stretchr/testify/require"
 )
 
 func TestRetry(t *testing.T) {
-	backoff := NewBackoff(common.NewChangeFeedIDWithName("test"), time.Minute*30, 1)
+	backoff := NewBackoff(common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceNamme), time.Minute*30, 1)
 	require.True(t, backoff.ShouldRun())
 
 	// stop the backoff
@@ -41,7 +41,7 @@ func TestRetry(t *testing.T) {
 		},
 	})
 	require.True(t, changefeed)
-	require.Equal(t, model.StateWarning, state)
+	require.Equal(t, config.StateWarning, state)
 	require.NotNil(t, err)
 	require.False(t, backoff.ShouldRun())
 	require.True(t, backoff.retrying.Load())
@@ -52,7 +52,7 @@ func TestRetry(t *testing.T) {
 	})
 
 	require.True(t, changefeed)
-	require.Equal(t, model.StateNormal, state)
+	require.Equal(t, config.StateNormal, state)
 	require.Nil(t, err)
 	require.True(t, backoff.ShouldRun())
 	require.False(t, backoff.retrying.Load())
@@ -67,7 +67,7 @@ func TestRetry(t *testing.T) {
 	})
 
 	require.True(t, changefeed)
-	require.Equal(t, model.StateFailed, state)
+	require.Equal(t, config.StateFailed, state)
 	require.NotNil(t, err)
 	require.False(t, backoff.ShouldRun())
 	require.False(t, backoff.retrying.Load())
@@ -77,7 +77,8 @@ func TestRetry(t *testing.T) {
 		CheckpointTs: 3,
 	})
 	require.False(t, changefeed)
-	require.Equal(t, model.StateFailed, state)
+	require.Equal(t, config.StateFailed, state)
+	require.Nil(t, err)
 	require.Equal(t, uint64(2), backoff.checkpointTs)
 
 	backoff.resetErrRetry()
@@ -90,14 +91,14 @@ func TestRetry(t *testing.T) {
 	})
 
 	require.False(t, changefeed)
-	require.Equal(t, model.StateNormal, state)
+	require.Equal(t, config.StateNormal, state)
 	require.Nil(t, err)
 	require.True(t, backoff.ShouldRun())
 	require.False(t, backoff.retrying.Load())
 }
 
 func TestErrorReportedWhenRetrying(t *testing.T) {
-	backoff := NewBackoff(common.NewChangeFeedIDWithName("test"), time.Minute*30, 1)
+	backoff := NewBackoff(common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceNamme), time.Minute*30, 1)
 	require.True(t, backoff.ShouldRun())
 
 	changefeed, state, err := backoff.CheckStatus(&heartbeatpb.MaintainerStatus{
@@ -108,7 +109,7 @@ func TestErrorReportedWhenRetrying(t *testing.T) {
 	})
 	require.NotNil(t, err)
 	require.True(t, changefeed)
-	require.Equal(t, model.StateWarning, state)
+	require.Equal(t, config.StateWarning, state)
 	require.True(t, backoff.retrying.Load())
 	require.True(t, backoff.isRestarting.Load())
 	backoffInterval := backoff.backoffInterval
@@ -122,7 +123,7 @@ func TestErrorReportedWhenRetrying(t *testing.T) {
 	})
 	require.NotNil(t, err)
 	require.True(t, changefeed)
-	require.Equal(t, model.StateWarning, state)
+	require.Equal(t, config.StateWarning, state)
 	require.True(t, backoff.retrying.Load())
 	require.True(t, backoff.isRestarting.Load())
 	// the interval is increased, todo: maybe we should ignore the error when retrying
@@ -130,7 +131,7 @@ func TestErrorReportedWhenRetrying(t *testing.T) {
 }
 
 func TestFailedWhenRetry(t *testing.T) {
-	backoff := NewBackoff(common.NewChangeFeedIDWithName("test"), time.Second*30, 1)
+	backoff := NewBackoff(common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceNamme), time.Second*30, 1)
 	require.True(t, backoff.ShouldRun())
 
 	mc := clock.NewMock()
@@ -145,7 +146,7 @@ func TestFailedWhenRetry(t *testing.T) {
 	})
 	require.NotNil(t, err)
 	require.True(t, changefeed)
-	require.Equal(t, model.StateWarning, state)
+	require.Equal(t, config.StateWarning, state)
 	require.True(t, backoff.retrying.Load())
 	require.True(t, backoff.isRestarting.Load())
 
@@ -159,7 +160,7 @@ func TestFailedWhenRetry(t *testing.T) {
 	})
 	require.NotNil(t, err)
 	require.True(t, changefeed)
-	require.Equal(t, model.StateFailed, state)
+	require.Equal(t, config.StateFailed, state)
 	require.True(t, backoff.retrying.Load())
 	require.True(t, backoff.isRestarting.Load())
 	backoff.StartFinished()
@@ -167,7 +168,7 @@ func TestFailedWhenRetry(t *testing.T) {
 }
 
 func TestNormal(t *testing.T) {
-	backoff := NewBackoff(common.NewChangeFeedIDWithName("test"), time.Second*10, 1)
+	backoff := NewBackoff(common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceNamme), time.Second*10, 1)
 	require.True(t, backoff.ShouldRun())
 
 	changefeed, state, err := backoff.CheckStatus(&heartbeatpb.MaintainerStatus{
@@ -175,7 +176,7 @@ func TestNormal(t *testing.T) {
 	})
 	require.Nil(t, err)
 	require.False(t, changefeed)
-	require.Equal(t, model.StateNormal, state)
+	require.Equal(t, config.StateNormal, state)
 	require.False(t, backoff.retrying.Load())
 	require.False(t, backoff.isRestarting.Load())
 }

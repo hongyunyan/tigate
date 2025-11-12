@@ -16,24 +16,24 @@ package server
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
-	"strings"
+	"runtime/debug"
 	"time"
 
-	"github.com/dustin/go-humanize"
 	"github.com/pingcap/log"
+	appctx "github.com/pingcap/ticdc/pkg/common/context"
 	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/etcd"
+	"github.com/pingcap/ticdc/pkg/fsutil"
 	"github.com/pingcap/ticdc/pkg/node"
 	"github.com/pingcap/ticdc/pkg/pdutil"
-	"github.com/pingcap/tidb/pkg/util/gctuner"
-	"github.com/pingcap/tiflow/cdc/kv"
-	"github.com/pingcap/tiflow/cdc/model"
-	"github.com/pingcap/tiflow/pkg/fsutil"
+	"github.com/pingcap/tidb/pkg/util/memory"
 	"github.com/tikv/client-go/v2/tikv"
 	pd "github.com/tikv/pd/client"
+	pdopt "github.com/tikv/pd/client/opt"
 	"go.etcd.io/etcd/client/v3/concurrency"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -44,8 +44,6 @@ const (
 	defaultDataDir = "/tmp/cdc_data"
 	// dataDirThreshold is used to warn if the free space of the specified data-dir is lower than it, unit is GB
 	dataDirThreshold = 500
-	// maxGcTunerMemory is used to limit the max memory usage of cdc server. if the memory is larger than it, gc tuner will be disabled
-	maxGcTunerMemory = 512 * 1024 * 1024 * 1024
 )
 
 func (c *server) prepare(ctx context.Context) error {
@@ -56,11 +54,11 @@ func (c *server) prepare(ctx context.Context) error {
 	}
 	log.Info("create pd client", zap.Strings("endpoints", c.pdEndpoints))
 	c.pdClient, err = pd.NewClientWithContext(
-		ctx, c.pdEndpoints, conf.Security.PDSecurityOption(),
+		ctx, "cdc-server", c.pdEndpoints, conf.Security.PDSecurityOption(),
 		// the default `timeout` is 3s, maybe too small if the pd is busy,
 		// set to 10s to avoid frequent timeout.
-		pd.WithCustomTimeoutOption(10*time.Second),
-		pd.WithGRPCDialOptions(
+		pdopt.WithCustomTimeoutOption(10*time.Second),
+		pdopt.WithGRPCDialOptions(
 			grpcTLSOption,
 			grpc.WithBlock(),
 			grpc.WithConnectParams(grpc.ConnectParams{
@@ -73,7 +71,7 @@ func (c *server) prepare(ctx context.Context) error {
 				MinConnectTimeout: 3 * time.Second,
 			}),
 		),
-		pd.WithForwardingOption(config.EnablePDForwarding))
+		pdopt.WithForwardingOption(config.EnablePDForwarding))
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -82,6 +80,7 @@ func (c *server) prepare(ctx context.Context) error {
 		return errors.Trace(err)
 	}
 	c.pdAPIClient = pdAPIClient
+	appctx.SetService(appctx.PDAPIClient, pdAPIClient)
 	log.Info("create etcdCli", zap.Strings("endpoints", c.pdEndpoints))
 	// we do not pass a `context` to create an etcd client,
 	// to prevent it's cancelled when the server is closing.
@@ -120,12 +119,7 @@ func (c *server) prepare(ctx context.Context) error {
 			zap.Strings("upstreamEndpoints", c.pdEndpoints))
 	}
 
-	c.KVStorage, err = kv.CreateTiStore(strings.Join(allPDEndpoints, ","), conf.Security)
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	c.RegionCache = tikv.NewRegionCache(c.pdClient)
+	appctx.SetService(appctx.RegionCache, tikv.NewRegionCache(c.pdClient))
 
 	if err = c.initDir(); err != nil {
 		return errors.Trace(err)
@@ -147,24 +141,25 @@ func (c *server) prepare(ctx context.Context) error {
 	return nil
 }
 
+func calcMemoryLimit(percentage float64) int64 {
+	serverMemoryLimit, err := memory.MemTotal()
+	if err != nil {
+		log.Error("get system total memory fail", zap.Error(err))
+		return math.MaxInt64
+	}
+	memoryLimit := int64(float64(serverMemoryLimit) * percentage) // `server_memory_limit` * `gc_limit_percentage`
+	if memoryLimit == 0 {
+		memoryLimit = math.MaxInt64
+	}
+	return memoryLimit
+}
+
 func (c *server) setMemoryLimit() {
 	conf := config.GetGlobalServerConfig()
-	if conf.GcTunerMemoryThreshold > maxGcTunerMemory {
-		// If total memory is larger than 512GB, we will not set memory limit.
-		// Because the memory limit is not accurate, and it is not necessary to set memory limit.
-		log.Info("total memory is larger than 512GB, skip setting memory limit",
-			zap.Uint64("bytes", conf.GcTunerMemoryThreshold),
-			zap.String("memory", humanize.IBytes(conf.GcTunerMemoryThreshold)),
-		)
-		return
-	}
-	if conf.GcTunerMemoryThreshold > 0 {
-		gctuner.EnableGOGCTuner.Store(true)
-		gctuner.Tuning(conf.GcTunerMemoryThreshold)
-		log.Info("enable gctuner, set memory limit",
-			zap.Uint64("bytes", conf.GcTunerMemoryThreshold),
-			zap.String("memory", humanize.IBytes(conf.GcTunerMemoryThreshold)),
-		)
+	if conf.MemoryLimitPercentage > 0 {
+		memoryLimit := calcMemoryLimit(conf.MemoryLimitPercentage)
+		debug.SetMemoryLimit(memoryLimit)
+		log.Info("ticdc server set memory limit", zap.Int64("memoryLimit", memoryLimit))
 	}
 }
 
@@ -199,13 +194,14 @@ func (c *server) setUpDir() {
 
 // registerNodeToEtcd the server by put the server's information in etcd
 func (c *server) registerNodeToEtcd(ctx context.Context) error {
-	cInfo := &model.CaptureInfo{
-		ID:             model.CaptureID(c.info.ID),
+	cInfo := &config.CaptureInfo{
+		ID:             config.CaptureID(c.info.ID),
 		AdvertiseAddr:  c.info.AdvertiseAddr,
 		Version:        c.info.Version,
 		GitHash:        c.info.GitHash,
 		DeployPath:     c.info.DeployPath,
 		StartTimestamp: c.info.StartTimestamp,
+		IsNewArch:      true,
 	}
 	err := c.EtcdClient.PutCaptureInfo(ctx, cInfo, c.session.Lease())
 	if err != nil {

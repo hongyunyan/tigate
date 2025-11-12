@@ -23,13 +23,11 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
+	"github.com/pingcap/ticdc/pkg/config/outdated"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/integrity"
+	"github.com/pingcap/ticdc/pkg/redo"
 	"github.com/pingcap/ticdc/pkg/util"
-	"github.com/pingcap/tiflow/pkg/config"
-	"github.com/pingcap/tiflow/pkg/config/outdated"
-	"github.com/pingcap/tiflow/pkg/integrity"
-	"github.com/pingcap/tiflow/pkg/redo"
-	"github.com/pingcap/tiflow/pkg/sink"
 	"go.uber.org/zap"
 )
 
@@ -44,7 +42,7 @@ const (
 )
 
 var defaultReplicaConfig = &ReplicaConfig{
-	MemoryQuota:        config.DefaultChangefeedMemoryQuota,
+	MemoryQuota:        DefaultChangefeedMemoryQuota,
 	CaseSensitive:      false,
 	CheckGCSafePoint:   true,
 	EnableSyncPoint:    util.AddressOf(false),
@@ -69,7 +67,6 @@ var defaultReplicaConfig = &ReplicaConfig{
 		Terminator:                       util.AddressOf(CRLF),
 		DateSeparator:                    util.AddressOf(DateSeparatorDay.String()),
 		EnablePartitionSeparator:         util.AddressOf(true),
-		EnableKafkaSinkV2:                util.AddressOf(false),
 		OnlyOutputUpdatedColumns:         util.AddressOf(false),
 		DeleteOnlyOutputHandleKeyColumns: util.AddressOf(false),
 		ContentCompatible:                util.AddressOf(false),
@@ -98,10 +95,15 @@ var defaultReplicaConfig = &ReplicaConfig{
 		},
 	},
 	Scheduler: &ChangefeedSchedulerConfig{
-		EnableTableAcrossNodes: false,
-		RegionThreshold:        100_000,
-		WriteKeyThreshold:      0,
-		SplitNumberPerNode:     1,
+		EnableTableAcrossNodes:     false,
+		RegionThreshold:            100_000,
+		WriteKeyThreshold:          0,
+		SchedulingTaskCountPerNode: 20,  // TODO: choose a btter value
+		RegionCountPerSpan:         100, // TODO: choose a btter value
+		EnableSplittableCheck:      false,
+		BalanceScoreThreshold:      20,
+		MinTrafficPercentage:       0.8,
+		MaxTrafficPercentage:       1.25,
 	},
 	Integrity: &integrity.Config{
 		IntegrityCheckLevel:   integrity.CheckLevelNone,
@@ -261,6 +263,10 @@ func (c *ReplicaConfig) ValidateAndAdjust(sinkURI *url.URL) error { // check sin
 
 	// check sync point config
 	if util.GetOrZero(c.EnableSyncPoint) {
+		if !IsMySQLCompatibleScheme(GetScheme(sinkURI)) {
+			return cerror.ErrInvalidReplicaConfig.
+				FastGenByArgs("The SyncPoint must be disabled when the downstream is not tidb or mysql")
+		}
 		if c.SyncPointInterval != nil &&
 			*c.SyncPointInterval < minSyncPointInterval {
 			return cerror.ErrInvalidReplicaConfig.
@@ -284,7 +290,7 @@ func (c *ReplicaConfig) ValidateAndAdjust(sinkURI *url.URL) error { // check sin
 	if c.Scheduler == nil {
 		c.FixScheduler(false)
 	} else {
-		err := c.Scheduler.Validate()
+		err := c.Scheduler.ValidateAndAdjust(sinkURI)
 		if err != nil {
 			return err
 		}
@@ -292,7 +298,7 @@ func (c *ReplicaConfig) ValidateAndAdjust(sinkURI *url.URL) error { // check sin
 
 	if c.Integrity != nil {
 		switch strings.ToLower(sinkURI.Scheme) {
-		case sink.KafkaScheme, sink.KafkaSSLScheme:
+		case KafkaScheme, KafkaSSLScheme:
 		default:
 			if c.Integrity.Enabled() {
 				log.Warn("integrity checksum only support kafka sink now, disable integrity")
@@ -334,7 +340,7 @@ func (c *ReplicaConfig) FixScheduler(inheritV66 bool) {
 
 // FixMemoryQuota adjusts memory quota to default value
 func (c *ReplicaConfig) FixMemoryQuota() {
-	c.MemoryQuota = config.DefaultChangefeedMemoryQuota
+	c.MemoryQuota = DefaultChangefeedMemoryQuota
 }
 
 // isSinkCompatibleWithSpanReplication returns true if the sink uri is

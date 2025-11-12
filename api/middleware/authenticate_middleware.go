@@ -13,42 +13,22 @@
 package middleware
 
 import (
-	"context"
 	"fmt"
 	"net/http"
-	"strconv"
-	"strings"
-	"time"
+	"slices"
 
 	"github.com/gin-gonic/gin"
 	dmysql "github.com/go-sql-driver/mysql"
 	"github.com/pingcap/log"
+	"github.com/pingcap/ticdc/pkg/api"
 	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/etcd"
 	"github.com/pingcap/ticdc/pkg/server"
 	"github.com/pingcap/ticdc/pkg/sink/mysql"
-	"github.com/pingcap/ticdc/pkg/util"
-	"github.com/pingcap/tidb-dashboard/util/distro"
-	"github.com/pingcap/tidb/pkg/domain/infosync"
-	"github.com/pingcap/tiflow/cdc/model"
-	"github.com/pingcap/tiflow/pkg/errorutil"
-	clientv3 "go.etcd.io/etcd/client/v3"
+	"github.com/pingcap/ticdc/pkg/upstream"
 	"go.uber.org/zap"
 )
-
-const (
-	// Refer to https://github.com/pingcap/tidb/blob/release-7.5/pkg/domain/infosync/info.go#L78-L79.
-	topologyTiDB    = infosync.TopologyInformationPath
-	topologyTiDBTTL = infosync.TopologySessionTTL
-	// defaultTimeout is the default timeout for etcd and mysql operations.
-	defaultTimeout = time.Second * 2
-)
-
-type tidbInstance struct {
-	IP   string
-	Port uint
-}
 
 // AuthenticateMiddleware authenticates the request by query upstream TiDB.
 func AuthenticateMiddleware(server server.Server) gin.HandlerFunc {
@@ -56,7 +36,7 @@ func AuthenticateMiddleware(server server.Server) gin.HandlerFunc {
 		security := config.GetGlobalServerConfig().Security
 		if security != nil && security.ClientUserRequired {
 			if err := verify(ctx, server.GetEtcdClient().GetEtcdClient()); err != nil {
-				ctx.IndentedJSON(http.StatusUnauthorized, model.NewHTTPError(err))
+				ctx.IndentedJSON(http.StatusUnauthorized, api.NewHTTPError(err))
 				ctx.Abort()
 				return
 			}
@@ -73,14 +53,8 @@ func verify(ctx *gin.Context, etcdCli etcd.Client) error {
 		return errors.ErrCredentialNotFound.GenWithStackByArgs(errMsg)
 	}
 
-	allowed := false
 	serverCfg := config.GetGlobalServerConfig()
-	for _, user := range serverCfg.Security.ClientAllowedUser {
-		if user == username {
-			allowed = true
-			break
-		}
-	}
+	allowed := slices.Contains(serverCfg.Security.ClientAllowedUser, username)
 	if !allowed {
 		errMsg := "The user is not allowed."
 		if username == "" {
@@ -89,9 +63,11 @@ func verify(ctx *gin.Context, etcdCli etcd.Client) error {
 		return errors.ErrUnauthorized.GenWithStackByArgs(username, errMsg)
 	}
 
+	keyspaceMeta := GetKeyspaceFromContext(ctx)
+
 	// verifyTiDBUser verify whether the username and password are valid in TiDB. It does the validation via
 	// the successfully build of a connection with upstream TiDB with the username and password.
-	tidbs, err := fetchTiDBTopology(ctx, etcdCli)
+	tidbs, err := upstream.FetchTiDBTopology(ctx, etcdCli, keyspaceMeta.Id)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -107,83 +83,13 @@ func verify(ctx *gin.Context, etcdCli etcd.Client) error {
 		if err == nil {
 			return nil
 		}
-		if errorutil.IsAccessDeniedError(err) {
+		if errors.IsAccessDeniedError(err) {
 			// For access denied error, we can return immediately.
 			// For other errors, we need to continue to verify the next tidb instance.
 			return errors.ErrUnauthorized.GenWithStackByArgs(username, err.Error())
 		}
 	}
 	return errors.ErrUnauthorized.GenWithStackByArgs(username, err.Error())
-}
-
-// fetchTiDBTopology parses the TiDB topology from etcd.
-func fetchTiDBTopology(ctx context.Context, etcdClient etcd.Client) ([]tidbInstance, error) {
-	ctx2, cancel := context.WithTimeout(ctx, defaultTimeout)
-	defer cancel()
-
-	resp, err := etcdClient.Get(ctx2, topologyTiDB, clientv3.WithPrefix())
-	if err != nil {
-		return nil, errors.ErrPDEtcdAPIError.Wrap(err)
-	}
-
-	nodesAlive := make(map[string]struct{}, len(resp.Kvs))
-	nodesInfo := make(map[string]*tidbInstance, len(resp.Kvs))
-
-	for _, kv := range resp.Kvs {
-		key := string(kv.Key)
-		if !strings.HasPrefix(key, topologyTiDB) {
-			continue
-		}
-		// remainingKey looks like `ip:port/info` or `ip:port/ttl`.
-		remainingKey := strings.TrimPrefix(key[len(topologyTiDB):], "/")
-		keyParts := strings.Split(remainingKey, "/")
-		if len(keyParts) != 2 {
-			log.Warn("Ignored invalid topology key", zap.String("component", distro.R().TiDB), zap.String("key", key))
-			continue
-		}
-
-		switch keyParts[1] {
-		case "info":
-			address := keyParts[0]
-			hostname, port, err := util.ParseHostAndPortFromAddress(address)
-			if err != nil {
-				log.Warn("Ignored invalid tidb topology info entry",
-					zap.String("key", key),
-					zap.String("value", string(kv.Value)),
-					zap.Error(err))
-				continue
-			}
-			nodesInfo[keyParts[0]] = &tidbInstance{
-				IP:   hostname,
-				Port: port,
-			}
-		case "ttl":
-			unixTimestampNano, err := strconv.ParseUint(string(kv.Value), 10, 64)
-			if err != nil {
-				log.Warn("Ignored invalid tidb topology TTL entry",
-					zap.String("key", key),
-					zap.String("value", string(kv.Value)),
-					zap.Error(errors.ErrUnmarshalFailed.Wrap(err)))
-				continue
-			}
-			t := time.Unix(0, int64(unixTimestampNano))
-			if time.Since(t) > topologyTiDBTTL*time.Second {
-				log.Warn("Ignored invalid tidb topology TTL entry",
-					zap.String("key", key),
-					zap.String("value", string(kv.Value)))
-				continue
-			}
-			nodesAlive[keyParts[0]] = struct{}{}
-		}
-	}
-
-	nodes := make([]tidbInstance, 0)
-	for addr, info := range nodesInfo {
-		if _, ok := nodesAlive[addr]; ok {
-			nodes = append(nodes, *info)
-		}
-	}
-	return nodes, nil
 }
 
 func doVerify(dsnStr string) error {
@@ -214,13 +120,17 @@ func doVerify(dsnStr string) error {
 		}
 	}()
 
-	var name, value string
-	err = rows.Scan(&name, &value)
-	if err != nil {
-		log.Warn("failed to get ssl cipher", zap.Error(err),
-			zap.String("username", dsn.User))
+	if rows.Next() {
+		var name, value string
+		err = rows.Scan(&name, &value)
+		if err != nil {
+			log.Warn("failed to get ssl cipher", zap.Error(err),
+				zap.String("username", dsn.User))
+		}
+		log.Info("verify tidb user successfully", zap.String("username", dsn.User),
+			zap.String("sslCipherName", name), zap.String("sslCipherValue", value))
+	} else {
+		log.Warn("no ssl cipher found", zap.String("username", dsn.User))
 	}
-	log.Info("verify tidb user successfully", zap.String("username", dsn.User),
-		zap.String("sslCipherName", name), zap.String("sslCipherValue", value))
 	return nil
 }

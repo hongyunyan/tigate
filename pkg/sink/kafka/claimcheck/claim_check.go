@@ -25,8 +25,8 @@ import (
 	commonType "github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/pingcap/ticdc/pkg/sink/codec/common"
+	"github.com/pingcap/ticdc/pkg/util"
 	"github.com/pingcap/tidb/br/pkg/storage"
-	"github.com/pingcap/tiflow/pkg/util"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
@@ -54,15 +54,15 @@ func New(ctx context.Context, config *config.LargeMessageHandleConfig, changefee
 	}
 
 	log.Info("claim check enabled, start create the external storage",
-		zap.String("namespace", changefeedID.Namespace()),
+		zap.String("keyspace", changefeedID.Keyspace()),
 		zap.String("changefeed", changefeedID.Name()),
 		zap.String("storageURI", util.MaskSensitiveDataInURI(config.ClaimCheckStorageURI)))
 
 	start := time.Now()
-	externalStorage, err := util.GetExternalStorageWithTimeout(ctx, config.ClaimCheckStorageURI, defaultTimeout)
+	externalStorage, err := util.GetExternalStorageWithDefaultTimeout(ctx, config.ClaimCheckStorageURI)
 	if err != nil {
 		log.Error("create external storage failed",
-			zap.String("namespace", changefeedID.Namespace()),
+			zap.String("keyspace", changefeedID.Keyspace()),
 			zap.String("changefeed", changefeedID.Name()),
 			zap.String("storageURI", util.MaskSensitiveDataInURI(config.ClaimCheckStorageURI)),
 			zap.Duration("duration", time.Since(start)),
@@ -71,7 +71,7 @@ func New(ctx context.Context, config *config.LargeMessageHandleConfig, changefee
 	}
 
 	log.Info("claim-check create the external storage success",
-		zap.String("namespace", changefeedID.Namespace()),
+		zap.String("keyspace", changefeedID.Keyspace()),
 		zap.String("changefeed", changefeedID.Name()),
 		zap.String("storageURI", util.MaskSensitiveDataInURI(config.ClaimCheckStorageURI)),
 		zap.Duration("duration", time.Since(start)))
@@ -80,8 +80,8 @@ func New(ctx context.Context, config *config.LargeMessageHandleConfig, changefee
 		changefeedID:              changefeedID,
 		storage:                   externalStorage,
 		rawValue:                  config.ClaimCheckRawValue,
-		metricSendMessageDuration: claimCheckSendMessageDuration.WithLabelValues(changefeedID.Namespace(), changefeedID.Name()),
-		metricSendMessageCount:    claimCheckSendMessageCount.WithLabelValues(changefeedID.Namespace(), changefeedID.Name()),
+		metricSendMessageDuration: claimCheckSendMessageDuration.WithLabelValues(changefeedID.Keyspace(), changefeedID.Name()),
+		metricSendMessageCount:    claimCheckSendMessageCount.WithLabelValues(changefeedID.Keyspace(), changefeedID.Name()),
 	}, nil
 }
 
@@ -114,8 +114,8 @@ func (c *ClaimCheck) FileNameWithPrefix(fileName string) string {
 
 // CleanMetrics the claim check by clean up the metrics.
 func (c *ClaimCheck) CleanMetrics() {
-	claimCheckSendMessageDuration.DeleteLabelValues(c.changefeedID.Namespace(), c.changefeedID.Name())
-	claimCheckSendMessageCount.DeleteLabelValues(c.changefeedID.Namespace(), c.changefeedID.Name())
+	claimCheckSendMessageDuration.DeleteLabelValues(c.changefeedID.Keyspace(), c.changefeedID.Name())
+	claimCheckSendMessageCount.DeleteLabelValues(c.changefeedID.Keyspace(), c.changefeedID.Name())
 }
 
 // NewFileName return the file name for the message which is delivered to the external storage system.

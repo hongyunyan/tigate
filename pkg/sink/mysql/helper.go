@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/coreos/go-semver/semver"
@@ -33,21 +34,26 @@ import (
 	timodel "github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/charset"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
-	dmutils "github.com/pingcap/tiflow/dm/pkg/conn"
+	tmysql "github.com/pingcap/tidb/pkg/parser/mysql"
 	"go.uber.org/zap"
 )
 
-// CheckIfBDRModeIsSupported checks if the downstream supports BDR mode.
+const checkRunningAddIndexSQL = `
+SELECT JOB_ID, JOB_TYPE, SCHEMA_STATE, STATE
+FROM information_schema.ddl_jobs
+WHERE TABLE_ID = "%d"
+    AND JOB_TYPE LIKE "add index%%"
+    AND (STATE = "running" OR STATE = "queueing");
+`
+
+const checkRunningSQL = `SELECT JOB_ID, JOB_TYPE, SCHEMA_STATE, SCHEMA_ID, TABLE_ID, STATE, QUERY FROM information_schema.ddl_jobs 
+	WHERE CREATE_TIME >= "%s" AND QUERY = "%s";`
+
+// CheckIfBDRModeIsSupported checks if the downstream supports set tidb_cdc_write_source variable
 func CheckIfBDRModeIsSupported(ctx context.Context, db *sql.DB) (bool, error) {
-	isTiDB := CheckIsTiDB(ctx, db)
-	if !isTiDB {
-		return false, nil
-	}
-	testSourceID := 1
-	// downstream is TiDB, set system variables.
 	// We should always try to set this variable, and ignore the error if
 	// downstream does not support this variable, it is by design.
-	query := fmt.Sprintf("SET SESSION %s = %d", "tidb_cdc_write_source", testSourceID)
+	query := "SET SESSION tidb_cdc_write_source = 1"
 	_, err := db.ExecContext(ctx, query)
 	if err != nil {
 		if mysqlErr, ok := errors.Cause(err).(*dmysql.MySQLError); ok &&
@@ -66,7 +72,6 @@ func CheckIsTiDB(ctx context.Context, db *sql.DB) bool {
 	row := db.QueryRowContext(ctx, "select tidb_version()")
 	err := row.Scan(&tidbVer)
 	if err != nil {
-		log.Warn("check tidb version error, the downstream db is not tidb?", zap.Error(err))
 		// In earlier versions, this function returned an `error` along with a boolean value,
 		// which allowed callers to differentiate between network-related issues and
 		// the absence of TiDB. However, since the specific error content wasn't critical to
@@ -83,11 +88,12 @@ func CheckIsTiDB(ctx context.Context, db *sql.DB) bool {
 		// query to retrieve the TiDB version fails.
 		return false
 	}
+	log.Info("mysql sink target is TiDB", zap.String("version", tidbVer))
 	return true
 }
 
 // GenBasicDSN generates a basic DSN from the given config.
-func GenBasicDSN(cfg *MysqlConfig) (*dmysql.Config, error) {
+func GenBasicDSN(cfg *Config) (*dmysql.Config, error) {
 	// dsn format of the driver:
 	// [username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]
 	username := cfg.sinkURI.User.Username()
@@ -128,7 +134,7 @@ func GenBasicDSN(cfg *MysqlConfig) (*dmysql.Config, error) {
 	return dsn, nil
 }
 
-func setDryRunConfig(cfg *MysqlConfig) {
+func setDryRunConfig(cfg *Config) {
 	dryRun := cfg.sinkURI.Query().Get("dry-run")
 	if dryRun == "true" {
 		log.Info("dry-run mode is enabled, will not write data to downstream")
@@ -198,7 +204,7 @@ func checkTiDBVariable(db *sql.DB, variableName, defaultValue string) (string, e
 
 func generateDSNByConfig(
 	dsnCfg *dmysql.Config,
-	cfg *MysqlConfig,
+	cfg *Config,
 	testDB *sql.DB,
 ) (string, error) {
 	if dsnCfg.Params == nil {
@@ -296,7 +302,7 @@ func checkCharsetSupport(db *sql.DB, charsetName string) (bool, error) {
 }
 
 // return dsn
-func GenerateDSN(cfg *MysqlConfig) (string, error) {
+func GenerateDSN(ctx context.Context, cfg *Config) (string, error) {
 	dsn, err := GenBasicDSN(cfg)
 	if err != nil {
 		return "", err
@@ -311,12 +317,26 @@ func GenerateDSN(cfg *MysqlConfig) (string, error) {
 
 	// we use default sql mode for downstream because all dmls generated and ddls in ticdc
 	// are based on default sql mode.
-	dsn.Params["sql_mode"], err = dmutils.AdjustSQLModeCompatible(mysql.DefaultSQLMode)
+	dsn.Params["sql_mode"], err = AdjustSQLModeCompatible(mysql.DefaultSQLMode)
 	if err != nil {
 		return "", err
 	}
 	// NOTE: quote the string is necessary to avoid ambiguities.
 	dsn.Params["sql_mode"] = strconv.Quote(dsn.Params["sql_mode"])
+
+	cfg.IsTiDB = CheckIsTiDB(ctx, testDB)
+
+	if cfg.IsTiDB {
+		// check if tidb_cdc_write_source is supported
+		// only tidb downstream and version is greater than or equal to v6.5.0 supports this variable
+		bdrModeSupported, err := CheckIfBDRModeIsSupported(ctx, testDB)
+		if err != nil {
+			return "", err
+		}
+		if bdrModeSupported {
+			dsn.Params["tidb_cdc_write_source"] = "1"
+		}
+	}
 
 	dsnStr, err := generateDSNByConfig(dsn, cfg, testDB)
 	if err != nil {
@@ -365,28 +385,19 @@ func needSwitchDB(event *commonEvent.DDLEvent) bool {
 	return true
 }
 
-func SetWriteSource(cfg *MysqlConfig, txn *sql.Tx) error {
-	// we only set write source when donwstream is TiDB and write source is existed.
-	if !cfg.IsWriteSourceExisted {
-		return nil
+func needWaitAsyncExecDone(t timodel.ActionType) bool {
+	switch t {
+	case timodel.ActionCreateTable, timodel.ActionCreateTables:
+		return false
+	case timodel.ActionCreateSchema:
+		return false
+	default:
+		return true
 	}
-	// downstream is TiDB, set system variables.
-	// We should always try to set this variable, and ignore the error if
-	// downstream does not support this variable, it is by design.
-	query := fmt.Sprintf("SET SESSION %s = %d", "tidb_cdc_write_source", cfg.SourceID)
-	_, err := txn.ExecContext(context.Background(), query)
-	if err != nil {
-		if mysqlErr, ok := errors.Cause(err).(*dmysql.MySQLError); ok &&
-			mysqlErr.Number == mysql.ErrUnknownSystemVariable {
-			return nil
-		}
-		return err
-	}
-	return nil
 }
 
 // ShouldFormatVectorType return true if vector type should be converted to longtext.
-func ShouldFormatVectorType(db *sql.DB, cfg *MysqlConfig) bool {
+func ShouldFormatVectorType(db *sql.DB, cfg *Config) bool {
 	if !cfg.HasVectorType {
 		log.Warn("please set `has-vector-type` to be true if a column is vector type when the downstream is not TiDB or TiDB version less than specify version",
 			zap.Any("hasVectorType", cfg.HasVectorType), zap.Any("supportVectorVersion", defaultSupportVectorVersion))
@@ -432,4 +443,127 @@ func getSQLErrCode(err error) (errors.ErrCode, bool) {
 	}
 
 	return errors.ErrCode(mysqlErr.Number), true
+}
+
+// queryMaxPreparedStmtCount gets the value of max_prepared_stmt_count
+func queryMaxPreparedStmtCount(ctx context.Context, db *sql.DB) (int, error) {
+	row := db.QueryRowContext(ctx, "select @@global.max_prepared_stmt_count;")
+	var maxPreparedStmtCount sql.NullInt32
+	err := row.Scan(&maxPreparedStmtCount)
+	if err != nil {
+		err = cerror.WrapError(cerror.ErrMySQLQueryError, err)
+	}
+	return int(maxPreparedStmtCount.Int32), err
+}
+
+// queryMaxAllowedPacket gets the value of max_allowed_packet
+func queryMaxAllowedPacket(ctx context.Context, db *sql.DB) (int64, error) {
+	row := db.QueryRowContext(ctx, "select @@global.max_allowed_packet;")
+	var maxAllowedPacket sql.NullInt64
+	if err := row.Scan(&maxAllowedPacket); err != nil {
+		return 0, cerror.WrapError(cerror.ErrMySQLQueryError, err)
+	}
+	return maxAllowedPacket.Int64, nil
+}
+
+func getDDLCreateTime(ctx context.Context, db *sql.DB) string {
+	ddlCreateTime := "" // default when scan failed
+	row, err := db.QueryContext(ctx, "BEGIN; SET @ticdc_ts := TIDB_PARSE_TSO(@@tidb_current_ts); ROLLBACK; SELECT @ticdc_ts; SET @ticdc_ts=NULL;")
+	if err != nil {
+		return ddlCreateTime
+	}
+	for row.Next() {
+		err = row.Scan(&ddlCreateTime)
+		if err != nil {
+			log.Warn("getting ddlCreateTime failed", zap.Error(err))
+		}
+	}
+	//nolint:sqlclosecheck
+	_ = row.Close()
+	_ = row.Err()
+	return ddlCreateTime
+}
+
+// getDDLStateFromTiDB retrieves the ddl job status of the ddl query from downstream tidb based on the ddl query and the approximate ddl create time.
+func getDDLStateFromTiDB(ctx context.Context, db *sql.DB, ddl string, createTime string) (timodel.JobState, error) {
+	// ddlCreateTime and createTime are both based on UTC timezone of downstream
+	showJobs := fmt.Sprintf(checkRunningSQL, createTime, ddl)
+	//nolint:rowserrcheck
+	jobsRows, err := db.QueryContext(ctx, showJobs)
+	if err != nil {
+		return timodel.JobStateNone, err
+	}
+
+	var jobsResults [][]string
+	jobsResults, err = export.GetSpecifiedColumnValuesAndClose(jobsRows, "QUERY", "STATE", "JOB_ID", "JOB_TYPE", "SCHEMA_STATE")
+	if err != nil {
+		return timodel.JobStateNone, err
+	}
+	if len(jobsResults) > 0 {
+		result := jobsResults[0]
+		state, jobID, jobType, schemaState := result[1], result[2], result[3], result[4]
+		log.Debug("Find ddl state in downstream",
+			zap.String("jobID", jobID),
+			zap.String("jobType", jobType),
+			zap.String("schemaState", schemaState),
+			zap.String("ddl", ddl),
+			zap.String("state", state),
+			zap.Any("jobsResults", jobsResults),
+		)
+		return timodel.StrToJobState(result[1]), nil
+	}
+	return timodel.JobStateNone, nil
+}
+
+// AdjustSQLModeCompatible adjust downstream sql mode to compatible.
+// TODO: When upstream's datatime is 2020-00-00, 2020-00-01, 2020-06-00
+// and so on, downstream will be 2019-11-30, 2019-12-01, 2020-05-31,
+// as if set the 'NO_ZERO_IN_DATE', 'NO_ZERO_DATE'.
+// This is because the implementation of go-mysql, that you can see
+// https://github.com/go-mysql-org/go-mysql/blob/master/replication/row_event.go#L1063-L1087
+func AdjustSQLModeCompatible(sqlModes string) (string, error) {
+	needDisable := []string{
+		"NO_ZERO_IN_DATE",
+		"NO_ZERO_DATE",
+		"ERROR_FOR_DIVISION_BY_ZERO",
+		"NO_AUTO_CREATE_USER",
+		"STRICT_TRANS_TABLES",
+		"STRICT_ALL_TABLES",
+	}
+	needEnable := []string{
+		"IGNORE_SPACE",
+		"NO_AUTO_VALUE_ON_ZERO",
+		"ALLOW_INVALID_DATES",
+	}
+	disable := strings.Join(needDisable, ",")
+	enable := strings.Join(needEnable, ",")
+
+	mode, err := tmysql.GetSQLMode(sqlModes)
+	if err != nil {
+		return sqlModes, err
+	}
+	disableMode, err2 := tmysql.GetSQLMode(disable)
+	if err2 != nil {
+		return sqlModes, err2
+	}
+	enableMode, err3 := tmysql.GetSQLMode(enable)
+	if err3 != nil {
+		return sqlModes, err3
+	}
+	// About this bit manipulation, details can be seen
+	// https://github.com/pingcap/dm/pull/1869#discussion_r669771966
+	mode = (mode &^ disableMode) | enableMode
+
+	return GetSQLModeStrBySQLMode(mode), nil
+}
+
+// GetSQLModeStrBySQLMode get string represent of sql_mode by sql_mode.
+func GetSQLModeStrBySQLMode(sqlMode tmysql.SQLMode) string {
+	var sqlModeStr []string
+	for str, SQLMode := range tmysql.Str2SQLMode {
+		if sqlMode&SQLMode != 0 {
+			sqlModeStr = append(sqlModeStr, str)
+		}
+	}
+	return strings.Join(sqlModeStr, ",")
 }

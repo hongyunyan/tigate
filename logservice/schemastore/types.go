@@ -63,6 +63,7 @@ type PersistedDDLEvent struct {
 	Query         string `msg:"query"`
 	SchemaVersion int64  `msg:"schema_version"`
 	FinishedTs    uint64 `msg:"finished_ts"`
+	StartTs       uint64 `msg:"start_ts"`
 
 	DBInfo *model.DBInfo `msg:"-"`
 	// it is from upstream job.TableInfo
@@ -110,6 +111,18 @@ type BasicTableInfo struct {
 }
 
 type BasicPartitionInfo map[int64]interface{}
+
+func (info BasicPartitionInfo) AddPartitionIDs(ids ...int64) {
+	for _, id := range ids {
+		info[id] = nil
+	}
+}
+
+func (info BasicPartitionInfo) RemovePartitionIDs(ids ...int64) {
+	for _, id := range ids {
+		delete(info, id)
+	}
+}
 
 //msgp:ignore DDLJobWithCommitTs
 type DDLJobWithCommitTs struct {
