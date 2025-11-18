@@ -655,6 +655,7 @@ func (s *remoteMessageTarget) handleIncomingMessage(ctx context.Context, stream 
 			targetMsg.Message = append(targetMsg.Message, msg)
 		}
 
+		targetMsg.markEnqueued()
 		ch <- targetMsg
 	}
 }

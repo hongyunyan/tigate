@@ -82,9 +82,11 @@ func (s *localMessageTarget) sendMsgToChan(ch chan *TargetMessage, msg ...*Targe
 		m.To = s.localId
 		m.From = s.localId
 		m.Sequence = s.sequence.Add(1)
+		m.markEnqueued()
 		select {
 		case ch <- m:
 		default:
+			m.clearEnqueuedMark()
 			remains := len(msg) - i
 			s.dropMessageCounter.Add(float64(remains))
 			return AppError{Type: ErrorTypeMessageCongested, Reason: "Send message is congested"}

@@ -72,6 +72,15 @@ var (
 			Name:      "slow_handle_counter",
 			Help:      "The counter of messages that took more than 100ms to handle",
 		}, []string{"type"}) // type: message type
+
+	MessagingHandleTotalDurationHistogram = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "ticdc",
+			Subsystem: "messaging",
+			Name:      "handle_total_duration_seconds",
+			Help:      "Bucketed histogram of the time from enqueueing a message until its handler finishes",
+			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 20),
+		}, []string{"type"})
 )
 
 // InitMetrics registers all metrics used in owner
@@ -83,4 +92,5 @@ func initMessagingMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(MessagingStreamGauge)
 	registry.Register(MessagingReceiveChannelLength)
 	registry.MustRegister(MessagingSlowHandleCounter)
+	registry.MustRegister(MessagingHandleTotalDurationHistogram)
 }

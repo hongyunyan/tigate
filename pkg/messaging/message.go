@@ -383,6 +383,8 @@ type TargetMessage struct {
 	Message  []IOTypeT
 	CreateAt int64
 
+	enqueuedAt time.Time
+
 	// Group is used to group messages into a same group.
 	// Different groups can be processed in different goroutines.
 	Group uint64
@@ -492,4 +494,19 @@ func (m *TargetMessage) String() string {
 
 func (m *TargetMessage) GetGroup() uint64 {
 	return m.Group
+}
+
+func (m *TargetMessage) markEnqueued() {
+	m.enqueuedAt = time.Now()
+}
+
+func (m *TargetMessage) clearEnqueuedMark() {
+	m.enqueuedAt = time.Time{}
+}
+
+func (m *TargetMessage) elapsedSinceEnqueue(now time.Time) (time.Duration, bool) {
+	if m == nil || m.enqueuedAt.IsZero() {
+		return 0, false
+	}
+	return now.Sub(m.enqueuedAt), true
 }
