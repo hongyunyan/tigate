@@ -79,7 +79,7 @@ var (
 			Subsystem: "messaging",
 			Name:      "handle_total_duration_seconds",
 			Help:      "Bucketed histogram of the time from enqueueing a message until its handler finishes",
-			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 20),
+			Buckets:   prometheus.ExponentialBuckets(1e-6, 2, 24),
 		}, []string{"type"})
 
 	MessagingHandleDurationHistogram = prometheus.NewHistogramVec(
@@ -88,7 +88,7 @@ var (
 			Subsystem: "messaging",
 			Name:      "handle_duration_seconds",
 			Help:      "Bucketed histogram of the time spent in message handler only",
-			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 20),
+			Buckets:   prometheus.ExponentialBuckets(1e-6, 2, 24),
 		}, []string{"type"})
 )
 

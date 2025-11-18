@@ -72,7 +72,7 @@ func (r *router) runDispatch(ctx context.Context, out <-chan *TargetMessage) {
 				msg.clearEnqueuedMark()
 			}
 			metrics.MessagingHandleDurationHistogram.WithLabelValues(msg.Type.String()).Observe(handleDuration.Seconds())
-			if handleDuration > 100*time.Millisecond {
+			if handleDuration > 10*time.Millisecond {
 				// Rate limit logging: only log once every 10 seconds
 				if now.Sub(lastSlowLogTime) >= 10*time.Second {
 					lastSlowLogTime = now
