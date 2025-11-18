@@ -66,18 +66,20 @@ func (r *router) runDispatch(ctx context.Context, out <-chan *TargetMessage) {
 			start := time.Now()
 			err := handler(ctx, msg)
 			now := time.Now()
+			handleDuration := now.Sub(start)
 			if elapsed, ok := msg.elapsedSinceEnqueue(now); ok {
 				metrics.MessagingHandleTotalDurationHistogram.WithLabelValues(msg.Type.String()).Observe(elapsed.Seconds())
 				msg.clearEnqueuedMark()
 			}
-			if now.Sub(start) > 100*time.Millisecond {
+			metrics.MessagingHandleDurationHistogram.WithLabelValues(msg.Type.String()).Observe(handleDuration.Seconds())
+			if handleDuration > 100*time.Millisecond {
 				// Rate limit logging: only log once every 10 seconds
 				if now.Sub(lastSlowLogTime) >= 10*time.Second {
 					lastSlowLogTime = now
 					log.Warn("slow message handling detected",
 						zap.String("topic", msg.Topic),
 						zap.String("type", msg.Type.String()),
-						zap.Duration("duration", now.Sub(start)),
+						zap.Duration("duration", handleDuration),
 						zap.String("from", msg.From.String()))
 				}
 
