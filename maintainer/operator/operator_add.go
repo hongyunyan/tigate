@@ -46,6 +46,7 @@ type AddDispatcherOperator struct {
 	spanController *span.Controller
 
 	sendThrottler sendThrottler
+	count         int
 }
 
 func NewAddDispatcherOperator(
@@ -58,6 +59,7 @@ func NewAddDispatcherOperator(
 		dest:           dest,
 		spanController: spanController,
 		sendThrottler:  newSendThrottler(),
+		count:          0,
 	}
 }
 
@@ -68,10 +70,13 @@ func (m *AddDispatcherOperator) Check(from node.ID, status *heartbeatpb.TableSpa
 
 	switch status.ComponentStatus {
 	case heartbeatpb.ComponentState_Working:
-		log.Info("dispatcher report working status",
-			zap.String("changefeed", m.replicaSet.ChangefeedID.String()),
-			zap.String("replicaSet", m.replicaSet.ID.String()))
-		m.finished.Store(true)
+		m.count += 1
+		if m.count > 10 {
+			log.Info("dispatcher report working status",
+				zap.String("changefeed", m.replicaSet.ChangefeedID.String()),
+				zap.String("replicaSet", m.replicaSet.ID.String()))
+			m.finished.Store(true)
+		}
 	case heartbeatpb.ComponentState_Removed:
 		log.Info("dispatcher report removed status",
 			zap.String("changefeed", m.replicaSet.ChangefeedID.String()),
