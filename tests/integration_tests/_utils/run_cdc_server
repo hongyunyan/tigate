@@ -7,6 +7,12 @@
 # --logsuffix: log suffix
 # --addr: address
 # --pd: pd address
+# --redact-info-log: log redaction mode (false|true|marker)
+#                    Generates a config file with [security] redact-info-log setting
+#                    Values: false (OFF, no redaction), true (ON, full redaction),
+#                            marker (MARKER, wraps sensitive data with ‹› markers)
+#                    Security note: Once enabled via API at runtime, redaction
+#                    cannot be disabled to prevent accidental data exposure
 
 set -e
 
@@ -22,6 +28,9 @@ addr_url="127.0.0.1:8300"
 pd_addr=
 pwd=$pwd
 log_level=debug
+# Security feature: Log redaction mode (off|on|marker)
+# Can be set at startup via config file. Once enabled via API at runtime, it cannot be disabled.
+redact_log_mode=
 restart=
 failpoint=$GO_FAILPOINTS
 config_path=
@@ -68,6 +77,10 @@ while [[ ${1} ]]; do
 		log_level=${2}
 		shift
 		;;
+	--redact-info-log)
+		redact_log_mode="${2}"
+		shift
+		;;
 	--restart)
 		restart=${2}
 		shift
@@ -112,9 +125,46 @@ if [ -z "$data_dir" ]; then
 	data_dir=${workdir}/cdc_data${logsuffix}
 fi
 
+# If redact_log_mode is set, generate a config file with security settings
+if [ -n "$redact_log_mode" ]; then
+	redact_config_file="${workdir}/cdc_redact${logsuffix}.toml"
+	# Convert to recommended TOML format:
+	# - "off" -> false (boolean)
+	# - "on" -> true (boolean)
+	# - "marker" -> "marker" (string, the only string-only option)
+	case "$redact_log_mode" in
+	off | OFF | false | 0)
+		redact_toml_value="false"
+		;;
+	on | ON | true | 1)
+		redact_toml_value="true"
+		;;
+	marker | MARKER)
+		redact_toml_value="\"marker\""
+		;;
+	*)
+		# Pass through as quoted string for other values (may be invalid, will be caught at runtime)
+		redact_toml_value="\"$redact_log_mode\""
+		;;
+	esac
+	cat >"$redact_config_file" <<EOF
+[security]
+redact-info-log = $redact_toml_value
+EOF
+	# If config_path is already set, we need to merge, otherwise just use this one
+	if [ -z "$config_path" ]; then
+		config_path="--config $redact_config_file"
+	else
+		# Append security config to existing config
+		existing_config=$(echo "$config_path" | sed 's/--config //')
+		cat "$existing_config" >>"$redact_config_file"
+		config_path="--config $redact_config_file"
+	fi
+fi
+
 echo "[$(date)] <<<<<< START cdc server in $TEST_NAME case >>>>>>"
 cd $workdir
-pid=$(ps -C run_cdc_server -o pid= | tr -d '[:space:]')
+pid=$$
 # Uncomment to turn on grpc versbose log.
 # GRPC_GO_LOG_VERBOSITY_LEVEL=99 GRPC_GO_LOG_SEVERITY_LEVEL=debug \
 
@@ -131,7 +181,7 @@ if [[ "$restart" == "true" ]]; then
 			$tls \
 			$certcn \
 			$addr \
-			$pd_addr &>>$workdir/stdout$logsuffix.log
+			$pd_addr >>$workdir/stdout$logsuffix.log 2>&1
 		if [ $? -eq 143 ]; then
 			break
 		fi
@@ -147,7 +197,7 @@ else
 		$tls \
 		$certcn \
 		$addr \
-		$pd_addr &>>$workdir/stdout$logsuffix.log &
+		$pd_addr >>$workdir/stdout$logsuffix.log 2>&1 &
 fi
 
 # Make sure cdc is ready to serve
@@ -156,15 +206,15 @@ fi
 # it is acceptable and will retry, so you cannot quit.
 set +e
 
-get_info_fail_msg="failed to get info:"
-etcd_info_msg="etcd info"
-# If tls is set, then we need to pass the certificate and use https.
-# Note that the certificate name may be specified.
-if [ -z "$tls_dir" ]; then
-	curl_status_cmd="curl -vsL --max-time 20 http://$addr_url/debug/info --user ticdc:ticdc_secret -vsL"
-else
-	curl_status_cmd="curl --cacert $tls_dir/ca.pem --cert $tls_dir/$certcn_name.pem --key $tls_dir/$certcn_name-key.pem --user ticdc:ticdc_secret -vsL --max-time 20 https://$addr_url/debug/info"
-fi
+# get_info_fail_msg="failed to get info:"
+# etcd_info_msg="etcd info"
+# # If tls is set, then we need to pass the certificate and use https.
+# # Note that the certificate name may be specified.
+# if [ -z "$tls_dir" ]; then
+# 	curl_status_cmd="curl -vsL --max-time 20 http://$addr_url/api/v2/changefeeds --user ticdc:ticdc_secret -vsL"
+# else
+# 	curl_status_cmd="curl --cacert $tls_dir/ca.pem --cert $tls_dir/$certcn_name.pem --key $tls_dir/$certcn_name-key.pem --user ticdc:ticdc_secret -vsL --max-time 20 https://$addr_url/api/v2/changefeeds"
+# fi
 
 # If the command is supposed to fail (in check usage tips test), just exit without retry
 if [[ "$supposed_to_fail" != "no" ]]; then
@@ -173,9 +223,13 @@ if [[ "$supposed_to_fail" != "no" ]]; then
 fi
 
 for ((i = 0; i <= 50; i++)); do
-	res=$($curl_status_cmd)
-	# Make sure we get the capture info(etcd_info_msg) and that there are no errors(get_info_fail_msg).
-	if (! echo "$res" | grep -q "$get_info_fail_msg") && (echo "$res" | grep -q "$etcd_info_msg"); then
+	# Check if curl returns HTTP 200 OK status code
+	if [ -z "$tls_dir" ]; then
+		http_code=$(curl -o /dev/null -s -w "%{http_code}" --max-time 20 "http://$addr_url/api/v2/changefeeds?keyspace=$KEYSPACE_NAME" --user ticdc:ticdc_secret)
+	else
+		http_code=$(curl -o /dev/null -s -w "%{http_code}" --cacert $tls_dir/ca.pem --cert $tls_dir/$certcn_name.pem --key $tls_dir/$certcn_name-key.pem --user ticdc:ticdc_secret --max-time 20 "https://$addr_url/api/v2/changefeeds?keyspace=$KEYSPACE_NAME")
+	fi
+	if [ "$http_code" = "200" ]; then
 		break
 	fi
 	if [ "$i" -eq 50 ]; then

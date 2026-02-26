@@ -14,6 +14,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,9 +22,8 @@ import (
 	"time"
 
 	"github.com/golang/mock/gomock"
-	v2 "github.com/pingcap/tiflow/cdc/api/v2"
-	"github.com/pingcap/tiflow/cdc/model"
-	"github.com/pingcap/tiflow/pkg/config"
+	v2 "github.com/pingcap/ticdc/api/v2"
+	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
 )
@@ -85,7 +85,11 @@ func TestTomlFileToApiModel(t *testing.T) {
 	require.Nil(t, err)
 	apiModel := v2.ToAPIReplicaConfig(cfg)
 	cfg2 := apiModel.ToInternalReplicaConfig()
-	require.Equal(t, cfg, cfg2)
+	cfgBuf, err := json.MarshalIndent(cfg, "", "  ")
+	require.NoError(t, err)
+	cfg2Buf, err := json.MarshalIndent(cfg2, "", "  ")
+	require.NoError(t, err)
+	require.EqualValuesf(t, cfg, cfg2, "cfg: %s, cfg2: %s", cfgBuf, cfg2Buf)
 }
 
 func TestInvalidSortEngine(t *testing.T) {
@@ -93,19 +97,19 @@ func TestInvalidSortEngine(t *testing.T) {
 
 	cases := []struct {
 		input  string
-		expect model.SortEngine
+		expect config.SortEngine
 	}{{
 		input:  "invalid",
-		expect: model.SortUnified,
+		expect: config.SortUnified,
 	}, {
 		input:  "memory",
-		expect: model.SortInMemory,
+		expect: config.SortInMemory,
 	}, {
 		input:  "file",
-		expect: model.SortInFile,
+		expect: config.SortInFile,
 	}, {
 		input:  "unified",
-		expect: model.SortUnified,
+		expect: config.SortUnified,
 	}}
 	for _, cs := range cases {
 		cmd := new(cobra.Command)
@@ -127,7 +131,7 @@ func TestChangefeedCreateCli(t *testing.T) {
 	cmd := newCmdCreateChangefeed(f)
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "cf.toml")
-	err := os.WriteFile(configPath, []byte("enable-sync-point=true\r\nsync-point-interval='20m'"), 0o644)
+	err := os.WriteFile(configPath, []byte("enable-sync-point=false\r\nsync-point-interval='20m'"), 0o644)
 	require.Nil(t, err)
 	os.Args = []string{
 		"create",
@@ -157,10 +161,10 @@ func TestChangefeedCreateCli(t *testing.T) {
 	f.tso.EXPECT().Query(gomock.Any(), gomock.Any()).Return(&v2.Tso{
 		Timestamp: time.Now().Unix() * 1000,
 	}, nil)
-	f.changefeeds.EXPECT().VerifyTable(gomock.Any(), gomock.Any()).Return(&v2.Tables{
+	f.changefeeds.EXPECT().VerifyTable(gomock.Any(), gomock.Any(), gomock.Any()).Return(&v2.Tables{
 		IneligibleTables: []v2.TableName{{}},
 	}, nil)
-	f.changefeeds.EXPECT().Create(gomock.Any(), gomock.Any()).Return(&v2.ChangeFeedInfo{}, nil)
+	f.changefeeds.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any()).Return(&v2.ChangeFeedInfo{}, nil)
 	require.Nil(t, cmd.Execute())
 
 	cmd = newCmdCreateChangefeed(f)

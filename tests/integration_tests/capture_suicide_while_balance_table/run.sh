@@ -8,6 +8,26 @@ WORK_DIR=$OUT_DIR/$TEST_NAME
 CDC_BINARY=cdc.test
 SINK_TYPE=$1
 
+function prepare() {
+	changefeed_id=$1
+	capture1_id=$2
+	capture2_id=$3
+	target_capture=$capture1_id
+	# find a table that capture2 is replicating
+	tables=$(curl -X GET "http://127.0.0.1:8301/api/v2/changefeeds/${changefeed_id}/tables?keyspace=$KEYSPACE_NAME")
+	one_table_id=$(echo $tables | jq -r --arg cid "$capture2_id" '.items[] | select(.node_id==$cid) | .table_ids[0]')
+	if [[ "$one_table_id" == "" || "$one_table_id" == "null" || "$one_table_id" == "0" ]]; then
+		# if not found, find a table that capture1 is replicating
+		target_capture=$capture2_id
+		tables=$(curl -X GET "http://127.0.0.1:8300/api/v2/changefeeds/${changefeed_id}/tables?keyspace=$KEYSPACE_NAME")
+		one_table_id=$(echo $tables | jq -r --arg cid "$capture1_id" '.items[] | select(.node_id==$cid) | .table_ids[0]')
+		if [[ "$one_table_id" == "" || "$one_table_id" == "null" || "$one_table_id" == "0" ]]; then
+			return 1
+		fi
+	fi
+	return 0
+}
+
 # This test mainly verifies CDC can handle the following scenario
 # 1. Two captures, capture-1 is the coordinator, each capture replicates more than one table.
 # 2. capture-2 replicates some DMLs but has some delay, such as large amount of
@@ -32,7 +52,6 @@ function run() {
 
 	rm -rf $WORK_DIR && mkdir -p $WORK_DIR
 	start_tidb_cluster --workdir $WORK_DIR
-	cd $WORK_DIR
 
 	pd_addr="http://$UP_PD_HOST_1:$UP_PD_PORT_1"
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --pd $pd_addr --logsuffix 1 --addr "127.0.0.1:8300"
@@ -40,7 +59,7 @@ function run() {
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --pd $pd_addr --logsuffix 2 --addr "127.0.0.1:8301"
 
 	SINK_URI="mysql://normal:123456@127.0.0.1:3306/?max-txn-row=1"
-	changefeed_id=$(cdc cli changefeed create --pd=$pd_addr --sink-uri="$SINK_URI" 2>&1 | tail -n2 | head -n1 | awk '{print $2}')
+	changefeed_id=$(cdc_cli_changefeed create --pd=$pd_addr --sink-uri="$SINK_URI" | grep '^ID:' | head -n1 | awk '{print $2}')
 
 	run_sql "CREATE DATABASE capture_suicide_while_balance_table;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 	for i in $(seq 1 4); do
@@ -54,21 +73,24 @@ function run() {
 	capture1_id=$(cdc cli capture list | grep -v "Command to ticdc" | jq -r '.[]|select(.address=="127.0.0.1:8300")|.id')
 	capture2_id=$(cdc cli capture list | grep -v "Command to ticdc" | jq -r '.[]|select(.address=="127.0.0.1:8301")|.id')
 
-	target_capture=$capture1_id
-	# find a table that capture2 is replicating
-	one_table_id=$(curl -X GET "http://127.0.0.1:8301/api/v2/changefeeds/${changefeed_id}/tables" | jq -r --arg cid "$capture2_id" '.items[] | select(.node_id==$cid) | .table_ids[0]')
-	if [[ $one_table_id == "null" || $one_table_id == "0" ]]; then
-		# if not found, find a table that capture1 is replicating
-		target_capture=$capture2_id
-		one_table_id=$(curl -X GET "http://127.0.0.1:8300/api/v2/changefeeds/${changefeed_id}/tables" | jq -r --arg cid "$capture1_id" '.items[] | select(.node_id==$cid) | .table_ids[0]')
+	for ((i = 0; i < 5; i++)); do
+		if prepare "$changefeed_id" "$capture1_id" "$capture2_id"; then
+			break
+		fi
+		sleep 2
+	done
+	if [[ $i -eq 5 ]]; then
+		echo 'Failed to find a replicating table'
+		exit 1
 	fi
-	table_query=$(mysql -h${UP_TIDB_HOST} -P${UP_TIDB_PORT} -uroot -e "select table_name from information_schema.tables where tidb_table_id = ${one_table_id}\G")
+
+	table_query=$(mysql -E -h${UP_TIDB_HOST} -P${UP_TIDB_PORT} -uroot -e "select table_name from information_schema.tables where tidb_table_id = ${one_table_id}")
 	table_name=$(echo $table_query | tail -n 1 | awk '{print $(NF)}')
 	run_sql "insert into capture_suicide_while_balance_table.${table_name} values (),(),(),(),()"
 
 	# sleep some time to wait global resolved ts forwarded
 	sleep 2
-	curl -X POST "http://127.0.0.1:8300/api/v2/changefeeds/${changefeed_id}/move_table?tableID=${one_table_id}&targetNodeID=${target_capture}"
+	curl -X POST "http://127.0.0.1:8300/api/v2/changefeeds/${changefeed_id}/move_table?tableID=${one_table_id}&targetNodeID=${target_capture}&keyspace=$KEYSPACE_NAME"
 	# sleep some time to wait table balance job is written to etcd
 	sleep 2
 
@@ -88,7 +110,7 @@ function run() {
 	cleanup_process $CDC_BINARY
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 run $*
 check_logs $WORK_DIR
 echo "[$(date)] <<<<<< run test case $TEST_NAME success! >>>>>>"

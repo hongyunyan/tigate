@@ -18,63 +18,66 @@ import (
 	"time"
 
 	"github.com/pingcap/ticdc/pkg/common"
+	"github.com/pingcap/ticdc/pkg/integrity"
+	"github.com/pingcap/ticdc/pkg/util"
 	timodel "github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/stretchr/testify/require"
 )
 
 var createTableSQL = `create table t (
 	id          int primary key auto_increment,
- 
+
 	c_tinyint   tinyint   null,
 	c_smallint  smallint  null,
 	c_mediumint mediumint null,
 	c_int       int       null,
 	c_bigint    bigint    null,
- 
+
 	c_unsigned_tinyint   tinyint   unsigned null,
 	c_unsigned_smallint  smallint  unsigned null,
 	c_unsigned_mediumint mediumint unsigned null,
 	c_unsigned_int       int       unsigned null,
 	c_unsigned_bigint    bigint    unsigned null,
- 
+
 	c_float   float   null,
 	c_double  double  null,
 	c_decimal decimal null,
 	c_decimal_2 decimal(10, 4) null,
- 
+
 	c_unsigned_float     float unsigned   null,
 	c_unsigned_double    double unsigned  null,
 	c_unsigned_decimal   decimal unsigned null,
 	c_unsigned_decimal_2 decimal(10, 4) unsigned null,
- 
+
 	c_date      date      null,
 	c_datetime  datetime  null,
 	c_timestamp timestamp null,
 	c_time      time      null,
 	c_year      year      null,
- 
+
 	c_tinytext   tinytext      null,
 	c_text       text          null,
 	c_mediumtext mediumtext    null,
 	c_longtext   longtext      null,
- 
+
 	c_tinyblob   tinyblob      null,
 	c_blob       blob          null,
 	c_mediumblob mediumblob    null,
 	c_longblob   longblob      null,
- 
+
 	c_char       char(16)      null,
 	c_varchar    varchar(16)   null,
 	c_binary     binary(16)    null,
 	c_varbinary  varbinary(16) null,
- 
+
 	c_enum enum ('a','b','c') null,
 	c_set  set ('a','b','c')  null,
 	c_bit  bit(64)            null,
 	c_json json               null,
- 
+
  -- gbk dmls
 	name varchar(128) CHARACTER SET gbk,
 	country char(32) CHARACTER SET gbk,
@@ -496,7 +499,7 @@ func TestGetDefaultZeroValue(t *testing.T) {
 		},
 	}
 
-	tz := time.Local
+	tz := time.UTC
 	for _, tc := range testCases {
 		_, val, _, _, _ := getDefaultOrZeroValue(&tc.ColInfo, tz)
 		require.Equal(t, tc.Res, val, tc.Name)
@@ -519,7 +522,7 @@ func TestGetDefaultZeroValue(t *testing.T) {
 	_, val, _, _, _ = getDefaultOrZeroValue(&colInfo, tz)
 	expected, err := types.ParseTimeFromFloatString(
 		types.DefaultStmtNoWarningContext,
-		"2020-11-19 20:12:12", colInfo.FieldType.GetType(), colInfo.FieldType.GetDecimal())
+		"2020-11-19 12:12:12", colInfo.FieldType.GetType(), colInfo.FieldType.GetDecimal())
 	require.NoError(t, err)
 	require.Equal(t, expected.String(), val, "mysql.TypeTimestamp + notnull + default")
 
@@ -530,7 +533,7 @@ func TestGetDefaultZeroValue(t *testing.T) {
 	_, val, _, _, _ = getDefaultOrZeroValue(&colInfo, tz)
 	expected, err = types.ParseTimeFromFloatString(
 		types.DefaultStmtNoWarningContext,
-		"2020-11-19 20:12:12", colInfo.FieldType.GetType(), colInfo.FieldType.GetDecimal())
+		"2020-11-19 12:12:12", colInfo.FieldType.GetType(), colInfo.FieldType.GetDecimal())
 	require.NoError(t, err)
 	require.Equal(t, expected.String(), val, "mysql.TypeTimestamp + null + default")
 
@@ -564,7 +567,7 @@ func TestTimezoneDefaultValue(t *testing.T) {
 	require.NotNil(t, dmlEvent)
 	row, ok := dmlEvent.GetNextRow()
 	require.True(t, ok)
-	require.Equal(t, RowTypeInsert, row.RowType)
+	require.Equal(t, common.RowTypeInsert, row.RowType)
 	require.Equal(t, int64(1), row.Row.GetInt64(0))
 	require.Equal(t, "2023-02-09 13:00:00", row.Row.GetTime(1).String())
 }
@@ -581,7 +584,7 @@ func TestAllTypes(t *testing.T) {
 
 	row, ok := dmlEvent.GetNextRow()
 	require.True(t, ok)
-	require.Equal(t, RowTypeInsert, row.RowType)
+	require.Equal(t, common.RowTypeInsert, row.RowType)
 	require.Equal(t, int64(2), row.Row.GetInt64(0))
 	require.Equal(t, int64(1), row.Row.GetInt64(1))
 
@@ -675,38 +678,31 @@ func TestNullColumn(t *testing.T) {
 
 	row, ok := dmlEvent.GetNextRow()
 	require.True(t, ok)
-	require.Equal(t, RowTypeInsert, row.RowType)
+	require.Equal(t, common.RowTypeInsert, row.RowType)
 
 	tableInfo := helper.GetTableInfo(job)
 	require.NotNil(t, tableInfo)
 
 	// column b is the 2th column
-	colValue, err := common.FormatColVal(&row.Row, tableInfo.GetColumns()[1], 1)
-	require.NoError(t, err)
+	colValue := common.ExtractColVal(&row.Row, tableInfo.GetColumns()[1], 1)
 	require.Equal(t, nil, colValue)
 	// column d is the 4th column
-	colValue, err = common.FormatColVal(&row.Row, tableInfo.GetColumns()[3], 3)
-	require.NoError(t, err)
+	colValue = common.ExtractColVal(&row.Row, tableInfo.GetColumns()[3], 3)
 	require.Equal(t, nil, colValue)
 	// column f is the 6th column
-	colValue, err = common.FormatColVal(&row.Row, tableInfo.GetColumns()[5], 5)
-	require.NoError(t, err)
+	colValue = common.ExtractColVal(&row.Row, tableInfo.GetColumns()[5], 5)
 	require.Equal(t, nil, colValue)
 	// column h is the 8th column
-	colValue, err = common.FormatColVal(&row.Row, tableInfo.GetColumns()[7], 7)
-	require.NoError(t, err)
+	colValue = common.ExtractColVal(&row.Row, tableInfo.GetColumns()[7], 7)
 	require.Equal(t, nil, colValue)
 	// column j is the 10th column
-	colValue, err = common.FormatColVal(&row.Row, tableInfo.GetColumns()[9], 9)
-	require.NoError(t, err)
+	colValue = common.ExtractColVal(&row.Row, tableInfo.GetColumns()[9], 9)
 	require.Equal(t, nil, colValue)
 	// column l is the 12th column
-	colValue, err = common.FormatColVal(&row.Row, tableInfo.GetColumns()[11], 11)
-	require.NoError(t, err)
+	colValue = common.ExtractColVal(&row.Row, tableInfo.GetColumns()[11], 11)
 	require.Equal(t, nil, colValue)
 	// column ah is the 34th column
-	colValue, err = common.FormatColVal(&row.Row, tableInfo.GetColumns()[33], 33)
-	require.NoError(t, err)
+	colValue = common.ExtractColVal(&row.Row, tableInfo.GetColumns()[33], 33)
 	require.Equal(t, nil, colValue)
 }
 
@@ -722,10 +718,70 @@ func TestBinary(t *testing.T) {
 
 	row, ok := dmlEvent.GetNextRow()
 	require.True(t, ok)
-	require.Equal(t, RowTypeInsert, row.RowType)
+	require.Equal(t, common.RowTypeInsert, row.RowType)
 	tableInfo := helper.GetTableInfo(job)
-	v, err := common.FormatColVal(&row.Row, tableInfo.GetColumns()[0], 0)
-	require.NoError(t, err)
+	v := common.ExtractColVal(&row.Row, tableInfo.GetColumns()[0], 0)
 	binaryFormat := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A}
 	require.Equal(t, binaryFormat, v)
+}
+
+func TestDecodeToChunk(t *testing.T) {
+	helper := NewEventTestHelper(t)
+	defer helper.Close()
+
+	// This configuration only takes effect for newly created sessions.
+	helper.tk.MustExec("set global tidb_enable_row_level_checksum=true")
+	helper.tk.RefreshSession()
+	helper.tk.MustExec("use test")
+	ddlJob := helper.DDL2Job("create table t(id int primary key)")
+	require.NotNil(t, ddlJob)
+	tableInfo := helper.GetTableInfo(ddlJob)
+	ts := tableInfo.GetUpdateTS()
+	dmls := []string{
+		"insert into t values(1)",
+		"insert into t values(2)",
+		"insert into t values(3)",
+	}
+	rawKvs := helper.DML2RawKv(tableInfo.TableName.TableID, ts, dmls...)
+
+	m := NewMounter(time.UTC, &integrity.Config{
+		IntegrityCheckLevel:   util.AddressOf(integrity.CheckLevelCorrectness),
+		CorruptionHandleLevel: util.AddressOf(integrity.CorruptionHandleLevelError),
+	})
+	chk := chunk.NewChunkWithCapacity(tableInfo.GetFieldSlice(), defaultRowCount)
+	for idx, rawKv := range rawKvs {
+		count, checksum, err := m.DecodeToChunk(rawKv, tableInfo, chk)
+		require.NoError(t, err)
+		require.Equal(t, count, 1)
+		require.False(t, checksum.Corrupted)
+		sum, err := calculateColumnChecksum(tableInfo.GetColumns(), chk.GetRow(idx), time.UTC)
+		require.NoError(t, err)
+		require.Equal(t, sum, checksum.Current)
+	}
+
+	dmls = []string{
+		"insert into t values(4)",
+		"insert into t values(5)",
+		"insert into t values(6)",
+	}
+	rawKvs = helper.DML2RawKv(tableInfo.TableName.TableID, ts, dmls...)
+	prev := chk.NumRows()
+	for idx, rawKv := range rawKvs {
+		count, checksum, err := m.DecodeToChunk(rawKv, tableInfo, chk)
+		require.NoError(t, err)
+		require.Equal(t, count, 1)
+		require.False(t, checksum.Corrupted)
+		sum, err := calculateColumnChecksum(tableInfo.GetColumns(), chk.GetRow(idx), time.UTC)
+		require.NoError(t, err)
+		require.NotEqual(t, sum, checksum.Current)
+	}
+	for idx, rawKv := range rawKvs {
+		count, checksum, err := m.DecodeToChunk(rawKv, tableInfo, chk)
+		require.NoError(t, err)
+		require.Equal(t, count, 1)
+		require.False(t, checksum.Corrupted)
+		sum, err := calculateColumnChecksum(tableInfo.GetColumns(), chk.GetRow(prev+idx), time.UTC)
+		require.NoError(t, err)
+		require.Equal(t, sum, checksum.Current)
+	}
 }

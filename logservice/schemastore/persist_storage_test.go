@@ -23,11 +23,13 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/pingcap/log"
+	"github.com/pingcap/ticdc/pkg/common"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
 	"github.com/pingcap/ticdc/pkg/filter"
 	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/charset"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
@@ -64,9 +66,134 @@ func TestApplyDDLJobs(t *testing.T) {
 		fetchTableDDLEventsTestCase []FetchTableDDLEventsTestCase        // test cases for fetchTableDDLEvents, nil means not check it
 		fetchTableTriggerDDLEvents  []FetchTableTriggerDDLEventsTestCase //	test cases for fetchTableTriggerDDLEvents, nil means not check it
 	}{
+		// test filter rules
+		{
+			testName:       "filter_rules",
+			initailDBInfos: nil,
+			ddlJobs: []*model.Job{
+				buildCreateSchemaJobForTest(100, "filter", 1000),
+				buildCreateTableJobForTest(100, 200, "t1", 1010), // create table 200
+				buildCreateTableJobForTest(100, 201, "t2", 1020), // create table 201
+				buildCreateSchemaJobForTest(101, "haha", 2000),
+				buildCreateTableJobForTest(101, 202, "t2", 2010), // create table 202
+			},
+			tableMap: map[int64]*BasicTableInfo{
+				200: {
+					SchemaID: 100,
+					Name:     "t1",
+				},
+				201: {
+					SchemaID: 100,
+					Name:     "t2",
+				},
+				202: {
+					SchemaID: 101,
+					Name:     "t2",
+				},
+			},
+			partitionMap: map[int64]BasicPartitionInfo{},
+			databaseMap: map[int64]*BasicDatabaseInfo{
+				100: {
+					Name: "filter",
+					Tables: map[int64]bool{
+						200: true,
+						201: true,
+					},
+				},
+				101: {
+					Name: "haha",
+					Tables: map[int64]bool{
+						202: true,
+					},
+				},
+			},
+			tablesDDLHistory: map[int64][]uint64{
+				200: {1010},
+				201: {1020},
+				202: {2010},
+			},
+			tableTriggerDDLHistory:      []uint64{1000, 1010, 1020, 2000, 2010},
+			physicalTableQueryTestCases: nil,
+			fetchTableDDLEventsTestCase: []FetchTableDDLEventsTestCase{
+				{
+					tableID:     200,
+					tableFilter: buildTableFilterByNameForTest("filter", "t1"),
+					startTs:     999,
+					endTs:       3000,
+					result: []commonEvent.DDLEvent{
+						{
+							SchemaID:   100,
+							Type:       byte(model.ActionCreateTable),
+							FinishedTs: 1010,
+							BlockedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{common.DDLSpanTableID},
+							},
+							NeedAddedTables: []commonEvent.Table{
+								{
+									SchemaID:  100,
+									TableID:   200,
+									Splitable: true,
+								},
+							},
+							TableNameChange: &commonEvent.TableNameChange{
+								AddName: []commonEvent.SchemaTableName{
+									{
+										SchemaName: "filter",
+										TableName:  "t1",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			fetchTableTriggerDDLEvents: []FetchTableTriggerDDLEventsTestCase{
+				{
+					tableFilter: buildTableFilterByNameForTest("filter", "t1"),
+					startTs:     999,
+					limit:       10,
+					result: []commonEvent.DDLEvent{
+						{
+							SchemaID:   100,
+							Type:       byte(model.ActionCreateSchema),
+							FinishedTs: 1000,
+							BlockedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{common.DDLSpanTableID},
+							},
+						},
+						{
+							SchemaID:   100,
+							Type:       byte(model.ActionCreateTable),
+							FinishedTs: 1010,
+							BlockedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{common.DDLSpanTableID},
+							},
+							NeedAddedTables: []commonEvent.Table{
+								{
+									SchemaID:  100,
+									TableID:   200,
+									Splitable: true,
+								},
+							},
+							TableNameChange: &commonEvent.TableNameChange{
+								AddName: []commonEvent.SchemaTableName{
+									{
+										SchemaName: "filter",
+										TableName:  "t1",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 		// test drop schema can clear table info and partition info
 		{
-			"drop schema",
+			"drop_schema",
 			nil,
 			func() []*model.Job {
 				return []*model.Job{
@@ -92,7 +219,7 @@ func TestApplyDDLJobs(t *testing.T) {
 		},
 		// test create table/drop table/truncate table
 		{
-			"create/drop/truncate table",
+			"create_drop_truncate_table",
 			nil,
 			func() []*model.Job {
 				return []*model.Job{
@@ -129,8 +256,9 @@ func TestApplyDDLJobs(t *testing.T) {
 					snapTs: 1010,
 					result: []commonEvent.Table{
 						{
-							SchemaID: 100,
-							TableID:  200,
+							SchemaID:  100,
+							TableID:   200,
+							Splitable: true,
 							SchemaTableName: &commonEvent.SchemaTableName{
 								SchemaName: "test",
 								TableName:  "t1",
@@ -142,16 +270,18 @@ func TestApplyDDLJobs(t *testing.T) {
 					snapTs: 1020,
 					result: []commonEvent.Table{
 						{
-							SchemaID: 100,
-							TableID:  200,
+							SchemaID:  100,
+							TableID:   200,
+							Splitable: true,
 							SchemaTableName: &commonEvent.SchemaTableName{
 								SchemaName: "test",
 								TableName:  "t1",
 							},
 						},
 						{
-							SchemaID: 100,
-							TableID:  201,
+							SchemaID:  100,
+							TableID:   201,
+							Splitable: true,
 							SchemaTableName: &commonEvent.SchemaTableName{
 								SchemaName: "test",
 								TableName:  "t2",
@@ -164,8 +294,9 @@ func TestApplyDDLJobs(t *testing.T) {
 					tableFilter: buildTableFilterByNameForTest("test", "t1"),
 					result: []commonEvent.Table{
 						{
-							SchemaID: 100,
-							TableID:  202,
+							SchemaID:  100,
+							TableID:   202,
+							Splitable: true,
 							SchemaTableName: &commonEvent.SchemaTableName{
 								SchemaName: "test",
 								TableName:  "t1",
@@ -194,8 +325,9 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  200,
+									SchemaID:  100,
+									TableID:   200,
+									Splitable: true,
 								},
 							},
 							TableNameChange: &commonEvent.TableNameChange{
@@ -216,8 +348,9 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  201,
+									SchemaID:  100,
+									TableID:   201,
+									Splitable: true,
 								},
 							},
 							TableNameChange: &commonEvent.TableNameChange{
@@ -249,6 +382,9 @@ func TestApplyDDLJobs(t *testing.T) {
 								},
 							},
 							Query: "DROP TABLE `test`.`t2`",
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t2"},
+							},
 						},
 						{
 							Type:       byte(model.ActionTruncateTable),
@@ -259,13 +395,116 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  202,
+									SchemaID:  100,
+									TableID:   202,
+									Splitable: true,
 								},
 							},
 							NeedDroppedTables: &commonEvent.InfluencedTables{
 								InfluenceType: commonEvent.InfluenceTypeNormal,
 								TableIDs:      []int64{200},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+							},
+						},
+					},
+				},
+			},
+		},
+		// test create table/drop table for partition table
+		{
+			"drop_partition_table",
+			[]mockDBInfo{
+				{
+					dbInfo: &model.DBInfo{
+						ID:   100,
+						Name: ast.NewCIStr("test"),
+					},
+				},
+			},
+			func() []*model.Job {
+				return []*model.Job{
+					buildCreatePartitionTableJobForTest(100, 200, "t1", []int64{301, 302, 303}, 1010), // create table 200
+					buildDropPartitionTableJobForTest(100, 200, "t1", []int64{301, 302, 303}, 1020),   // drop table 200
+				}
+			}(),
+			map[int64]*BasicTableInfo{},
+			nil,
+			map[int64]*BasicDatabaseInfo{
+				100: {
+					Name:   "test",
+					Tables: map[int64]bool{},
+				},
+			},
+			map[int64][]uint64{
+				301: {1010, 1020},
+				302: {1010, 1020},
+				303: {1010, 1020},
+			},
+			[]uint64{1010, 1020},
+			nil,
+			nil,
+			[]FetchTableTriggerDDLEventsTestCase{
+				{
+					startTs: 1000,
+					limit:   100,
+					result: []commonEvent.DDLEvent{
+						{
+							Type:       byte(model.ActionCreateTable),
+							FinishedTs: 1010,
+							BlockedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{0},
+							},
+							NeedAddedTables: []commonEvent.Table{
+								{
+									SchemaID:  100,
+									TableID:   301,
+									Splitable: true,
+								},
+								{
+									SchemaID:  100,
+									TableID:   302,
+									Splitable: true,
+								},
+								{
+									SchemaID:  100,
+									TableID:   303,
+									Splitable: true,
+								},
+							},
+							TableNameChange: &commonEvent.TableNameChange{
+								AddName: []commonEvent.SchemaTableName{
+									{
+										SchemaName: "test",
+										TableName:  "t1",
+									},
+								},
+							},
+						},
+						{
+							Type:       byte(model.ActionDropTable),
+							FinishedTs: 1020,
+							BlockedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{0, 301, 302, 303},
+							},
+							NeedDroppedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{301, 302, 303},
+							},
+							TableNameChange: &commonEvent.TableNameChange{
+								DropName: []commonEvent.SchemaTableName{
+									{
+										SchemaName: "test",
+										TableName:  "t1",
+									},
+								},
+							},
+							Query: "DROP TABLE `test`.`t1`",
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
 							},
 						},
 					},
@@ -274,12 +513,24 @@ func TestApplyDDLJobs(t *testing.T) {
 		},
 		// test partition table related ddl
 		{
-			"partition table",
-			nil,
+			"partition_table",
+			[]mockDBInfo{
+				{
+					dbInfo: &model.DBInfo{
+						ID:   100,
+						Name: ast.NewCIStr("test"),
+					},
+					tables: []*model.TableInfo{
+						{
+							ID:        200,
+							Name:      ast.NewCIStr("t1"),
+							Partition: buildPartitionDefinitionsForTest([]int64{201, 202, 203}),
+						},
+					},
+				},
+			},
 			func() []*model.Job {
 				return []*model.Job{
-					buildCreateSchemaJobForTest(100, "test", 1000),                                           // create schema 100
-					buildCreatePartitionTableJobForTest(100, 200, "t1", []int64{201, 202, 203}, 1010),        // create partition table 200
 					buildTruncatePartitionTableJobForTest(100, 200, 300, "t1", []int64{204, 205, 206}, 1020), // truncate partition table 200 to 300
 					buildAddPartitionJobForTest(100, 300, "t1", []int64{204, 205, 206, 207}, 1030),           // add partition 207
 					buildDropPartitionJobForTest(100, 300, "t1", []int64{205, 206, 207}, 1040),               // drop partition 204
@@ -308,39 +559,42 @@ func TestApplyDDLJobs(t *testing.T) {
 				},
 			},
 			map[int64][]uint64{
-				201: {1010, 1020},
-				202: {1010, 1020},
-				203: {1010, 1020},
+				201: {1020},
+				202: {1020},
+				203: {1020},
 				204: {1020, 1030, 1040},
 				205: {1020, 1030, 1040, 1050},
 				206: {1020, 1030, 1040, 1050},
 				207: {1030, 1040, 1050},
 				208: {1050},
 			},
-			[]uint64{1000, 1010, 1020, 1030, 1040, 1050},
+			[]uint64{1020, 1030, 1040, 1050},
 			[]PhysicalTableQueryTestCase{
 				{
 					snapTs: 1010,
 					result: []commonEvent.Table{
 						{
-							SchemaID: 100,
-							TableID:  201,
+							SchemaID:  100,
+							TableID:   201,
+							Splitable: false,
 							SchemaTableName: &commonEvent.SchemaTableName{
 								SchemaName: "test",
 								TableName:  "t1",
 							},
 						},
 						{
-							SchemaID: 100,
-							TableID:  202,
+							SchemaID:  100,
+							TableID:   202,
+							Splitable: false,
 							SchemaTableName: &commonEvent.SchemaTableName{
 								SchemaName: "test",
 								TableName:  "t1",
 							},
 						},
 						{
-							SchemaID: 100,
-							TableID:  203,
+							SchemaID:  100,
+							TableID:   203,
+							Splitable: false,
 							SchemaTableName: &commonEvent.SchemaTableName{
 								SchemaName: "test",
 								TableName:  "t1",
@@ -352,24 +606,27 @@ func TestApplyDDLJobs(t *testing.T) {
 					snapTs: 1050,
 					result: []commonEvent.Table{
 						{
-							SchemaID: 100,
-							TableID:  206,
+							SchemaID:  100,
+							TableID:   206,
+							Splitable: true,
 							SchemaTableName: &commonEvent.SchemaTableName{
 								SchemaName: "test",
 								TableName:  "t1",
 							},
 						},
 						{
-							SchemaID: 100,
-							TableID:  207,
+							SchemaID:  100,
+							TableID:   207,
+							Splitable: true,
 							SchemaTableName: &commonEvent.SchemaTableName{
 								SchemaName: "test",
 								TableName:  "t1",
 							},
 						},
 						{
-							SchemaID: 100,
-							TableID:  208,
+							SchemaID:  100,
+							TableID:   208,
+							Splitable: true,
 							SchemaTableName: &commonEvent.SchemaTableName{
 								SchemaName: "test",
 								TableName:  "t1",
@@ -395,6 +652,9 @@ func TestApplyDDLJobs(t *testing.T) {
 								InfluenceType: commonEvent.InfluenceTypeNormal,
 								TableIDs:      []int64{204},
 							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+							},
 						},
 						{
 							Type:       byte(model.ActionTruncateTablePartition),
@@ -409,9 +669,13 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  208,
+									SchemaID:  100,
+									TableID:   208,
+									Splitable: true,
 								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
 							},
 						},
 					},
@@ -422,50 +686,6 @@ func TestApplyDDLJobs(t *testing.T) {
 					startTs: 999,
 					limit:   1,
 					result: []commonEvent.DDLEvent{
-						{
-							Type:       byte(model.ActionCreateSchema),
-							FinishedTs: 1000,
-							BlockedTables: &commonEvent.InfluencedTables{
-								InfluenceType: commonEvent.InfluenceTypeNormal,
-								TableIDs:      []int64{0},
-							},
-						},
-					},
-				},
-				{
-					startTs: 1000,
-					limit:   10,
-					result: []commonEvent.DDLEvent{
-						{
-							Type:       byte(model.ActionCreateTable),
-							FinishedTs: 1010,
-							BlockedTables: &commonEvent.InfluencedTables{
-								InfluenceType: commonEvent.InfluenceTypeNormal,
-								TableIDs:      []int64{0},
-							},
-							NeedAddedTables: []commonEvent.Table{
-								{
-									SchemaID: 100,
-									TableID:  201,
-								},
-								{
-									SchemaID: 100,
-									TableID:  202,
-								},
-								{
-									SchemaID: 100,
-									TableID:  203,
-								},
-							},
-							TableNameChange: &commonEvent.TableNameChange{
-								AddName: []commonEvent.SchemaTableName{
-									{
-										SchemaName: "test",
-										TableName:  "t1",
-									},
-								},
-							},
-						},
 						{
 							Type:       byte(model.ActionTruncateTable),
 							FinishedTs: 1020,
@@ -479,17 +699,61 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  204,
+									SchemaID:  100,
+									TableID:   204,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  205,
+									SchemaID:  100,
+									TableID:   205,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  206,
+									SchemaID:  100,
+									TableID:   206,
+									Splitable: true,
 								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+							},
+						},
+					},
+				},
+				{
+					startTs: 1000,
+					limit:   10,
+					result: []commonEvent.DDLEvent{
+						{
+							Type:       byte(model.ActionTruncateTable),
+							FinishedTs: 1020,
+							BlockedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{0, 201, 202, 203},
+							},
+							NeedDroppedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{201, 202, 203},
+							},
+							NeedAddedTables: []commonEvent.Table{
+								{
+									SchemaID:  100,
+									TableID:   204,
+									Splitable: true,
+								},
+								{
+									SchemaID:  100,
+									TableID:   205,
+									Splitable: true,
+								},
+								{
+									SchemaID:  100,
+									TableID:   206,
+									Splitable: true,
+								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
 							},
 						},
 						{
@@ -501,9 +765,13 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  207,
+									SchemaID:  100,
+									TableID:   207,
+									Splitable: true,
 								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
 							},
 						},
 						{
@@ -516,6 +784,9 @@ func TestApplyDDLJobs(t *testing.T) {
 							NeedDroppedTables: &commonEvent.InfluencedTables{
 								InfluenceType: commonEvent.InfluenceTypeNormal,
 								TableIDs:      []int64{204},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
 							},
 						},
 						{
@@ -531,9 +802,13 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  208,
+									SchemaID:  100,
+									TableID:   208,
+									Splitable: true,
 								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
 							},
 						},
 					},
@@ -542,18 +817,18 @@ func TestApplyDDLJobs(t *testing.T) {
 		},
 		// test exchange partition
 		{
-			"exchange table partition",
+			"exchange_table_partition",
 			[]mockDBInfo{
 				{
 					dbInfo: &model.DBInfo{
 						ID:   100,
-						Name: pmodel.NewCIStr("test"),
+						Name: ast.NewCIStr("test"),
 					},
 				},
 				{
 					dbInfo: &model.DBInfo{
 						ID:   105,
-						Name: pmodel.NewCIStr("test2"),
+						Name: ast.NewCIStr("test2"),
 					},
 				},
 			},
@@ -628,6 +903,10 @@ func TestApplyDDLJobs(t *testing.T) {
 									NewSchemaID: 105,
 								},
 							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+								{SchemaName: "test2", TableName: "t2"},
+							},
 						},
 					},
 				},
@@ -651,9 +930,13 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  300,
+									SchemaID:  100,
+									TableID:   300,
+									Splitable: true,
 								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
 							},
 						},
 					},
@@ -678,9 +961,13 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 105,
-									TableID:  203,
+									SchemaID:  105,
+									TableID:   203,
+									Splitable: true,
 								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test2", TableName: "t2"},
 							},
 						},
 					},
@@ -690,18 +977,18 @@ func TestApplyDDLJobs(t *testing.T) {
 		},
 		// test rename table
 		{
-			"rename table",
+			"rename_table",
 			[]mockDBInfo{
 				{
 					dbInfo: &model.DBInfo{
 						ID:   100,
-						Name: pmodel.NewCIStr("test"),
+						Name: ast.NewCIStr("test"),
 					},
 				},
 				{
 					dbInfo: &model.DBInfo{
 						ID:   105,
-						Name: pmodel.NewCIStr("test2"),
+						Name: ast.NewCIStr("test2"),
 					},
 				},
 			},
@@ -780,6 +1067,9 @@ func TestApplyDDLJobs(t *testing.T) {
 									},
 								},
 							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+							},
 						},
 						{
 							Type:       byte(model.ActionRenameTable),
@@ -802,6 +1092,9 @@ func TestApplyDDLJobs(t *testing.T) {
 										TableName:  "t2",
 									},
 								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test2", TableName: "t2"},
 							},
 						},
 					},
@@ -831,6 +1124,9 @@ func TestApplyDDLJobs(t *testing.T) {
 										TableName:  "t1",
 									},
 								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
 							},
 						},
 					},
@@ -862,18 +1158,18 @@ func TestApplyDDLJobs(t *testing.T) {
 		},
 		// test rename partition table
 		{
-			"rename partition table",
+			"rename_partition_table",
 			[]mockDBInfo{
 				{
 					dbInfo: &model.DBInfo{
 						ID:   100,
-						Name: pmodel.NewCIStr("test"),
+						Name: ast.NewCIStr("test"),
 					},
 				},
 				{
 					dbInfo: &model.DBInfo{
 						ID:   105,
-						Name: pmodel.NewCIStr("test2"),
+						Name: ast.NewCIStr("test2"),
 					},
 				},
 			},
@@ -959,6 +1255,9 @@ func TestApplyDDLJobs(t *testing.T) {
 									},
 								},
 							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+							},
 						},
 					},
 				},
@@ -988,6 +1287,9 @@ func TestApplyDDLJobs(t *testing.T) {
 									},
 								},
 							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+							},
 						},
 					},
 				},
@@ -1010,28 +1312,28 @@ func TestApplyDDLJobs(t *testing.T) {
 		},
 		// test rename tables
 		{
-			"rename tables",
+			"rename_tables",
 			[]mockDBInfo{
 				{
 					dbInfo: &model.DBInfo{
 						ID:   100,
-						Name: pmodel.NewCIStr("test"),
+						Name: ast.NewCIStr("test"),
 					},
 					tables: []*model.TableInfo{
 						{
 							ID:   200,
-							Name: pmodel.NewCIStr("t1"),
+							Name: ast.NewCIStr("t1"),
 						},
 						{
 							ID:   201,
-							Name: pmodel.NewCIStr("t2"),
+							Name: ast.NewCIStr("t2"),
 						},
 					},
 				},
 				{
 					dbInfo: &model.DBInfo{
 						ID:   105,
-						Name: pmodel.NewCIStr("test2"),
+						Name: ast.NewCIStr("test2"),
 					},
 				},
 			},
@@ -1121,6 +1423,10 @@ func TestApplyDDLJobs(t *testing.T) {
 									},
 								},
 							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+								{SchemaName: "test", TableName: "t2"},
+							},
 						},
 					},
 				},
@@ -1161,6 +1467,54 @@ func TestApplyDDLJobs(t *testing.T) {
 									},
 								},
 							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+								{SchemaName: "test", TableName: "t2"},
+							},
+						},
+					},
+				},
+				// test filter: after rename, t102 is filtered out
+				{
+					tableID:     200,
+					tableFilter: buildTableFilterByNameForTest("test", "*"),
+					startTs:     1000,
+					endTs:       1010,
+					result: []commonEvent.DDLEvent{
+						{
+							Type:       byte(model.ActionRenameTables),
+							Query:      "RENAME TABLE `test`.`t1` TO `test`.`t101`;RENAME TABLE `test`.`t2` TO `test2`.`t102`;",
+							FinishedTs: 1010,
+							BlockedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{0, 200, 201},
+							},
+							NeedDroppedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{201},
+							},
+							TableNameChange: &commonEvent.TableNameChange{
+								AddName: []commonEvent.SchemaTableName{
+									{
+										SchemaName: "test",
+										TableName:  "t101",
+									},
+								},
+								DropName: []commonEvent.SchemaTableName{
+									{
+										SchemaName: "test",
+										TableName:  "t1",
+									},
+									{
+										SchemaName: "test",
+										TableName:  "t2",
+									},
+								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+								{SchemaName: "test", TableName: "t2"},
+							},
 						},
 					},
 				},
@@ -1197,14 +1551,208 @@ func TestApplyDDLJobs(t *testing.T) {
 			},
 			nil,
 		},
-		// test create tables
+		// test rename tables to swap names
 		{
-			"create tables",
+			"rename_tables_to_swap_names",
 			[]mockDBInfo{
 				{
 					dbInfo: &model.DBInfo{
 						ID:   100,
-						Name: pmodel.NewCIStr("test"),
+						Name: ast.NewCIStr("test"),
+					},
+					tables: []*model.TableInfo{
+						{
+							ID:   200,
+							Name: ast.NewCIStr("t1"),
+						},
+						{
+							ID:   201,
+							Name: ast.NewCIStr("t2"),
+						},
+					},
+				},
+			},
+			func() []*model.Job {
+				return []*model.Job{
+					buildRenameTablesJobForTest(
+						[]int64{100, 100},
+						[]int64{100, 100},
+						[]int64{200, 201},
+						[]string{"test", "test"},
+						[]string{"t1", "t2"},
+						[]string{"t2", "t1"},
+						1010), // rename table 200 to t2, 201 to t1
+				}
+			}(),
+			map[int64]*BasicTableInfo{
+				200: {
+					SchemaID: 100,
+					Name:     "t2",
+				},
+				201: {
+					SchemaID: 100,
+					Name:     "t1",
+				},
+			},
+			nil,
+			map[int64]*BasicDatabaseInfo{
+				100: {
+					Name: "test",
+					Tables: map[int64]bool{
+						200: true,
+						201: true,
+					},
+				},
+			},
+			map[int64][]uint64{
+				200: {1010},
+				201: {1010},
+			},
+			[]uint64{1010},
+			nil,
+			[]FetchTableDDLEventsTestCase{
+				{
+					tableID: 200,
+					startTs: 1000,
+					endTs:   1010,
+					result: []commonEvent.DDLEvent{
+						{
+							Type:       byte(model.ActionRenameTables),
+							FinishedTs: 1010,
+							// Query:      "RENAME TABLE `test`.`t1` TO `test`.`t2`;RENAME TABLE `test`.`t2` TO `test`.`t1`;",
+							BlockedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{0, 200, 201},
+							},
+							TableNameChange: &commonEvent.TableNameChange{
+								AddName: []commonEvent.SchemaTableName{
+									{
+										SchemaName: "test",
+										TableName:  "t1",
+									},
+									{
+										SchemaName: "test",
+										TableName:  "t2",
+									},
+								},
+								DropName: []commonEvent.SchemaTableName{
+									{
+										SchemaName: "test",
+										TableName:  "t1",
+									},
+									{
+										SchemaName: "test",
+										TableName:  "t2",
+									},
+								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+								{SchemaName: "test", TableName: "t2"},
+							},
+						},
+					},
+				},
+			},
+			nil,
+		},
+		// test complex rename tables and ignore-ts filter
+		// TODO: this DDL is not supported now, add it later
+		// {
+		// 	"complex rename and ignore-ts filter",
+		// 	[]mockDBInfo{
+		// 		{
+		// 			dbInfo: &model.DBInfo{ID: 100, Name: ast.NewCIStr("test")},
+		// 			tables: []*model.TableInfo{
+		// 				{ID: 200, Name: ast.NewCIStr("a")},
+		// 				{ID: 201, Name: ast.NewCIStr("b")},
+		// 			},
+		// 		},
+		// 	},
+		// 	func() []*model.Job {
+		// 		return []*model.Job{
+		// 			// This job simulates `RENAME TABLE a to c, b to a, c to b`
+		// 			// which is effectively swapping table a and b's names.
+		// 			buildRenameTablesJobForTest(
+		// 				[]int64{100, 100},        // oldSchemaIDs
+		// 				[]int64{100, 100},        // newSchemaIDs
+		// 				[]int64{200, 201},        // tableIDs
+		// 				[]string{"test", "test"}, // oldSchemaNames
+		// 				[]string{"a", "b"},       // oldTableNames
+		// 				[]string{"b", "a"},       // newTableNames
+		// 				1010,
+		// 			),
+		// 		}
+		// 	}(),
+		// 	map[int64]*BasicTableInfo{
+		// 		200: {SchemaID: 100, Name: "b"},
+		// 		201: {SchemaID: 100, Name: "a"},
+		// 	},
+		// 	nil, // partitionMap
+		// 	map[int64]*BasicDatabaseInfo{
+		// 		100: {
+		// 			Name:   "test",
+		// 			Tables: map[int64]bool{200: true, 201: true},
+		// 		},
+		// 	},
+		// 	map[int64][]uint64{
+		// 		200: {1010},
+		// 		201: {1010},
+		// 	},
+		// 	[]uint64{1010},
+		// 	nil, // physicalTableQueryTestCases
+		// 	nil, // fetchTableDDLEventsTestCase
+		// 	[]FetchTableTriggerDDLEventsTestCase{
+		// 		// Case 1: Without filter, DDL event should be fetched.
+		// 		{
+		// 			startTs: 1000,
+		// 			limit:   10,
+		// 			result: []commonEvent.DDLEvent{
+		// 				{
+		// 					Type:       byte(model.ActionRenameTables),
+		// 					FinishedTs: 1010,
+		// 					BlockedTables: &commonEvent.InfluencedTables{
+		// 						InfluenceType: commonEvent.InfluenceTypeNormal,
+		// 						TableIDs:      []int64{0, 200, 201},
+		// 					},
+		// 					TableNameChange: &commonEvent.TableNameChange{
+		// 						AddName: []commonEvent.SchemaTableName{
+		// 							{SchemaName: "test", TableName: "a"},
+		// 							{SchemaName: "test", TableName: "b"},
+		// 						},
+		// 						DropName: []commonEvent.SchemaTableName{
+		// 							{SchemaName: "test", TableName: "a"},
+		// 							{SchemaName: "test", TableName: "b"},
+		// 						},
+		// 					},
+		// 				},
+		// 			},
+		// 		},
+		// 		// Case 2: With ignore-txn-start-ts filter, DDL event should be ignored.
+		// 		{
+		// 			tableFilter: func() filter.Filter {
+		// 				cfg := config.GetDefaultReplicaConfig()
+		// 				cfg.Filter.IgnoreTxnStartTs = []uint64{1010}
+		// 				f, err := filter.NewFilter(cfg.Filter, "UTC", false, false)
+		// 				if err != nil {
+		// 					panic("failed to create filter for test")
+		// 				}
+		// 				return f
+		// 			}(),
+		// 			startTs: 1000,
+		// 			limit:   10,
+		// 			result:  []commonEvent.DDLEvent{},
+		// 		},
+		// 	},
+		// },
+		// test create tables
+		{
+			"create_tables",
+			[]mockDBInfo{
+				{
+					dbInfo: &model.DBInfo{
+						ID:   100,
+						Name: ast.NewCIStr("test"),
 					},
 				},
 			},
@@ -1278,16 +1826,19 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  301,
+									SchemaID:  100,
+									TableID:   301,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  302,
+									SchemaID:  100,
+									TableID:   302,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  303,
+									SchemaID:  100,
+									TableID:   303,
+									Splitable: true,
 								},
 							},
 							TableNameChange: &commonEvent.TableNameChange{
@@ -1317,12 +1868,14 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  304,
+									SchemaID:  100,
+									TableID:   304,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  305,
+									SchemaID:  100,
+									TableID:   305,
+									Splitable: true,
 								},
 							},
 							TableNameChange: &commonEvent.TableNameChange{
@@ -1356,8 +1909,9 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  301,
+									SchemaID:  100,
+									TableID:   301,
+									Splitable: true,
 								},
 							},
 							TableNameChange: &commonEvent.TableNameChange{
@@ -1375,12 +1929,12 @@ func TestApplyDDLJobs(t *testing.T) {
 		},
 		// test create tables for partition table
 		{
-			"create partition tables",
+			"create_partition_tables",
 			[]mockDBInfo{
 				{
 					dbInfo: &model.DBInfo{
 						ID:   100,
-						Name: pmodel.NewCIStr("test"),
+						Name: ast.NewCIStr("test"),
 					},
 				},
 			},
@@ -1462,40 +2016,49 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  301,
+									SchemaID:  100,
+									TableID:   301,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  302,
+									SchemaID:  100,
+									TableID:   302,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  303,
+									SchemaID:  100,
+									TableID:   303,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  401,
+									SchemaID:  100,
+									TableID:   401,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  402,
+									SchemaID:  100,
+									TableID:   402,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  403,
+									SchemaID:  100,
+									TableID:   403,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  501,
+									SchemaID:  100,
+									TableID:   501,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  502,
+									SchemaID:  100,
+									TableID:   502,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  503,
+									SchemaID:  100,
+									TableID:   503,
+									Splitable: true,
 								},
 							},
 							TableNameChange: &commonEvent.TableNameChange{
@@ -1532,16 +2095,19 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  301,
+									SchemaID:  100,
+									TableID:   301,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  302,
+									SchemaID:  100,
+									TableID:   302,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  303,
+									SchemaID:  100,
+									TableID:   303,
+									Splitable: true,
 								},
 							},
 							TableNameChange: &commonEvent.TableNameChange{
@@ -1559,17 +2125,17 @@ func TestApplyDDLJobs(t *testing.T) {
 		},
 		// test alter/remove partitioning
 		{
-			"alter remove partitioning",
+			"alter_remove_partitioning",
 			[]mockDBInfo{
 				{
 					dbInfo: &model.DBInfo{
 						ID:   100,
-						Name: pmodel.NewCIStr("test"),
+						Name: ast.NewCIStr("test"),
 					},
 					tables: []*model.TableInfo{
 						{
 							ID:   300,
-							Name: pmodel.NewCIStr("t1"),
+							Name: ast.NewCIStr("t1"),
 						},
 					},
 				},
@@ -1627,17 +2193,23 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  501,
+									SchemaID:  100,
+									TableID:   501,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  502,
+									SchemaID:  100,
+									TableID:   502,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  503,
+									SchemaID:  100,
+									TableID:   503,
+									Splitable: true,
 								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
 							},
 						},
 						{
@@ -1653,17 +2225,23 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  504,
+									SchemaID:  100,
+									TableID:   504,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  505,
+									SchemaID:  100,
+									TableID:   505,
+									Splitable: true,
 								},
 								{
-									SchemaID: 100,
-									TableID:  506,
+									SchemaID:  100,
+									TableID:   506,
+									Splitable: true,
 								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
 							},
 						},
 						{
@@ -1679,9 +2257,13 @@ func TestApplyDDLJobs(t *testing.T) {
 							},
 							NeedAddedTables: []commonEvent.Table{
 								{
-									SchemaID: 100,
-									TableID:  303,
+									SchemaID:  100,
+									TableID:   303,
+									Splitable: true,
 								},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
 							},
 						},
 					},
@@ -1695,17 +2277,17 @@ func TestApplyDDLJobs(t *testing.T) {
 		// test multi schema change
 		// test add/drop column
 		{
-			"trivial ddls",
+			"trivial_ddls",
 			[]mockDBInfo{
 				{
 					dbInfo: &model.DBInfo{
 						ID:   100,
-						Name: pmodel.NewCIStr("test"),
+						Name: ast.NewCIStr("test"),
 					},
 					tables: []*model.TableInfo{
 						{
 							ID:   300,
-							Name: pmodel.NewCIStr("t1"),
+							Name: ast.NewCIStr("t1"),
 						},
 					},
 				},
@@ -1714,15 +2296,15 @@ func TestApplyDDLJobs(t *testing.T) {
 				return []*model.Job{
 					buildAddPrimaryKeyJobForTest(100, 300, 1010, &model.IndexInfo{
 						ID:        500,
-						Name:      pmodel.NewCIStr("idx1"),
-						Table:     pmodel.NewCIStr("t1"),
+						Name:      ast.NewCIStr("idx1"),
+						Table:     ast.NewCIStr("t1"),
 						Primary:   true,
 						Invisible: true,
 					}),
 					buildAlterIndexVisibilityJobForTest(100, 300, 1020, &model.IndexInfo{
 						ID:        500,
-						Name:      pmodel.NewCIStr("idx1"),
-						Table:     pmodel.NewCIStr("t1"),
+						Name:      ast.NewCIStr("idx1"),
+						Table:     ast.NewCIStr("t1"),
 						Primary:   true,
 						Invisible: false,
 					}),
@@ -1735,6 +2317,9 @@ func TestApplyDDLJobs(t *testing.T) {
 					buildDropColumnJobForTest(100, 300, 1100),
 					buildCreateViewJobForTest(100, 1110),
 					buildDropViewJobForTest(100, 1120),
+					buildAddForeignKeyJobForTest(100, 300, 1130),
+					buildAddFulltextIndexJobForTest(100, 300, 1140),
+					buildCreateHybridIndexJobForTest(100, 300, 1150),
 				}
 			}(),
 			map[int64]*BasicTableInfo{
@@ -1753,11 +2338,54 @@ func TestApplyDDLJobs(t *testing.T) {
 				},
 			},
 			map[int64][]uint64{
-				300: {1010, 1020, 1030, 1040, 1050, 1060, 1080, 1090, 1100, 1110},
+				300: {1010, 1020, 1030, 1040, 1050, 1060, 1080, 1090, 1100, 1110, 1130, 1140, 1150},
 			},
 			[]uint64{1110, 1120},
 			nil,
-			nil,
+			[]FetchTableDDLEventsTestCase{
+				{
+					tableID: 300,
+					startTs: 1120,
+					endTs:   1180,
+					result: []commonEvent.DDLEvent{
+						{
+							Type:       byte(model.ActionAddForeignKey),
+							FinishedTs: 1130,
+							BlockedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{300},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+							},
+						},
+						{
+							Type:       byte(filter.ActionAddFullTextIndex),
+							FinishedTs: 1140,
+							TiDBOnly:   true,
+							BlockedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{300},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+							},
+						},
+						{
+							Type:       byte(filter.ActionCreateHybridIndex),
+							FinishedTs: 1150,
+							TiDBOnly:   true,
+							BlockedTables: &commonEvent.InfluencedTables{
+								InfluenceType: commonEvent.InfluenceTypeNormal,
+								TableIDs:      []int64{300},
+							},
+							BlockedTableNames: []commonEvent.SchemaTableName{
+								{SchemaName: "test", TableName: "t1"},
+							},
+						},
+					},
+				},
+			},
 			nil,
 		},
 	}
@@ -1855,10 +2483,35 @@ func TestApplyDDLJobs(t *testing.T) {
 								return false
 							}
 						}
+						// check BlockedTableNames
+						sort.Slice(expectedDDLEvent.BlockedTableNames, func(i, j int) bool {
+							if expectedDDLEvent.BlockedTableNames[i].TableName != expectedDDLEvent.BlockedTableNames[j].TableName {
+								return expectedDDLEvent.BlockedTableNames[i].TableName < expectedDDLEvent.BlockedTableNames[j].TableName
+							}
+							return expectedDDLEvent.BlockedTableNames[i].SchemaName < expectedDDLEvent.BlockedTableNames[j].SchemaName
+						})
+						sort.Slice(actualDDLEvent.BlockedTableNames, func(i, j int) bool {
+							if actualDDLEvent.BlockedTableNames[i].TableName != actualDDLEvent.BlockedTableNames[j].TableName {
+								return actualDDLEvent.BlockedTableNames[i].TableName < actualDDLEvent.BlockedTableNames[j].TableName
+							}
+							return actualDDLEvent.BlockedTableNames[i].SchemaName < actualDDLEvent.BlockedTableNames[j].SchemaName
+						})
+						if !reflect.DeepEqual(expectedDDLEvent.BlockedTableNames, actualDDLEvent.BlockedTableNames) {
+							log.Warn("BlockedTableNames not equal",
+								zap.String("DDLType", model.ActionType(expectedDDLEvent.Type).String()),
+								zap.Uint64("TS", expectedDDLEvent.FinishedTs),
+								zap.Any("expectedBlockedTableNames", expectedDDLEvent.BlockedTableNames),
+								zap.Any("actualBlockedTableNames", actualDDLEvent.BlockedTableNames))
+							return false
+						}
 						// check UpdatedSchemas
 						sort.Slice(expectedDDLEvent.UpdatedSchemas, func(i, j int) bool {
 							// TableID should be unique, so it is enough
 							return expectedDDLEvent.UpdatedSchemas[i].TableID < expectedDDLEvent.UpdatedSchemas[j].TableID
+						})
+						sort.Slice(actualDDLEvent.UpdatedSchemas, func(i, j int) bool {
+							// TableID should be unique, so it is enough
+							return actualDDLEvent.UpdatedSchemas[i].TableID < actualDDLEvent.UpdatedSchemas[j].TableID
 						})
 						if !reflect.DeepEqual(expectedDDLEvent.UpdatedSchemas, actualDDLEvent.UpdatedSchemas) {
 							return false
@@ -1885,6 +2538,10 @@ func TestApplyDDLJobs(t *testing.T) {
 						sort.Slice(expectedDDLEvent.NeedAddedTables, func(i, j int) bool {
 							// TableID should be unique, so it is enough
 							return expectedDDLEvent.NeedAddedTables[i].TableID < expectedDDLEvent.NeedAddedTables[j].TableID
+						})
+						sort.Slice(actualDDLEvent.NeedAddedTables, func(i, j int) bool {
+							// TableID should be unique, so it is enough
+							return actualDDLEvent.NeedAddedTables[i].TableID < actualDDLEvent.NeedAddedTables[j].TableID
 						})
 						if !reflect.DeepEqual(expectedDDLEvent.NeedAddedTables, actualDDLEvent.NeedAddedTables) {
 							return false
@@ -1915,6 +2572,24 @@ func TestApplyDDLJobs(t *testing.T) {
 									return expectedDDLEvent.TableNameChange.DropName[i].SchemaName < expectedDDLEvent.TableNameChange.DropName[j].SchemaName
 								}
 							})
+							sort.Slice(actualDDLEvent.TableNameChange.AddName, func(i, j int) bool {
+								if actualDDLEvent.TableNameChange.AddName[i].TableName < actualDDLEvent.TableNameChange.AddName[j].TableName {
+									return true
+								} else if actualDDLEvent.TableNameChange.AddName[i].TableName > actualDDLEvent.TableNameChange.AddName[j].TableName {
+									return false
+								} else {
+									return actualDDLEvent.TableNameChange.AddName[i].SchemaName < actualDDLEvent.TableNameChange.AddName[j].SchemaName
+								}
+							})
+							sort.Slice(actualDDLEvent.TableNameChange.DropName, func(i, j int) bool {
+								if actualDDLEvent.TableNameChange.DropName[i].TableName < actualDDLEvent.TableNameChange.DropName[j].TableName {
+									return true
+								} else if actualDDLEvent.TableNameChange.DropName[i].TableName > actualDDLEvent.TableNameChange.DropName[j].TableName {
+									return false
+								} else {
+									return actualDDLEvent.TableNameChange.DropName[i].SchemaName < actualDDLEvent.TableNameChange.DropName[j].SchemaName
+								}
+							})
 							if !reflect.DeepEqual(expectedDDLEvent.TableNameChange, actualDDLEvent.TableNameChange) {
 								return false
 							}
@@ -1923,7 +2598,7 @@ func TestApplyDDLJobs(t *testing.T) {
 					return true
 				}
 				for _, testCase := range tt.fetchTableDDLEventsTestCase {
-					events, err := pStorage.fetchTableDDLEvents(testCase.tableID, testCase.tableFilter, testCase.startTs, testCase.endTs)
+					events, err := pStorage.fetchTableDDLEvents(common.NewDispatcherID(), testCase.tableID, testCase.tableFilter, testCase.startTs, testCase.endTs)
 					require.Nil(t, err)
 					if !checkDDLEvents(testCase.result, events) {
 						log.Warn("fetchTableDDLEvents result wrong",
@@ -2026,35 +2701,42 @@ func TestRegisterTable(t *testing.T) {
 		tableID int64
 		snapTs  uint64
 		name    string
+		deleted bool
 	}
 	testCases := []struct {
-		initailDBInfos []mockDBInfo // tables in initailDBInfos will be registered before apply ddl
+		name           string
+		initialDBInfos []mockDBInfo
 		ddlJobs        []*model.Job
-		queryCases     []QueryTableInfoTestCase
+		// tables registered before apply ddl
+		// used for test to apply online ddl jobs
+		preDDLTables []int64
+		// tables registered after apply ddl
+		// used for test to load and apply ddls from disk
+		postDDLTables []int64
+		queryCases    []QueryTableInfoTestCase
 	}{
 		{
-			initailDBInfos: []mockDBInfo{
+			name: "rename table",
+			initialDBInfos: []mockDBInfo{
 				{
 					dbInfo: &model.DBInfo{
 						ID:   50,
-						Name: pmodel.NewCIStr("test"),
+						Name: ast.NewCIStr("test"),
 					},
 					tables: []*model.TableInfo{
 						{
 							ID:   99,
-							Name: pmodel.NewCIStr("t1"),
+							Name: ast.NewCIStr("t1"),
 						},
 					},
 				},
 			},
 			ddlJobs: func() []*model.Job {
 				return []*model.Job{
-					buildRenameTableJobForTest(50, 99, "t2", 1000, nil),                              // rename table 99 to t2
-					buildCreateTableJobForTest(50, 100, "t3", 1010),                                  // create table 100
-					buildTruncateTableJobForTest(50, 100, 101, "t3", 1020),                           // truncate table 100 to 101
-					buildCreatePartitionTableJobForTest(50, 102, "t4", []int64{201, 202, 203}, 1030), // create partition table 102
+					buildRenameTableJobForTest(50, 99, "t2", 1000, nil), // rename table 99 to t2
 				}
 			}(),
+			postDDLTables: []int64{99},
 			queryCases: []QueryTableInfoTestCase{
 				{
 					tableID: 99,
@@ -2066,6 +2748,26 @@ func TestRegisterTable(t *testing.T) {
 					snapTs:  1000,
 					name:    "t2",
 				},
+			},
+		},
+		{
+			name: "truncate table",
+			initialDBInfos: []mockDBInfo{
+				{
+					dbInfo: &model.DBInfo{
+						ID:   50,
+						Name: ast.NewCIStr("test"),
+					},
+				},
+			},
+			ddlJobs: func() []*model.Job {
+				return []*model.Job{
+					buildCreateTableJobForTest(50, 100, "t3", 1010),        // create table 100
+					buildTruncateTableJobForTest(50, 100, 101, "t3", 1020), // truncate table 100 to 101
+				}
+			}(),
+			postDDLTables: []int64{100, 101},
+			queryCases: []QueryTableInfoTestCase{
 				{
 					tableID: 100,
 					snapTs:  1010,
@@ -2076,6 +2778,25 @@ func TestRegisterTable(t *testing.T) {
 					snapTs:  1020,
 					name:    "t3",
 				},
+			},
+		},
+		{
+			name: "create partition table",
+			initialDBInfos: []mockDBInfo{
+				{
+					dbInfo: &model.DBInfo{
+						ID:   50,
+						Name: ast.NewCIStr("test"),
+					},
+				},
+			},
+			ddlJobs: func() []*model.Job {
+				return []*model.Job{
+					buildCreatePartitionTableJobForTest(50, 102, "t4", []int64{201, 202, 203}, 1030), // create partition table 102
+				}
+			}(),
+			postDDLTables: []int64{201, 202, 203},
+			queryCases: []QueryTableInfoTestCase{
 				{
 					tableID: 201,
 					snapTs:  1030,
@@ -2093,26 +2814,83 @@ func TestRegisterTable(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "drop partition table",
+			initialDBInfos: []mockDBInfo{
+				{
+					dbInfo: &model.DBInfo{
+						ID:   50,
+						Name: ast.NewCIStr("test"),
+					},
+					tables: []*model.TableInfo{
+						{
+							ID:        102,
+							Name:      ast.NewCIStr("t1"),
+							Partition: buildPartitionDefinitionsForTest([]int64{201, 202, 203}),
+						},
+					},
+				},
+			},
+			preDDLTables: []int64{201, 202, 203},
+			ddlJobs: func() []*model.Job {
+				return []*model.Job{
+					buildDropPartitionTableJobForTest(50, 102, "t4", []int64{201, 202, 203}, 1030), // drop partition table 102
+				}
+			}(),
+			queryCases: []QueryTableInfoTestCase{
+				{
+					tableID: 201,
+					snapTs:  1029,
+					name:    "t1",
+				},
+				{
+					tableID: 202,
+					snapTs:  1029,
+					name:    "t1",
+				},
+				{
+					tableID: 203,
+					snapTs:  1029,
+					name:    "t1",
+				},
+				{
+					tableID: 201,
+					snapTs:  1030,
+					deleted: true,
+				},
+			},
+		},
 	}
 	for _, tt := range testCases {
-		dbPath := fmt.Sprintf("/tmp/testdb-%s", t.Name())
-		pStorage := newPersistentStorageForTest(dbPath, tt.initailDBInfos)
-		for _, db := range tt.initailDBInfos {
-			for _, table := range db.tables {
-				pStorage.registerTable(table.ID, 0) // second arguments is not important
+		t.Run(tt.name, func(t *testing.T) {
+			dbPath := fmt.Sprintf("/tmp/testdb-%s", t.Name())
+			pStorage := newPersistentStorageForTest(dbPath, tt.initialDBInfos)
+			for _, tableID := range tt.preDDLTables {
+				err := pStorage.registerTable(tableID, 0) // second arguments is not important
+				require.Nil(t, err)
 			}
-		}
-		for _, job := range tt.ddlJobs {
-			err := pStorage.handleDDLJob(job)
-			require.Nil(t, err)
-		}
-		for _, testCase := range tt.queryCases {
-			pStorage.registerTable(testCase.tableID, 0) // second arguments is not important
-			tableInfo, err := pStorage.getTableInfo(testCase.tableID, testCase.snapTs)
-			require.Nil(t, err)
-			require.Equal(t, testCase.name, tableInfo.TableName.Table)
-		}
-		pStorage.close()
+			for _, job := range tt.ddlJobs {
+				err := pStorage.handleDDLJob(job)
+				require.Nil(t, err)
+			}
+			for _, tableID := range tt.postDDLTables {
+				err := pStorage.registerTable(tableID, 0) // second arguments is not important
+				require.Nil(t, err)
+			}
+			for _, testCase := range tt.queryCases {
+				tableInfo, err := pStorage.getTableInfo(testCase.tableID, testCase.snapTs)
+				if testCase.deleted {
+					require.Nil(t, tableInfo)
+					if _, ok := err.(*TableDeletedError); !ok {
+						t.Error("expect TableDeletedError, but got", err)
+					}
+				} else {
+					require.Nil(t, err)
+					require.Equal(t, testCase.name, tableInfo.TableName.Table)
+				}
+			}
+			pStorage.close()
+		})
 	}
 }
 
@@ -2129,16 +2907,16 @@ func TestGCPersistStorage(t *testing.T) {
 		{
 			dbInfo: &model.DBInfo{
 				ID:   schemaID,
-				Name: pmodel.NewCIStr("test"),
+				Name: ast.NewCIStr("test"),
 			},
 			tables: []*model.TableInfo{
 				{
 					ID:   tableID1,
-					Name: pmodel.NewCIStr("t1"),
+					Name: ast.NewCIStr("t1"),
 				},
 				{
 					ID:   tableID2,
-					Name: pmodel.NewCIStr("t2"),
+					Name: ast.NewCIStr("t2"),
 				},
 			},
 		},
@@ -2157,7 +2935,7 @@ func TestGCPersistStorage(t *testing.T) {
 				SchemaVersion: 501,
 				TableInfo: &model.TableInfo{
 					ID:   tableID3,
-					Name: pmodel.NewCIStr("t3"),
+					Name: ast.NewCIStr("t3"),
 				},
 				FinishedTS: 602,
 			},
@@ -2190,7 +2968,7 @@ func TestGCPersistStorage(t *testing.T) {
 				SchemaVersion: 505,
 				TableInfo: &model.TableInfo{
 					ID:   tableID1,
-					Name: pmodel.NewCIStr("t1_r"),
+					Name: ast.NewCIStr("t1_r"),
 				},
 				FinishedTS: 605,
 			},
@@ -2215,16 +2993,16 @@ func TestGCPersistStorage(t *testing.T) {
 			{
 				dbInfo: &model.DBInfo{
 					ID:   schemaID,
-					Name: pmodel.NewCIStr("test"),
+					Name: ast.NewCIStr("test"),
 				},
 				tables: []*model.TableInfo{
 					{
 						ID:   tableID1,
-						Name: pmodel.NewCIStr("t1"),
+						Name: ast.NewCIStr("t1"),
 					},
 					{
 						ID:   tableID2,
-						Name: pmodel.NewCIStr("t2"),
+						Name: ast.NewCIStr("t2"),
 					},
 				},
 			},
@@ -2246,16 +3024,16 @@ func TestGCPersistStorage(t *testing.T) {
 			{
 				dbInfo: &model.DBInfo{
 					ID:   schemaID,
-					Name: pmodel.NewCIStr("test"),
+					Name: ast.NewCIStr("test"),
 				},
 				tables: []*model.TableInfo{
 					{
 						ID:   tableID1,
-						Name: pmodel.NewCIStr("t1"),
+						Name: ast.NewCIStr("t1"),
 					},
 					{
 						ID:   tableID2,
-						Name: pmodel.NewCIStr("t3"),
+						Name: ast.NewCIStr("t3"),
 					},
 				},
 			},
@@ -2288,4 +3066,234 @@ func TestGCPersistStorage(t *testing.T) {
 	}
 
 	// TODO: test obsolete data can be removed
+}
+
+func TestRenameTable(t *testing.T) {
+	// use t;
+	job := buildRenameTableJobForTest(100, 101, "t1", 101, &model.InvolvingSchemaInfo{
+		Database: "t",
+		Table:    "t3",
+	})
+	job.Query = "RENAME TABLE t3 TO test.t1"
+	ddl := buildPersistedDDLEventForRenameTable(buildPersistedDDLEventFuncArgs{
+		job: job,
+		databaseMap: map[int64]*BasicDatabaseInfo{
+			100: {Name: "test", Tables: map[int64]bool{101: true, 102: true}},
+			200: {Name: "t", Tables: map[int64]bool{103: true}},
+		},
+		tableMap: map[int64]*BasicTableInfo{
+			101: {SchemaID: 100, Name: "t1"},
+			102: {SchemaID: 100, Name: "t2"},
+			103: {SchemaID: 200, Name: "t3"},
+		},
+	})
+	assert.Equal(t, "RENAME TABLE `t`.`t3` TO `test`.`t1`", ddl.Query)
+
+	// use test;
+	job = buildRenameTableJobForTest(100, 101, "t2", 100, &model.InvolvingSchemaInfo{
+		Database: "test",
+		Table:    "t1",
+	})
+	job.Query = "RENAME TABLE t1 TO t2"
+	ddl = buildPersistedDDLEventForRenameTable(buildPersistedDDLEventFuncArgs{
+		job: job,
+		databaseMap: map[int64]*BasicDatabaseInfo{
+			100: {Name: "test", Tables: map[int64]bool{101: true, 102: true}},
+			200: {Name: "t", Tables: map[int64]bool{103: true}},
+		},
+		tableMap: map[int64]*BasicTableInfo{
+			101: {SchemaID: 100, Name: "t1"},
+			102: {SchemaID: 100, Name: "t2"},
+			103: {SchemaID: 200, Name: "t3"},
+		},
+	})
+	assert.Equal(t, "RENAME TABLE `test`.`t1` TO `test`.`t2`", ddl.Query)
+
+	// use test;
+	job = buildRenameTableJobForTest(100, 101, "t2", 100, &model.InvolvingSchemaInfo{
+		Database: "test",
+		Table:    "t1",
+	})
+	job.Query = "ALTER TABLE t1 RENAME TO t2"
+	ddl = buildPersistedDDLEventForRenameTable(buildPersistedDDLEventFuncArgs{
+		job: job,
+		databaseMap: map[int64]*BasicDatabaseInfo{
+			100: {Name: "test", Tables: map[int64]bool{101: true, 102: true}},
+			200: {Name: "t", Tables: map[int64]bool{103: true}},
+		},
+		tableMap: map[int64]*BasicTableInfo{
+			101: {SchemaID: 100, Name: "t1"},
+			102: {SchemaID: 100, Name: "t2"},
+			103: {SchemaID: 200, Name: "t3"},
+		},
+	})
+	assert.Equal(t, "RENAME TABLE `test`.`t1` TO `test`.`t2`", ddl.Query)
+}
+
+func TestBuildDDLEventForNewTableDDL_CreateTableLikeBlockedTableNames(t *testing.T) {
+	cases := []struct {
+		name     string
+		query    string
+		expected []commonEvent.SchemaTableName
+	}{
+		{
+			name:  "default schema",
+			query: "CREATE TABLE `b` LIKE `a`",
+			expected: []commonEvent.SchemaTableName{
+				{SchemaName: "test", TableName: "a"},
+			},
+		},
+		{
+			name:  "explicit schema",
+			query: "CREATE TABLE `b` LIKE `other`.`a`",
+			expected: []commonEvent.SchemaTableName{
+				{SchemaName: "other", TableName: "a"},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		rawEvent := &PersistedDDLEvent{
+			Type:       byte(model.ActionCreateTable),
+			SchemaID:   1,
+			TableID:    2,
+			SchemaName: "test",
+			TableName:  "b",
+			Query:      tc.query,
+			TableInfo:  &model.TableInfo{},
+		}
+
+		ddlEvent, ok, err := buildDDLEventForNewTableDDL(rawEvent, nil, 0)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, tc.expected, ddlEvent.BlockedTableNames)
+	}
+}
+
+func TestBuildPersistedDDLEventForCreateTableLikeSetsReferTableID(t *testing.T) {
+	cases := []struct {
+		name            string
+		query           string
+		partitionIDs    []int64
+		expectedReferID int64
+	}{
+		{
+			name:            "non partition refer table",
+			query:           "CREATE TABLE `b` LIKE `a`",
+			partitionIDs:    nil,
+			expectedReferID: 101,
+		},
+		{
+			name:            "partition refer table",
+			query:           "CREATE TABLE `b` LIKE `a`",
+			partitionIDs:    []int64{111, 112},
+			expectedReferID: 101,
+		},
+	}
+
+	for _, tc := range cases {
+		job := buildCreateTableJobForTest(100, 200, "b", 1010)
+		job.Query = tc.query
+		partitionMap := map[int64]BasicPartitionInfo{}
+		if len(tc.partitionIDs) > 0 {
+			partitionInfo := make(BasicPartitionInfo)
+			for _, id := range tc.partitionIDs {
+				partitionInfo[id] = nil
+			}
+			partitionMap[tc.expectedReferID] = partitionInfo
+		}
+		ddl := buildPersistedDDLEventForCreateTable(buildPersistedDDLEventFuncArgs{
+			job: job,
+			databaseMap: map[int64]*BasicDatabaseInfo{
+				100: {Name: "test", Tables: map[int64]bool{101: true, 200: true}},
+			},
+			tableMap: map[int64]*BasicTableInfo{
+				101: {SchemaID: 100, Name: "a"},
+				200: {SchemaID: 100, Name: "b"},
+			},
+			partitionMap: partitionMap,
+		})
+		require.Equal(t, tc.expectedReferID, ddl.ExtraTableID, tc.name)
+		if len(tc.partitionIDs) > 0 {
+			require.ElementsMatch(t, tc.partitionIDs, ddl.ReferTablePartitionIDs, tc.name)
+		} else {
+			require.Empty(t, ddl.ReferTablePartitionIDs, tc.name)
+		}
+	}
+}
+
+func TestBuildDDLEventForNewTableDDL_CreateTableLikeBlockedTables(t *testing.T) {
+	rawEvent := &PersistedDDLEvent{
+		Type:         byte(model.ActionCreateTable),
+		SchemaID:     1,
+		TableID:      2,
+		SchemaName:   "test",
+		TableName:    "b",
+		Query:        "CREATE TABLE `b` LIKE `a`",
+		TableInfo:    &model.TableInfo{},
+		ExtraTableID: 101,
+	}
+	ddlEvent, ok, err := buildDDLEventForNewTableDDL(rawEvent, nil, 0)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.ElementsMatch(t, []int64{common.DDLSpanTableID, 101}, ddlEvent.BlockedTables.TableIDs)
+
+	rawEvent.ReferTablePartitionIDs = []int64{111, 112}
+	ddlEvent, ok, err = buildDDLEventForNewTableDDL(rawEvent, nil, 0)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.ElementsMatch(t, []int64{common.DDLSpanTableID, 111, 112}, ddlEvent.BlockedTables.TableIDs)
+}
+
+func TestUpdateDDLHistoryForAddDropTable_CreateTableLikeAddsReferTable(t *testing.T) {
+	args := updateDDLHistoryFuncArgs{
+		ddlEvent: &PersistedDDLEvent{
+			Type:         byte(model.ActionCreateTable),
+			TableID:      200,
+			ExtraTableID: 101,
+			FinishedTs:   10,
+			TableInfo:    &model.TableInfo{},
+		},
+		tablesDDLHistory:       map[int64][]uint64{},
+		tableTriggerDDLHistory: []uint64{},
+	}
+	updateDDLHistoryForAddDropTable(args)
+	require.Equal(t, []uint64{10}, args.tablesDDLHistory[200])
+	require.Equal(t, []uint64{10}, args.tablesDDLHistory[101])
+
+	args.ddlEvent.ReferTablePartitionIDs = []int64{111, 112}
+	args.tablesDDLHistory = map[int64][]uint64{}
+	args.tableTriggerDDLHistory = []uint64{}
+	updateDDLHistoryForAddDropTable(args)
+	require.Equal(t, []uint64{10}, args.tablesDDLHistory[200])
+	require.Equal(t, []uint64{10}, args.tablesDDLHistory[111])
+	require.Equal(t, []uint64{10}, args.tablesDDLHistory[112])
+	require.Empty(t, args.tablesDDLHistory[101])
+}
+
+func TestExtractTableInfoFuncForSingleTableDDL_CreateTableLikeReferTableIgnored(t *testing.T) {
+	rawEvent := &PersistedDDLEvent{
+		Type:         byte(model.ActionCreateTable),
+		TableID:      140,
+		ExtraTableID: 138,
+		Query:        "CREATE TABLE `b` LIKE `a`",
+	}
+
+	require.NotPanics(t, func() {
+		tableInfo, deleted := extractTableInfoFuncForSingleTableDDL(rawEvent, 138)
+		require.Nil(t, tableInfo)
+		require.False(t, deleted)
+	})
+
+	rawEvent.ReferTablePartitionIDs = []int64{111, 112}
+	require.NotPanics(t, func() {
+		tableInfo, deleted := extractTableInfoFuncForSingleTableDDL(rawEvent, 111)
+		require.Nil(t, tableInfo)
+		require.False(t, deleted)
+	})
+	require.NotPanics(t, func() {
+		tableInfo, deleted := extractTableInfoFuncForSingleTableDDL(rawEvent, 112)
+		require.Nil(t, tableInfo)
+		require.False(t, deleted)
+	})
 }

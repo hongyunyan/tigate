@@ -20,17 +20,16 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	commonType "github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/common/event"
+	"github.com/pingcap/ticdc/pkg/config"
+	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/sink/codec/common"
 	timodel "github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
-	"github.com/pingcap/tiflow/pkg/config"
-	cerror "github.com/pingcap/tiflow/pkg/errors"
 )
 
 // a csv row should at least contain operation-type, table-name, schema-name and one table column
@@ -101,7 +100,8 @@ func newCSVMessage(config *common.Config) *csvMessage {
 // Col2: Table name, the name of the source table.
 // Col3: Schema name, the name of the source schema.
 // Col4: Commit TS, the commit-ts of the source txn (optional).
-// Col5-n: one or more columns that represent the data to be changed.
+// Column 5: The is-update column only exists when the value of output-old-value is true.(optional)
+// Col6-n: one or more columns that represent the data to be changed.
 func (c *csvMessage) encode() []byte {
 	strBuilder := new(strings.Builder)
 	if c.opType == operationUpdate && c.config.OutputOldValue && len(c.preColumns) != 0 {
@@ -117,7 +117,7 @@ func (c *csvMessage) encode() []byte {
 		c.encodeMeta(c.opType.String(), strBuilder)
 		c.encodeColumns(c.columns, strBuilder)
 	}
-	return []byte(strBuilder.String())
+	return common.UnsafeStringToBytes(strBuilder.String())
 }
 
 func (c *csvMessage) encodeMeta(opType string, b *strings.Builder) {
@@ -152,13 +152,13 @@ func (c *csvMessage) encodeColumns(columns []any, b *strings.Builder) {
 func (c *csvMessage) decode(datums []types.Datum) error {
 	var dataColIdx int
 	if len(datums) < minimumColsCnt {
-		return cerror.WrapError(cerror.ErrCSVDecodeFailed,
+		return errors.WrapError(errors.ErrCSVDecodeFailed,
 			errors.New("the csv row should have at least four columns"+
 				"(operation-type, table-name, schema-name, commit-ts)"))
 	}
 
 	if err := c.opType.FromString(datums[0].GetString()); err != nil {
-		return cerror.WrapError(cerror.ErrCSVDecodeFailed, err)
+		return errors.WrapError(errors.ErrCSVDecodeFailed, err)
 	}
 	dataColIdx++
 	c.tableName = datums[1].GetString()
@@ -168,7 +168,7 @@ func (c *csvMessage) decode(datums []types.Datum) error {
 	if c.config.IncludeCommitTs {
 		commitTs, err := strconv.ParseUint(datums[3].GetString(), 10, 64)
 		if err != nil {
-			return cerror.WrapError(cerror.ErrCSVDecodeFailed,
+			return errors.WrapError(errors.ErrCSVDecodeFailed,
 				fmt.Errorf("the 4th column(%s) of csv row should be a valid commit-ts", datums[3].GetString()))
 		}
 		c.commitTs = commitTs
@@ -275,7 +275,7 @@ func (c *csvMessage) formatValue(value any, strBuilder *strings.Builder) {
 }
 
 // fromColValToCsvVal converts column from TiDB type to csv type.
-func fromColValToCsvVal(csvConfig *common.Config, row *chunk.Row, idx int, colInfo *timodel.ColumnInfo, flag *commonType.ColumnFlagType) (any, error) {
+func fromColValToCsvVal(csvConfig *common.Config, row *chunk.Row, idx int, colInfo *timodel.ColumnInfo, flag uint) (any, error) {
 	if row.IsNull(idx) {
 		return nil, nil
 	}
@@ -283,7 +283,7 @@ func fromColValToCsvVal(csvConfig *common.Config, row *chunk.Row, idx int, colIn
 	switch colInfo.GetType() {
 	case mysql.TypeVarchar, mysql.TypeString, mysql.TypeVarString, mysql.TypeTinyBlob,
 		mysql.TypeMediumBlob, mysql.TypeLongBlob, mysql.TypeBlob:
-		if flag.IsBinary() {
+		if mysql.HasBinaryFlag(flag) {
 			v := row.GetBytes(idx)
 			switch csvConfig.BinaryEncodingMethod {
 			case config.BinaryEncodingBase64:
@@ -291,7 +291,7 @@ func fromColValToCsvVal(csvConfig *common.Config, row *chunk.Row, idx int, colIn
 			case config.BinaryEncodingHex:
 				return hex.EncodeToString(v), nil
 			default:
-				return nil, cerror.WrapError(cerror.ErrCSVEncodeFailed,
+				return nil, errors.WrapError(errors.ErrCSVEncodeFailed,
 					errors.Errorf("unsupported binary encoding method %s",
 						csvConfig.BinaryEncodingMethod))
 			}
@@ -305,14 +305,14 @@ func fromColValToCsvVal(csvConfig *common.Config, row *chunk.Row, idx int, colIn
 		enumValue := row.GetEnum(idx).Value
 		enumVar, err := types.ParseEnumValue(colInfo.GetElems(), enumValue)
 		if err != nil {
-			return nil, cerror.WrapError(cerror.ErrCSVEncodeFailed, err)
+			return nil, errors.WrapError(errors.ErrCSVEncodeFailed, err)
 		}
 		return enumVar.Name, nil
 	case mysql.TypeSet:
 		bitValue := row.GetEnum(idx).Value
 		setVar, err := types.ParseSetValue(colInfo.GetElems(), bitValue)
 		if err != nil {
-			return nil, cerror.WrapError(cerror.ErrCSVEncodeFailed, err)
+			return nil, errors.WrapError(errors.ErrCSVEncodeFailed, err)
 		}
 		return setVar.Name, nil
 	case mysql.TypeBit:
@@ -367,7 +367,7 @@ func rowChangedEvent2CSVMsg(csvConfig *common.Config, e *event.RowEvent) (*csvMe
 		csvMsg.opType = operationUpdate
 		if csvConfig.OutputOldValue {
 			if e.GetPreRows().Len() != e.GetRows().Len() {
-				return nil, cerror.WrapError(cerror.ErrCSVDecodeFailed,
+				return nil, errors.WrapError(errors.ErrCSVDecodeFailed,
 					fmt.Errorf("the column length of preColumns %d doesn't equal to that of columns %d",
 						e.GetPreRows().Len(), e.GetRows().Len()))
 			}
@@ -389,12 +389,12 @@ func rowChangeColumns2CSVColumns(csvConfig *common.Config, row *chunk.Row, table
 
 	for i, col := range tableInfo.GetColumns() {
 		// column could be nil in a condition described in
-		// https://github.com/pingcap/tiflow/issues/6198#issuecomment-1191132951
-		if col == nil {
+		// https://github.com/pingcap/ticdc/issues/6198#issuecomment-1191132951
+		if col == nil || col.IsVirtualGenerated() {
 			continue
 		}
 
-		flag := tableInfo.GetColumnFlags()[col.ID]
+		flag := col.GetFlag()
 		converted, err := fromColValToCsvVal(csvConfig, row, i, col, flag)
 		if err != nil {
 			return nil, errors.Trace(err)
@@ -403,4 +403,33 @@ func rowChangeColumns2CSVColumns(csvConfig *common.Config, row *chunk.Row, table
 	}
 
 	return csvColumns, nil
+}
+
+// The header should contain the name corresponding to the file record field,
+// and should have the same number as the record field.
+// | ticdc-meta$operation | ticdc-meta$table | ticdc-meta$schema | ticdc-meta$commit-ts | ticdc-meta$is-update | col1 | col2 | ... |
+func encodeHeader(config *common.Config, colNames []string) []byte {
+	if !config.CSVOutputFieldHeader {
+		return nil
+	}
+	strBuilder := new(strings.Builder)
+	strBuilder.WriteString("ticdc-meta$operation")
+	strBuilder.WriteString(config.Delimiter)
+	strBuilder.WriteString("ticdc-meta$table")
+	strBuilder.WriteString(config.Delimiter)
+	strBuilder.WriteString("ticdc-meta$schema")
+	if config.IncludeCommitTs {
+		strBuilder.WriteString(config.Delimiter)
+		strBuilder.WriteString("ticdc-meta$commit-ts")
+	}
+	if config.OutputOldValue {
+		strBuilder.WriteString(config.Delimiter)
+		strBuilder.WriteString("ticdc-meta$is-update")
+	}
+	for _, name := range colNames {
+		strBuilder.WriteString(config.Delimiter)
+		strBuilder.WriteString(name)
+	}
+	strBuilder.WriteString(config.Terminator)
+	return common.UnsafeStringToBytes(strBuilder.String())
 }

@@ -27,11 +27,11 @@ import (
 // 4. manager gc safe point
 // 5. response for open API call
 type Coordinator interface {
-	AsyncStop()
+	Stop()
 	// Run handles messages
 	Run(ctx context.Context) error
-	// ListChangefeeds returns all changefeeds
-	ListChangefeeds(ctx context.Context) ([]*config.ChangeFeedInfo, []*config.ChangeFeedStatus, error)
+	// ListChangefeeds returns all changefeeds of keyspace
+	ListChangefeeds(ctx context.Context, keyspace string) ([]*config.ChangeFeedInfo, []*config.ChangeFeedStatus, error)
 	// GetChangefeed returns a changefeed
 	GetChangefeed(ctx context.Context, changefeedDisplayName common.ChangeFeedDisplayName) (*config.ChangeFeedInfo, *config.ChangeFeedStatus, error)
 	// CreateChangefeed creates a new changefeed
@@ -44,4 +44,9 @@ type Coordinator interface {
 	ResumeChangefeed(ctx context.Context, id common.ChangeFeedID, newCheckpointTs uint64, overwriteCheckpointTs bool) error
 	// UpdateChangefeed updates a changefeed
 	UpdateChangefeed(ctx context.Context, change *config.ChangeFeedInfo) error
+	// RequestResolvedTsFromLogCoordinator requests the log coordinator to report the resolved ts of the changefeed,
+	// and coordinator will update the changefeed status after receiving the resolved ts from log coordinator.
+	RequestResolvedTsFromLogCoordinator(ctx context.Context, changefeedDisplayName common.ChangeFeedDisplayName)
+
+	Initialized() bool
 }

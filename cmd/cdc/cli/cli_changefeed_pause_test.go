@@ -19,7 +19,7 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/tiflow/pkg/api/v2/mock"
+	"github.com/pingcap/ticdc/pkg/api/v2/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,13 +30,13 @@ func TestChangefeedPauseCli(t *testing.T) {
 	f := &mockFactory{changefeeds: cf}
 	cmd := newCmdPauseChangefeed(f)
 	cf.EXPECT().Pause(gomock.Any(), "default", "abc").Return(nil)
-	os.Args = []string{"pause", "--changefeed-id=abc", "--namespace=default"}
+	os.Args = []string{"pause", "--changefeed-id=abc", "--keyspace=default"}
 	require.Nil(t, cmd.Execute())
 
 	cf.EXPECT().Pause(gomock.Any(), "test", "abc").Return(errors.New("test"))
 	o := newPauseChangefeedOptions()
 	o.changefeedID = "abc"
-	o.namespace = "test"
+	o.keyspace = "test"
 	require.Nil(t, o.complete(f))
-	require.NotNil(t, o.run())
+	require.NotNil(t, o.run(cmd))
 }

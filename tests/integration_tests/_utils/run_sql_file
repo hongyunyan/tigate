@@ -7,6 +7,25 @@ set -eu
 
 prepare="set global tidb_enable_clustered_index = 'int_only';"
 
-echo "[$(date)] Executing SQL: $1" >"$OUT_DIR/sql_res.$TEST_NAME.txt"
-mysql -uroot -h$2 -P$3 --default-character-set utf8mb4 -E -e "${prepare}" >"$OUT_DIR/sql_res.$TEST_NAME.txt"
-mysql -uroot -h$2 -P$3 --default-character-set utf8mb4 -vv <"$1" >>"$OUT_DIR/sql_res.$TEST_NAME.txt"
+# Check if OUT_DIR contains TEST_NAME, if so, truncate OUT_DIR to the parent directory
+ADJUSTED_OUT_DIR="$OUT_DIR"
+if [ -n "$TEST_NAME" ] && [[ "$OUT_DIR" == *"/$TEST_NAME"* ]]; then
+	ADJUSTED_OUT_DIR="${OUT_DIR%/$TEST_NAME}"
+fi
+
+log_file="$ADJUSTED_OUT_DIR/$TEST_NAME/sql_res.$TEST_NAME.log"
+remainLogFile="$ADJUSTED_OUT_DIR/$TEST_NAME/sql_res.$TEST_NAME.remain.log"
+
+log_with_timestamp() {
+	# Clear the log file at the start of each command
+	while IFS= read -r line; do
+		echo "[$(date)] $line" >>"$remainLogFile"
+	done
+}
+
+echo "[$(date)] Executing SQL: $1" >"$log_file"
+echo "[$(date)] Executing SQL: $1" >>"$remainLogFile"
+
+mysql -uroot -h$2 -P$3 --default-character-set utf8mb4 -E -e "${prepare}" 2>&1 | tee "$log_file" | log_with_timestamp
+
+mysql -uroot -h$2 -P$3 --default-character-set utf8mb4 -vv <"$1" 2>&1 | tee "$log_file" | log_with_timestamp

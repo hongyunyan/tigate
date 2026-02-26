@@ -24,10 +24,10 @@ import (
 	"github.com/pingcap/kvproto/pkg/cdcpb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/log"
+	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/security"
 	"github.com/pingcap/ticdc/pkg/util"
 	"github.com/pingcap/ticdc/pkg/version"
-	cerror "github.com/pingcap/tiflow/pkg/errors"
-	"github.com/pingcap/tiflow/pkg/security"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	grpcstatus "google.golang.org/grpc/status"
@@ -42,7 +42,7 @@ type regionFeedStates map[uint64]*regionFeedState
 type regionRequestWorker struct {
 	workerID uint64
 
-	client *SubscriptionClient
+	client *subscriptionClient
 
 	store *requestedStore
 
@@ -50,8 +50,8 @@ type regionRequestWorker struct {
 	// only in this way we can avoid to try to connect to an offline store infinitely.
 	preFetchForConnecting *regionInfo
 
-	// used to receive region requests from outside.
-	requestsCh chan regionInfo
+	// request cache with flow control
+	requestCache *requestCache
 
 	// all regions maintained by this worker.
 	requestedRegions struct {
@@ -63,16 +63,17 @@ type regionRequestWorker struct {
 
 func newRegionRequestWorker(
 	ctx context.Context,
-	client *SubscriptionClient,
+	client *subscriptionClient,
 	credential *security.Credential,
 	g *errgroup.Group,
 	store *requestedStore,
+	requestCacheSize int,
 ) *regionRequestWorker {
 	worker := &regionRequestWorker{
-		workerID:   workerIDGen.Add(1),
-		client:     client,
-		store:      store,
-		requestsCh: make(chan regionInfo, 256), // 256 is an arbitrary number.
+		workerID:     workerIDGen.Add(1),
+		client:       client,
+		store:        store,
+		requestCache: newRequestCache(requestCacheSize),
 	}
 	worker.requestedRegions.subscriptions = make(map[SubscriptionID]regionFeedStates)
 
@@ -80,19 +81,19 @@ func newRegionRequestWorker(
 		if worker.preFetchForConnecting != nil {
 			log.Panic("preFetchForConnecting should be nil",
 				zap.Uint64("workerID", worker.workerID),
-				zap.Uint64("storeID", store.storeID),
 				zap.String("addr", store.storeAddr))
 		}
 		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case region := <-worker.requestsCh:
-				if !region.isStopped() {
-					worker.preFetchForConnecting = new(regionInfo)
-					*worker.preFetchForConnecting = region
-					return nil
-				}
+			region, err := worker.requestCache.pop(ctx)
+			if err != nil {
+				return err
+			}
+			if !region.regionInfo.isStopped() {
+				worker.preFetchForConnecting = new(regionInfo)
+				*worker.preFetchForConnecting = region.regionInfo
+				return nil
+			} else {
+				continue
 			}
 		}
 	}
@@ -103,13 +104,12 @@ func newRegionRequestWorker(
 				return err
 			}
 			var regionErr error
-			if err := version.CheckStoreVersion(ctx, worker.client.pd, worker.store.storeID); err != nil {
+			if err := version.CheckStoreVersion(ctx, worker.client.pd); err != nil {
 				if errors.Cause(err) == context.Canceled {
 					return nil
 				}
 				log.Error("event feed check store version fails",
 					zap.Uint64("workerID", worker.workerID),
-					zap.Uint64("storeID", worker.store.storeID),
 					zap.String("addr", worker.store.storeAddr),
 					zap.Error(err))
 				if cerror.Is(err, cerror.ErrGetAllStoresFailed) {
@@ -127,8 +127,7 @@ func newRegionRequestWorker(
 				for _, state := range m {
 					state.markStopped(regionErr)
 					regionEvent := regionEvent{
-						state:  state,
-						worker: worker,
+						states: []*regionFeedState{state},
 					}
 					worker.client.pushRegionEventToDS(subID, regionEvent)
 				}
@@ -162,13 +161,11 @@ func (s *regionRequestWorker) run(ctx context.Context, credential *security.Cred
 
 	log.Info("region request worker going to create grpc stream",
 		zap.Uint64("workerID", s.workerID),
-		zap.Uint64("storeID", s.store.storeID),
 		zap.String("addr", s.store.storeAddr))
 
 	defer func() {
 		log.Info("region request worker exits",
 			zap.Uint64("workerID", s.workerID),
-			zap.Uint64("storeID", s.store.storeID),
 			zap.String("addr", s.store.storeAddr),
 			zap.Bool("canceled", canceled))
 	}()
@@ -178,9 +175,12 @@ func (s *regionRequestWorker) run(ctx context.Context, credential *security.Cred
 	if err != nil {
 		log.Warn("region request worker create grpc stream failed",
 			zap.Uint64("workerID", s.workerID),
-			zap.Uint64("storeID", s.store.storeID),
 			zap.String("addr", s.store.storeAddr),
 			zap.Error(err))
+		// Close the connection if it was partially created to prevent goroutine leaks
+		if conn != nil && conn.Conn != nil {
+			_ = conn.Conn.Close()
+		}
 		return isCanceled()
 	}
 	defer func() {
@@ -213,7 +213,6 @@ func (s *regionRequestWorker) receiveAndDispatchChangeEvents(conn *ConnAndClient
 		if err != nil {
 			log.Info("region request worker receive from grpc stream failed",
 				zap.Uint64("workerID", s.workerID),
-				zap.Uint64("storeID", s.store.storeID),
 				zap.String("addr", s.store.storeAddr),
 				zap.String("code", grpcstatus.Code(err).String()),
 				zap.Error(err))
@@ -238,8 +237,7 @@ func (s *regionRequestWorker) dispatchRegionChangeEvents(events []*cdcpb.Event) 
 		state := s.getRegionState(subscriptionID, regionID)
 		if state != nil {
 			regionEvent := regionEvent{
-				state:  state,
-				worker: s,
+				states: []*regionFeedState{state},
 			}
 			switch eventData := event.Event.(type) {
 			case *cdcpb.Event_Entries_:
@@ -259,7 +257,6 @@ func (s *regionRequestWorker) dispatchRegionChangeEvents(events []*cdcpb.Event) 
 					zap.Uint64("workerID", s.workerID),
 					zap.Uint64("subscriptionID", uint64(subscriptionID)),
 					zap.Uint64("regionID", event.RegionId),
-					zap.Bool("stateIsNil", state == nil),
 					zap.Any("error", eventData.Error))
 				state.markStopped(&eventError{err: eventData.Error})
 			case *cdcpb.Event_ResolvedTs:
@@ -301,21 +298,25 @@ func (s *regionRequestWorker) dispatchResolvedTsEvent(resolvedTsEvent *cdcpb.Res
 			zap.Any("regionIDs", resolvedTsEvent.Regions))
 		return
 	}
+	resolvedStates := make([]*regionFeedState, 0, len(resolvedTsEvent.Regions))
 	for _, regionID := range resolvedTsEvent.Regions {
 		if state := s.getRegionState(subscriptionID, regionID); state != nil {
-			s.client.pushRegionEventToDS(SubscriptionID(resolvedTsEvent.RequestId), regionEvent{
-				state:      state,
-				worker:     s,
-				resolvedTs: resolvedTsEvent.Ts,
-			})
-		} else {
-			log.Warn("region request worker receives a resolved ts event for an untracked region",
-				zap.Uint64("workerID", s.workerID),
-				zap.Uint64("subscriptionID", uint64(subscriptionID)),
-				zap.Uint64("regionID", regionID),
-				zap.Uint64("resolvedTs", resolvedTsEvent.Ts))
+			resolvedStates = append(resolvedStates, state)
+			continue
 		}
+		log.Warn("region request worker receives a resolved ts event for an untracked region",
+			zap.Uint64("workerID", s.workerID),
+			zap.Uint64("subscriptionID", uint64(subscriptionID)),
+			zap.Uint64("regionID", regionID),
+			zap.Uint64("resolvedTs", resolvedTsEvent.Ts))
 	}
+	if len(resolvedStates) == 0 {
+		return
+	}
+	s.client.pushRegionEventToDS(subscriptionID, regionEvent{
+		resolvedTs: resolvedTsEvent.Ts,
+		states:     resolvedStates,
+	})
 }
 
 // processRegionSendTask receives region requests from the channel and sends them to the remote store.
@@ -329,7 +330,6 @@ func (s *regionRequestWorker) processRegionSendTask(
 				zap.Uint64("workerID", s.workerID),
 				zap.Uint64("subscriptionID", req.RequestId),
 				zap.Uint64("regionID", req.RegionId),
-				zap.Uint64("storeID", s.store.storeID),
 				zap.String("addr", s.store.storeAddr),
 				zap.Error(err))
 			return errors.Trace(err)
@@ -338,37 +338,41 @@ func (s *regionRequestWorker) processRegionSendTask(
 		return nil
 	}
 
-	fetchMoreReq := func() (regionInfo, error) {
+	fetchMoreReq := func() (regionReq, error) {
 		for {
-			var region regionInfo
-			select {
-			case <-ctx.Done():
-				return region, ctx.Err()
-			case region = <-s.requestsCh:
-				return region, nil
+			// Try to get from cache
+			if req, err := s.requestCache.pop(ctx); err != nil {
+				return regionReq{}, err
+			} else {
+				return req, nil
 			}
 		}
 	}
 
+	// Handle pre-fetched region first
 	region := *s.preFetchForConnecting
 	s.preFetchForConnecting = nil
+	regionReq := newRegionReq(region)
+	var err error
 	for {
-		// TODO: can region be nil?
+		region := regionReq.regionInfo
 		subID := region.subscribedSpan.subID
 		log.Debug("region request worker gets a singleRegionInfo",
 			zap.Uint64("workerID", s.workerID),
 			zap.Uint64("subscriptionID", uint64(subID)),
 			zap.Uint64("regionID", region.verID.GetID()),
-			zap.Uint64("storeID", s.store.storeID),
-			zap.String("addr", s.store.storeAddr))
+			zap.String("addr", s.store.storeAddr),
+			zap.Bool("bdrMode", region.filterLoop))
 
 		// It means it's a special task for stopping the table.
 		if region.isStopped() {
 			req := &cdcpb.ChangeDataRequest{
+				Header:    &cdcpb.Header{ClusterId: s.client.clusterID, TicdcVersion: version.ReleaseSemver()},
 				RequestId: uint64(subID),
 				Request: &cdcpb.ChangeDataRequest_Deregister_{
 					Deregister: &cdcpb.ChangeDataRequest_Deregister{},
 				},
+				FilterLoop: region.filterLoop,
 			}
 			if err := doSend(req); err != nil {
 				return err
@@ -376,28 +380,27 @@ func (s *regionRequestWorker) processRegionSendTask(
 			for _, state := range s.takeRegionStates(subID) {
 				state.markStopped(&requestCancelledErr{})
 				regionEvent := regionEvent{
-					state:  state,
-					worker: s,
+					states: []*regionFeedState{state},
 				}
 				s.client.pushRegionEventToDS(subID, regionEvent)
 			}
+
 		} else if region.subscribedSpan.stopped.Load() {
 			// It can be skipped directly because there must be no pending states from
 			// the stopped subscribedTable, or the special singleRegionInfo for stopping
 			// the table will be handled later.
 			s.client.onRegionFail(newRegionErrorInfo(region, &sendRequestToStoreErr{}))
 		} else {
-			state := newRegionFeedState(region, uint64(subID))
+			state := newRegionFeedState(region, uint64(subID), s)
 			state.start()
 			s.addRegionState(subID, region.verID.GetID(), state)
-
 			if err := doSend(s.createRegionRequest(region)); err != nil {
 				return err
 			}
+			s.requestCache.markSent(regionReq)
 		}
-
-		var err error
-		if region, err = fetchMoreReq(); err != nil {
+		regionReq, err = fetchMoreReq()
+		if err != nil {
 			return err
 		}
 	}
@@ -413,7 +416,7 @@ func (s *regionRequestWorker) createRegionRequest(region regionInfo) *cdcpb.Chan
 		StartKey:     region.span.StartKey,
 		EndKey:       region.span.EndKey,
 		ExtraOp:      kvrpcpb.ExtraOp_ReadOldValue,
-		FilterLoop:   s.client.filterLoop,
+		FilterLoop:   region.filterLoop,
 	}
 }
 
@@ -425,6 +428,7 @@ func (s *regionRequestWorker) addRegionState(subscriptionID SubscriptionID, regi
 		states = make(regionFeedStates)
 		s.requestedRegions.subscriptions[subscriptionID] = states
 	}
+
 	states[regionID] = state
 }
 
@@ -467,16 +471,24 @@ func (s *regionRequestWorker) clearRegionStates() map[SubscriptionID]regionFeedS
 	return subscriptions
 }
 
+// add adds a region request to the worker's cache
+// It blocks if the cache is full until there's space or ctx is cancelled
+func (s *regionRequestWorker) add(ctx context.Context, region regionInfo, force bool) (bool, error) {
+	return s.requestCache.add(ctx, region, force)
+}
+
 func (s *regionRequestWorker) clearPendingRegions() []regionInfo {
-	regions := make([]regionInfo, 0, len(s.requestsCh))
+	var regions []regionInfo
+
+	// Clear pre-fetched region
 	if s.preFetchForConnecting != nil {
 		region := *s.preFetchForConnecting
 		s.preFetchForConnecting = nil
 		regions = append(regions, region)
 	}
-	// TODO: do we need to start with i := 0(i := len(regions)) if s.preFetchForConnecting is nil?
-	for i := 1; i < cap(regions); i++ {
-		regions = append(regions, <-s.requestsCh)
-	}
+
+	// Clear all regions from cache
+	cacheRegions := s.requestCache.clear()
+	regions = append(regions, cacheRegions...)
 	return regions
 }

@@ -74,9 +74,12 @@ export -f check_safepoint_equal
 export -f clear_gc_worker_safepoint
 
 function run() {
+	if [ "$NEXT_GEN" = 1 ]; then
+		exit 0
+	fi
+
 	rm -rf $WORK_DIR && mkdir -p $WORK_DIR
 	start_tidb_cluster --workdir $WORK_DIR
-	cd $WORK_DIR
 
 	pd_addr="http://$UP_PD_HOST_1:$UP_PD_PORT_1"
 	TOPIC_NAME="ticdc-gc-safepoint-$RANDOM"
@@ -89,11 +92,11 @@ function run() {
 		;;
 	*) SINK_URI="mysql://normal:123456@127.0.0.1:3306/?max-txn-row=1" ;;
 	esac
-	# set gc safepoint update interval to 500ms to speed up the test, the default is 1 minute.
-	export GO_FAILPOINTS='github.com/pingcap/ticdc/pkg/txnutil/gc/InjectGcSafepointUpdateInterval=return(100)'
-	export GO_FAILPOINTS='github.com/pingcap/ticdc/coordinator/InjectUpdateGCTickerInterval=return(100)'
+	# Speed up the coordinator GC tick interval to make the test finish quickly.
+	# The test checks GC safepoint changes within seconds (see check_safepoint_forward / check_safepoint_equal).
+	export GO_FAILPOINTS='github.com/pingcap/ticdc/coordinator/InjectUpdateGCTickerInterval=return(5)'
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --addr "127.0.0.1:8300" --pd $pd_addr
-	changefeed_id=$(cdc cli changefeed create --pd=$pd_addr --sink-uri="$SINK_URI" 2>&1 | tail -n2 | head -n1 | awk '{print $2}')
+	changefeed_id=$(cdc_cli_changefeed create --pd=$pd_addr --sink-uri="$SINK_URI" | grep '^ID:' | head -n1 | awk '{print $2}')
 	case $SINK_TYPE in
 	kafka) run_kafka_consumer $WORK_DIR "kafka://127.0.0.1:9092/$TOPIC_NAME?protocol=open-protocol&partition-num=4&version=${KAFKA_VERSION}&max-message-bytes=10485760" ;;
 	storage) run_storage_consumer $WORK_DIR $SINK_URI "" "" ;;
@@ -112,37 +115,37 @@ function run() {
 	ensure $MAX_RETRIES check_safepoint_forward $pd_addr $pd_cluster_id $start_safepoint
 
 	# after the changefeed is paused, the safe_point will be not updated
-	cdc cli changefeed pause --changefeed-id=$changefeed_id --pd=$pd_addr
+	cdc_cli_changefeed pause --changefeed-id=$changefeed_id --pd=$pd_addr
 	ensure $MAX_RETRIES check_changefeed_state $pd_addr $changefeed_id "stopped" "null" ""
 	ensure $MAX_RETRIES check_safepoint_equal $pd_addr $pd_cluster_id
 
 	# resume changefeed will recover the safe_point forward
-	cdc cli changefeed resume --changefeed-id=$changefeed_id --pd=$pd_addr
+	cdc_cli_changefeed resume --changefeed-id=$changefeed_id --pd=$pd_addr
 	ensure $MAX_RETRIES check_changefeed_state $pd_addr $changefeed_id "normal" "null" ""
 	start_safepoint=$(get_safepoint $pd_addr $pd_cluster_id)
 	ensure $MAX_RETRIES check_safepoint_forward $pd_addr $pd_cluster_id $start_safepoint
 
-	cdc cli changefeed pause --changefeed-id=$changefeed_id --pd=$pd_addr
+	cdc_cli_changefeed pause --changefeed-id=$changefeed_id --pd=$pd_addr
 	ensure $MAX_RETRIES check_changefeed_state $pd_addr $changefeed_id "stopped" "null" ""
 	# create another changefeed, because there exists a paused changefeed,
 	# the safe_point still does not forward
-	changefeed_id2=$(cdc cli changefeed create --pd=$pd_addr --sink-uri="$SINK_URI" 2>&1 | tail -n2 | head -n1 | awk '{print $2}')
+	changefeed_id2=$(cdc_cli_changefeed create --pd=$pd_addr --sink-uri="$SINK_URI" | grep '^ID:' | head -n1 | awk '{print $2}')
 	ensure $MAX_RETRIES check_changefeed_state $pd_addr $changefeed_id2 "normal" "null" ""
 	ensure $MAX_RETRIES check_safepoint_equal $pd_addr $pd_cluster_id
 
 	# remove paused changefeed, the safe_point forward will recover
-	cdc cli changefeed remove --changefeed-id=$changefeed_id --pd=$pd_addr
+	cdc_cli_changefeed remove --changefeed-id=$changefeed_id --pd=$pd_addr
 	start_safepoint=$(get_safepoint $pd_addr $pd_cluster_id)
 	ensure $MAX_RETRIES check_safepoint_forward $pd_addr $pd_cluster_id $start_safepoint
 
 	# remove all changefeeds, the safe_point will be cleared
-	cdc cli changefeed remove --changefeed-id=$changefeed_id2 --pd=$pd_addr
+	cdc_cli_changefeed remove --changefeed-id=$changefeed_id2 --pd=$pd_addr
 	ensure $MAX_RETRIES check_safepoint_cleared $pd_addr $pd_cluster_id
 
 	cleanup_process $CDC_BINARY
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 run $*
 check_logs $WORK_DIR
 echo "[$(date)] <<<<<< run test case $TEST_NAME success! >>>>>>"

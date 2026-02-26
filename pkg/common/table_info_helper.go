@@ -17,6 +17,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 
@@ -32,18 +34,18 @@ import (
 // hash representation for columnSchema of TableInfo
 // Considering sha-256 output is 32 bytes, we use 4 uint64 to represent the hash value.
 type Digest struct {
-	a uint64
-	b uint64
-	c uint64
-	d uint64
+	A uint64 `json:"a"`
+	B uint64 `json:"b"`
+	C uint64 `json:"c"`
+	D uint64 `json:"d"`
 }
 
 func ToDigest(b []byte) Digest {
 	return Digest{
-		a: binary.BigEndian.Uint64(b[0:8]),
-		b: binary.BigEndian.Uint64(b[8:16]),
-		c: binary.BigEndian.Uint64(b[16:24]),
-		d: binary.BigEndian.Uint64(b[24:32]),
+		A: binary.BigEndian.Uint64(b[0:8]),
+		B: binary.BigEndian.Uint64(b[8:16]),
+		C: binary.BigEndian.Uint64(b[16:24]),
+		D: binary.BigEndian.Uint64(b[24:32]),
 	}
 }
 
@@ -68,6 +70,10 @@ func hashTableInfo(tableInfo *model.TableInfo) Digest {
 		sha256Hasher.Write(buf)
 		// column name
 		sha256Hasher.Write([]byte(col.Name.O))
+		// state
+		// Column state affects the visible schema during DDL.
+		binary.BigEndian.PutUint64(buf, uint64(col.State))
+		sha256Hasher.Write(buf)
 		// column type
 		columnType := col.FieldType
 		sha256Hasher.Write([]byte{columnType.GetType()})
@@ -90,19 +96,39 @@ func hashTableInfo(tableInfo *model.TableInfo) Digest {
 		}
 		binary.BigEndian.PutUint64(buf, uint64(boolToInt(columnType.IsArray())))
 		sha256Hasher.Write(buf)
+
+		binary.BigEndian.PutUint64(buf, uint64(boolToInt(col.DefaultIsExpr)))
+		sha256Hasher.Write(buf)
+		binary.BigEndian.PutUint64(buf, uint64(boolToInt(col.GeneratedStored)))
+		sha256Hasher.Write(buf)
+		binary.BigEndian.PutUint64(buf, uint64(boolToInt(col.Hidden)))
+		sha256Hasher.Write(buf)
+		binary.BigEndian.PutUint64(buf, col.Version)
+		sha256Hasher.Write(buf)
 	}
 	// idx info
 	sha256Hasher.Write([]byte("idxInfo"))
 	binary.BigEndian.PutUint64(buf, uint64(len(tableInfo.Indices)))
+	sha256Hasher.Write(buf)
 	for _, idx := range tableInfo.Indices {
 		// ID
 		binary.BigEndian.PutUint64(buf, uint64(idx.ID))
+		sha256Hasher.Write(buf)
+		// name
+		sha256Hasher.Write([]byte(idx.Name.O))
+		// state
+		// Index state affects how downstream chooses usable keys during DDL.
+		binary.BigEndian.PutUint64(buf, uint64(idx.State))
 		sha256Hasher.Write(buf)
 		// columns offset
 		binary.BigEndian.PutUint64(buf, uint64(len(idx.Columns)))
 		sha256Hasher.Write(buf)
 		for _, col := range idx.Columns {
 			binary.BigEndian.PutUint64(buf, uint64(col.Offset))
+			sha256Hasher.Write(buf)
+			// Prefix length changes handle decode behavior for clustered primary key.
+			// Include the length to prevent sharing schema across incompatible tables.
+			binary.BigEndian.PutUint64(buf, uint64(col.Length))
 			sha256Hasher.Write(buf)
 		}
 		// unique
@@ -112,6 +138,13 @@ func hashTableInfo(tableInfo *model.TableInfo) Digest {
 		binary.BigEndian.PutUint64(buf, uint64(boolToInt(idx.Primary)))
 		sha256Hasher.Write(buf)
 	}
+	// Handle-related flags affect how rows are decoded and how handle keys are built.
+	// Include them in the hash to avoid incorrectly sharing schemas across tables.
+	sha256Hasher.Write([]byte("handleFlags"))
+	binary.BigEndian.PutUint64(buf, uint64(boolToInt(tableInfo.PKIsHandle)))
+	sha256Hasher.Write(buf)
+	binary.BigEndian.PutUint64(buf, uint64(boolToInt(tableInfo.IsCommonHandle)))
+	sha256Hasher.Write(buf)
 	hash := sha256Hasher.Sum(nil)
 	return ToDigest(hash)
 }
@@ -156,7 +189,13 @@ type SharedColumnSchemaStorage struct {
 	mutex sync.Mutex
 }
 
-func (s *columnSchema) sameColumnsAndIndices(columns []*model.ColumnInfo, indices []*model.IndexInfo) bool {
+func (s *columnSchema) sameColumnsAndIndices(columns []*model.ColumnInfo, indices []*model.IndexInfo, pkIsHandle bool, isCommonHandle bool) bool {
+	// Handle-related flags affect how rows are decoded and how handle keys are built.
+	// They must be part of schema equality.
+	if s.PKIsHandle != pkIsHandle || s.IsCommonHandle != isCommonHandle {
+		return false
+	}
+
 	if len(s.Columns) != len(columns) {
 		return false
 	}
@@ -168,7 +207,33 @@ func (s *columnSchema) sameColumnsAndIndices(columns []*model.ColumnInfo, indice
 		if !col.FieldType.Equal(&columns[i].FieldType) {
 			return false
 		}
+		if col.State != columns[i].State {
+			return false
+		}
 		if col.ID != columns[i].ID {
+			return false
+		}
+		if !reflect.DeepEqual(col.GetDefaultValue(), columns[i].GetDefaultValue()) {
+			return false
+		}
+
+		if !reflect.DeepEqual(col.GetOriginDefaultValue(), columns[i].GetOriginDefaultValue()) {
+			return false
+		}
+
+		if col.DefaultIsExpr != columns[i].DefaultIsExpr {
+			return false
+		}
+		if col.GeneratedStored != columns[i].GeneratedStored {
+			return false
+		}
+		if col.Hidden != columns[i].Hidden {
+			return false
+		}
+		if col.GeneratedExprString != columns[i].GeneratedExprString {
+			return false
+		}
+		if col.Version != columns[i].Version {
 			return false
 		}
 	}
@@ -181,11 +246,22 @@ func (s *columnSchema) sameColumnsAndIndices(columns []*model.ColumnInfo, indice
 		if idx.ID != indices[i].ID {
 			return false
 		}
+		if idx.Name.O != indices[i].Name.O {
+			return false
+		}
+		if idx.State != indices[i].State {
+			return false
+		}
 		if len(idx.Columns) != len(indices[i].Columns) {
 			return false
 		}
 		for j, col := range idx.Columns {
 			if col.Offset != indices[i].Columns[j].Offset {
+				return false
+			}
+			// Prefix length affects whether a primary key column is partially indexed.
+			// This directly impacts handle decoding and must be part of schema equality.
+			if col.Length != indices[i].Columns[j].Length {
 				return false
 			}
 		}
@@ -200,12 +276,12 @@ func (s *columnSchema) sameColumnsAndIndices(columns []*model.ColumnInfo, indice
 }
 
 func (s *columnSchema) SameWithTableInfo(tableInfo *model.TableInfo) bool {
-	return s.sameColumnsAndIndices(tableInfo.Columns, tableInfo.Indices)
+	return s.sameColumnsAndIndices(tableInfo.Columns, tableInfo.Indices, tableInfo.PKIsHandle, tableInfo.IsCommonHandle)
 }
 
 // compare the item calculated in hashTableInfo
 func (s *columnSchema) equal(columnSchema *columnSchema) bool {
-	return s.sameColumnsAndIndices(columnSchema.Columns, columnSchema.Indices)
+	return s.sameColumnsAndIndices(columnSchema.Columns, columnSchema.Indices, columnSchema.PKIsHandle, columnSchema.IsCommonHandle)
 }
 
 func (s *SharedColumnSchemaStorage) incColumnSchemaCount(columnSchema *columnSchema) {
@@ -243,6 +319,7 @@ func (s *SharedColumnSchemaStorage) GetOrSetColumnSchema(tableInfo *model.TableI
 	if !ok {
 		// generate Column Schema
 		columnSchema := newColumnSchema(tableInfo, digest)
+		SharedColumnSchemaCountGauge.Inc()
 		s.m[digest] = make([]ColumnSchemaWithCount, 1)
 		s.m[digest][0] = *NewColumnSchemaWithCount(columnSchema)
 		return columnSchema
@@ -256,6 +333,7 @@ func (s *SharedColumnSchemaStorage) GetOrSetColumnSchema(tableInfo *model.TableI
 		}
 		// not found the same column info, create a new one
 		columnSchema := newColumnSchema(tableInfo, digest)
+		SharedColumnSchemaCountGauge.Inc()
 		s.m[digest] = append(s.m[digest], *NewColumnSchemaWithCount(columnSchema))
 		return columnSchema
 	}
@@ -309,7 +387,7 @@ func (s *SharedColumnSchemaStorage) tryReleaseColumnSchema(columnSchema *columnS
 			if s.m[columnSchema.Digest][idx].count == 0 {
 				// release the columnSchema object
 				SharedColumnSchemaCountGauge.Dec()
-				s.m[columnSchema.Digest] = append(s.m[columnSchema.Digest][:idx], s.m[columnSchema.Digest][idx+1:]...)
+				s.m[columnSchema.Digest] = slices.Delete(s.m[columnSchema.Digest], idx, idx+1)
 				if len(s.m[columnSchema.Digest]) == 0 {
 					delete(s.m, columnSchema.Digest)
 				}
@@ -336,57 +414,50 @@ type columnSchema struct {
 	// IsCommonHandle is true when clustered index feature is
 	// enabled and the primary key is not a single integer column.
 	IsCommonHandle bool `json:"is_common_handle"`
-	// UpdateTS is used to record the timestamp of updating the table's schema information.
-	// These changing schema operations don't include 'truncate table' and 'rename table'.
-	UpdateTS uint64 `json:"update_timestamp"`
-
 	// rest fields are generated
 	// ColumnID -> offset in model.TableInfo.Columns
 	ColumnsOffset map[int64]int `json:"columns_offset"`
 	// Column name -> ColumnID
 	NameToColID map[string]int64 `json:"name_to_col_id"`
-
-	HasUniqueColumn bool `json:"has_unique_column"`
-
 	// ColumnID -> offset in RowChangedEvents.Columns.
 	RowColumnsOffset map[int64]int `json:"row_columns_offset"`
 
-	ColumnsFlag map[int64]*ColumnFlagType `json:"columns_flag"`
+	// HandleColIDs is only used for the new row format decoder, it's the same concept as the TiDB Handle.
+	// In the clustered index scenario, it contains the column ID of the primary key columns.
+	// In the non-clustered scenario, it should always be -1, to avoid be observed by the decoder.
+	HandleColID []int64 `json:"handle_col_id"`
 
-	// the mounter will choose this index to output delete events
-	// special value:
-	// HandleIndexPKIsHandle(-1) : pk is handle
-	// HandleIndexTableIneligible(-2) : the table is not eligible
-	HandleIndexID int64 `json:"handle_index_id"`
+	// TiCDC only replicates table has primary key or not null unique key.
+	// * If there is primary key, it's the handle key
+	// * Otherwise, it's the unique key. If there are multiple unique keys, it's the longest one.
+	// * If there are multiple unique key with the same length, it the first one.
+	HandleKeyIDs map[int64]struct{} `json:"handle_key_ids"`
+	// HandleKeyIDList store the colID list of the HandleKeyIDs in order.
+	HandleKeyIDList []int64 `json:"handle_key_id_list"`
 
-	// IndexColumnsOffset store the offset of the columns in row changed events for
+	// IndexColumns store the colID of the columns in row changed events for
 	// unique index and primary key
 	// The reason why we need this is that the Indexes in TableInfo
 	// will not contain the PK if it is create in statement like:
 	// create table t (a int primary key, b int unique key);
 	// Every element in first dimension is a index, and the second dimension is the columns offset
-	// for example:
-	// table has 3 columns: a, b, c
-	// pk: a
-	// index1: a, b
-	// index2: a, c
-	// indexColumnsOffset: [[0], [0, 1], [0, 2]]
-	IndexColumnsOffset [][]int `json:"index_columns_offset"`
-
-	PKIndexOffset []int `json:"pk_index_offset"`
-
+	IndexColumns [][]int64 `json:"index_columns"`
+	// PKIndex store the colID of the columns in row changed events for primary key
+	PKIndex []int64 `json:"pk_index"`
 	// The following 3 fields, should only be used to decode datum from the raw value bytes, do not abuse those field.
 	// RowColInfos extend the model.ColumnInfo with some extra information
 	// it's the same length and order with the model.TableInfo.Columns
 	RowColInfos    []rowcodec.ColInfo              `json:"row_col_infos"`
 	RowColFieldTps map[int64]*datumTypes.FieldType `json:"row_col_field_tps"`
-	// only for new row format decoder
-	HandleColID []int64 `json:"handle_col_id"`
 	// RowColFieldTpsSlice is used to decode chunk ∂ raw value bytes
 	RowColFieldTpsSlice []*datumTypes.FieldType `json:"row_col_field_tps_slice"`
 
-	// number of virtual columns
-	VirtualColumnCount int `json:"virtual_column_count"`
+	// offset of virtual columns in Columns
+	// for example:
+	// Table has 4 columns: a (physical), b (physical), c (virtual), d (virtual)
+	// TableInfo.Columns order: a, b, c, d
+	// VirtualColumnsOffset will be [2, 3] (indices of virtual columns c and d)
+	VirtualColumnsOffset []int `json:"virtual_columns_offset"`
 	// RowColInfosWithoutVirtualCols is the same as rowColInfos, but without virtual columns
 	RowColInfosWithoutVirtualCols *[]rowcodec.ColInfo `json:"row_col_infos_without_virtual_cols"`
 	// PreSQL is used to restore pre-calculated sqls for insert/update/delete.
@@ -417,6 +488,12 @@ func unmarshalJsonToColumnSchema(data []byte) (*columnSchema, error) {
 	return sharedColumnSchema, nil
 }
 
+// newColumnSchema4Decoder should only be used by the codec decoder for the test purpose,
+// do not call this method in the TiCDC code.
+func newColumnSchema4Decoder(tableInfo *model.TableInfo) *columnSchema {
+	return newColumnSchema(tableInfo, Digest{})
+}
+
 // make newColumnSchema as a private method, in order to avoid other method to directly create a columnSchema object.
 // we only want user to get columnSchema by GetOrSetColumnSchema or Clone method.
 func newColumnSchema(tableInfo *model.TableInfo, digest Digest) *columnSchema {
@@ -426,86 +503,63 @@ func newColumnSchema(tableInfo *model.TableInfo, digest Digest) *columnSchema {
 		Indices:          tableInfo.Indices,
 		PKIsHandle:       tableInfo.PKIsHandle,
 		IsCommonHandle:   tableInfo.IsCommonHandle,
-		UpdateTS:         tableInfo.UpdateTS,
-		HasUniqueColumn:  false,
 		ColumnsOffset:    make(map[int64]int, len(tableInfo.Columns)),
 		NameToColID:      make(map[string]int64, len(tableInfo.Columns)),
 		RowColumnsOffset: make(map[int64]int, len(tableInfo.Columns)),
-		ColumnsFlag:      make(map[int64]*ColumnFlagType, len(tableInfo.Columns)),
+		HandleKeyIDs:     make(map[int64]struct{}),
+		HandleKeyIDList:  make([]int64, 0),
 		HandleColID:      []int64{-1},
-		HandleIndexID:    HandleIndexTableIneligible,
 		RowColInfos:      make([]rowcodec.ColInfo, len(tableInfo.Columns)),
 		RowColFieldTps:   make(map[int64]*datumTypes.FieldType, len(tableInfo.Columns)),
-		PKIndexOffset:    make([]int, 0),
+		PKIndex:          make([]int64, 0),
 	}
 
 	rowColumnsCurrentOffset := 0
-
-	colSchema.VirtualColumnCount = 0
 	for i, col := range colSchema.Columns {
 		colSchema.ColumnsOffset[col.ID] = i
 		pkIsHandle := false
-		if IsColCDCVisible(col) {
+		isVisible := IsColCDCVisible(col)
+		if isVisible {
 			colSchema.NameToColID[col.Name.O] = col.ID
 			colSchema.RowColumnsOffset[col.ID] = rowColumnsCurrentOffset
 			rowColumnsCurrentOffset++
 			pkIsHandle = (tableInfo.PKIsHandle && mysql.HasPriKeyFlag(col.GetFlag())) || col.ID == model.ExtraHandleID
 			if pkIsHandle {
 				// pk is handle
+				colSchema.HandleKeyIDs[col.ID] = struct{}{}
 				colSchema.HandleColID = []int64{col.ID}
-				colSchema.HandleIndexID = HandleIndexPKIsHandle
-				colSchema.HasUniqueColumn = true
-				colSchema.IndexColumnsOffset = append(colSchema.IndexColumnsOffset, []int{colSchema.RowColumnsOffset[col.ID]})
-				colSchema.PKIndexOffset = []int{colSchema.RowColumnsOffset[col.ID]}
+				colSchema.HandleKeyIDList = append(colSchema.HandleKeyIDList, col.ID)
+				colSchema.IndexColumns = append(colSchema.IndexColumns, []int64{col.ID})
+				colSchema.PKIndex = []int64{col.ID}
 			} else if tableInfo.IsCommonHandle {
-				colSchema.HandleIndexID = HandleIndexPKIsHandle
+				clear(colSchema.HandleKeyIDs)
+				colSchema.HandleKeyIDList = colSchema.HandleKeyIDList[:0]
 				colSchema.HandleColID = colSchema.HandleColID[:0]
 				pkIdx := tables.FindPrimaryIndex(tableInfo)
 				for _, pkCol := range pkIdx.Columns {
 					id := tableInfo.Columns[pkCol.Offset].ID
+					colSchema.HandleKeyIDs[id] = struct{}{}
 					colSchema.HandleColID = append(colSchema.HandleColID, id)
+					colSchema.HandleKeyIDList = append(colSchema.HandleKeyIDList, id)
 				}
+
 			}
 		} else {
-			colSchema.VirtualColumnCount += 1
+			colSchema.VirtualColumnsOffset = append(colSchema.VirtualColumnsOffset, i)
 		}
 		colSchema.RowColInfos[i] = rowcodec.ColInfo{
 			ID:            col.ID,
 			IsPKHandle:    pkIsHandle,
 			Ft:            col.FieldType.Clone(),
-			VirtualGenCol: !IsColCDCVisible(col),
+			VirtualGenCol: !isVisible,
 		}
 		colSchema.RowColFieldTps[col.ID] = colSchema.RowColInfos[i].Ft
 		colSchema.RowColFieldTpsSlice = append(colSchema.RowColFieldTpsSlice, colSchema.RowColInfos[i].Ft)
 	}
 
-	for _, idx := range colSchema.Indices {
-		if colSchema.IsIndexUniqueAndNotNull(idx) {
-			colSchema.HasUniqueColumn = true
-		}
-		if idx.Primary || idx.Unique {
-			indexColOffset := make([]int, 0, len(idx.Columns))
-			for _, idxCol := range idx.Columns {
-				colInfo := colSchema.Columns[idxCol.Offset]
-				if IsColCDCVisible(colInfo) {
-					indexColOffset = append(indexColOffset, colSchema.RowColumnsOffset[colInfo.ID])
-				}
-			}
-			if len(indexColOffset) > 0 {
-				colSchema.IndexColumnsOffset = append(colSchema.IndexColumnsOffset, indexColOffset)
-				if idx.Primary {
-					colSchema.PKIndexOffset = indexColOffset
-				}
-			}
-		}
-	}
 	colSchema.initRowColInfosWithoutVirtualCols()
-	colSchema.findHandleIndex(tableInfo.Name.O)
-	colSchema.initColumnsFlag()
-
 	colSchema.InitPreSQLs(tableInfo.Name.O)
-
-	SharedColumnSchemaCountGauge.Inc()
+	colSchema.initIndexColumns()
 	return colSchema
 }
 
@@ -585,131 +639,96 @@ func (s *columnSchema) GetPrimaryKey() *model.IndexInfo {
 }
 
 func (s *columnSchema) initRowColInfosWithoutVirtualCols() {
-	if s.VirtualColumnCount == 0 {
+	if len(s.VirtualColumnsOffset) == 0 {
 		s.RowColInfosWithoutVirtualCols = &s.RowColInfos
 		return
 	}
-	colInfos := make([]rowcodec.ColInfo, 0, len(s.RowColInfos)-s.VirtualColumnCount)
+	colInfos := make([]rowcodec.ColInfo, 0, len(s.RowColInfos)-len(s.VirtualColumnsOffset))
 	for i, col := range s.Columns {
 		if IsColCDCVisible(col) {
 			colInfos = append(colInfos, s.RowColInfos[i])
 		}
 	}
-	if len(colInfos) != len(s.RowColInfos)-s.VirtualColumnCount {
+	if len(colInfos) != len(s.RowColInfos)-len(s.VirtualColumnsOffset) {
 		log.Panic("invalid rowColInfosWithoutVirtualCols",
 			zap.Int("len(colInfos)", len(colInfos)),
 			zap.Int("len(ti.rowColInfos)", len(s.RowColInfos)),
-			zap.Int("ti.virtualColumnCount", s.VirtualColumnCount))
+			zap.Ints("ti.VirtualColumnsOffset", s.VirtualColumnsOffset))
 	}
 	s.RowColInfosWithoutVirtualCols = &colInfos
 }
 
-func (s *columnSchema) findHandleIndex(tableName string) {
-	if s.HandleIndexID == HandleIndexPKIsHandle {
-		// pk is handle
+// The handleKey is chosen by the following rules in the order:
+// 1. if the table has primary key, it's the handle key.
+// 2. If the table has not null unique key, it's the handle key.
+// 3. If the table has no primary key and no not null unique key, it has no handleKey.
+func (s *columnSchema) initIndexColumns() {
+	handleIndexOffset := -1
+	hasPrimary := len(s.HandleKeyIDs) != 0
+	for i, idx := range s.Indices {
+		if idx.Primary {
+			// append index
+			indexColOffset := make([]int64, 0, len(idx.Columns))
+			for _, idxCol := range idx.Columns {
+				colInfo := s.Columns[idxCol.Offset]
+				if IsColCDCVisible(colInfo) {
+					indexColOffset = append(indexColOffset, colInfo.ID)
+				}
+			}
+			if len(indexColOffset) > 0 {
+				s.IndexColumns = append(s.IndexColumns, indexColOffset)
+				s.PKIndex = indexColOffset
+			}
+			// check handle key with primary key
+			if !hasPrimary {
+				for _, col := range idx.Columns {
+					s.HandleKeyIDs[s.Columns[col.Offset].ID] = struct{}{}
+					s.HandleKeyIDList = append(s.HandleKeyIDList, s.Columns[col.Offset].ID)
+				}
+				hasPrimary = true
+			}
+		} else if idx.Unique {
+			hasNotNullUK := true
+			// append index
+			indexColOffset := make([]int64, 0, len(idx.Columns))
+			for _, idxCol := range idx.Columns {
+				colInfo := s.Columns[idxCol.Offset]
+				indexColOffset = append(indexColOffset, colInfo.ID)
+				if !mysql.HasNotNullFlag(colInfo.GetFlag()) {
+					hasNotNullUK = false
+				}
+			}
+			if len(indexColOffset) > 0 {
+				s.IndexColumns = append(s.IndexColumns, indexColOffset)
+			}
+			// check handle key with not null unique key
+			if hasPrimary || !hasNotNullUK {
+				continue
+			}
+			if handleIndexOffset < 0 {
+				handleIndexOffset = i
+			} else {
+				if len(s.Indices[handleIndexOffset].Columns) > len(s.Indices[i].Columns) ||
+					(len(s.Indices[handleIndexOffset].Columns) == len(s.Indices[i].Columns) &&
+						s.Indices[handleIndexOffset].ID > s.Indices[i].ID) {
+					handleIndexOffset = i
+				}
+			}
+		}
+	}
+
+	// if no handle index or has primary key, return directly
+	if handleIndexOffset < 0 || hasPrimary {
 		return
 	}
-	handleIndexOffset := -1
-	for i, idx := range s.Indices {
-		if !s.IsIndexUniqueAndNotNull(idx) {
-			continue
-		}
-		if idx.Primary {
-			handleIndexOffset = i
-			break
-		}
-		if handleIndexOffset < 0 {
-			handleIndexOffset = i
-		} else {
-			if len(s.Indices[handleIndexOffset].Columns) > len(s.Indices[i].Columns) ||
-				(len(s.Indices[handleIndexOffset].Columns) == len(s.Indices[i].Columns) &&
-					s.Indices[handleIndexOffset].ID > s.Indices[i].ID) {
-				handleIndexOffset = i
-			}
-		}
-	}
-	if handleIndexOffset >= 0 {
-		log.Info("find handle index", zap.String("table", tableName), zap.String("index", s.Indices[handleIndexOffset].Name.O))
-		s.HandleIndexID = s.Indices[handleIndexOffset].ID
-	}
-}
 
-func (s *columnSchema) initColumnsFlag() {
-	for _, colInfo := range s.Columns {
-		var flag ColumnFlagType
-		if colInfo.GetCharset() == "binary" {
-			flag.SetIsBinary()
-		}
-		if colInfo.IsGenerated() {
-			flag.SetIsGeneratedColumn()
-		}
-		if mysql.HasPriKeyFlag(colInfo.GetFlag()) {
-			flag.SetIsPrimaryKey()
-			if s.HandleIndexID == HandleIndexPKIsHandle {
-				flag.SetIsHandleKey()
-			}
-		}
-		if mysql.HasUniKeyFlag(colInfo.GetFlag()) {
-			flag.SetIsUniqueKey()
-		}
-		if !mysql.HasNotNullFlag(colInfo.GetFlag()) {
-			flag.SetIsNullable()
-		}
-		if mysql.HasMultipleKeyFlag(colInfo.GetFlag()) {
-			flag.SetIsMultipleKey()
-		}
-		if mysql.HasUnsignedFlag(colInfo.GetFlag()) {
-			flag.SetIsUnsigned()
-		}
-		s.ColumnsFlag[colInfo.ID] = &flag
+	// only set handle key Ids with not null unique key when there is no primary key
+	selectCols := s.Indices[handleIndexOffset].Columns
+	for _, col := range selectCols {
+		colID := s.Columns[col.Offset].ID
+		s.HandleKeyIDs[colID] = struct{}{}
+		s.HandleKeyIDList = append(s.HandleKeyIDList, colID)
 	}
-
-	// In TiDB, just as in MySQL, only the first column of an index can be marked as "multiple key" or "unique key",
-	// and only the first column of a unique index may be marked as "unique key".
-	// See https://dev.mysql.com/doc/refman/5.7/en/show-columns.html.
-	// Yet if an index has multiple columns, we would like to easily determine that all those columns are indexed,
-	// which is crucial for the completeness of the information we pass to the downstream.
-	// Therefore, instead of using the MySQL standard,
-	// we made our own decision to mark all columns in an index with the appropriate flag(s).
-	for _, idxInfo := range s.Indices {
-		for _, idxCol := range idxInfo.Columns {
-			colInfo := s.Columns[idxCol.Offset]
-			flag := s.ColumnsFlag[colInfo.ID]
-			if idxInfo.Primary {
-				flag.SetIsPrimaryKey()
-			} else if idxInfo.Unique {
-				flag.SetIsUniqueKey()
-			}
-			if len(idxInfo.Columns) > 1 {
-				flag.SetIsMultipleKey()
-			}
-			if idxInfo.ID == s.HandleIndexID && s.HandleIndexID >= 0 {
-				flag.SetIsHandleKey()
-			}
-			s.ColumnsFlag[colInfo.ID] = flag
-		}
-	}
-}
-
-// IsIndexUnique returns whether the index is unique and all columns are not null
-func (s *columnSchema) IsIndexUniqueAndNotNull(indexInfo *model.IndexInfo) bool {
-	if indexInfo.Primary {
-		return true
-	}
-	if indexInfo.Unique {
-		for _, col := range indexInfo.Columns {
-			colInfo := s.Columns[col.Offset]
-			if !mysql.HasNotNullFlag(colInfo.GetFlag()) {
-				return false
-			}
-			// this column is a virtual generated column
-			if colInfo.IsGenerated() && !colInfo.GeneratedStored {
-				return false
-			}
-		}
-		return true
-	}
-	return false
 }
 
 // TryGetCommonPkColumnIds get the IDs of primary key column if the table has common handle.
@@ -759,12 +778,12 @@ func (s *columnSchema) InitPreSQLs(tableName string) {
 		return
 	}
 	s.PreSQLs = make(map[int]string)
-	s.PreSQLs[preSQLInsert] = s.genPreSQLInsert(false, true)
-	s.PreSQLs[preSQLReplace] = s.genPreSQLInsert(true, true)
+	s.PreSQLs[preSQLInsert] = s.genPreSQLInsert(false)
+	s.PreSQLs[preSQLReplace] = s.genPreSQLInsert(true)
 	s.PreSQLs[preSQLUpdate] = s.genPreSQLUpdate()
 }
 
-func (s *columnSchema) genPreSQLInsert(isReplace bool, needPlaceHolder bool) string {
+func (s *columnSchema) genPreSQLInsert(isReplace bool) string {
 	var builder strings.Builder
 
 	if isReplace {
@@ -777,11 +796,10 @@ func (s *columnSchema) genPreSQLInsert(isReplace bool, needPlaceHolder bool) str
 	builder.WriteString(columnList)
 	builder.WriteString(") VALUES ")
 
-	if needPlaceHolder {
-		builder.WriteString("(")
-		builder.WriteString(placeHolder(nonGeneratedColumnCount))
-		builder.WriteString(")")
-	}
+	builder.WriteString("(")
+	builder.WriteString(placeHolder(nonGeneratedColumnCount))
+	builder.WriteString(")")
+
 	return builder.String()
 }
 
@@ -812,63 +830,19 @@ func placeHolder(n int) string {
 func (s *columnSchema) getColumnList(isUpdate bool) (int, string) {
 	var b strings.Builder
 	nonGeneratedColumnCount := 0
-	for i, col := range s.Columns {
-		if col == nil || s.ColumnsFlag[col.ID].IsGeneratedColumn() {
+	for _, col := range s.Columns {
+		if col == nil || col.IsGenerated() {
 			continue
 		}
-		nonGeneratedColumnCount++
-		if i > 0 {
+		// the first column may be generated.
+		if nonGeneratedColumnCount > 0 {
 			b.WriteString(",")
 		}
 		b.WriteString(QuoteName(col.Name.O))
 		if isUpdate {
 			b.WriteString(" = ?")
 		}
+		nonGeneratedColumnCount++
 	}
 	return nonGeneratedColumnCount, b.String()
-}
-
-func (s *columnSchema) getColumnSchemaWithoutVirtualColumns() *columnSchema {
-	newColumnSchema := &columnSchema{
-		Digest:                        s.Digest,
-		Columns:                       s.Columns,
-		Indices:                       s.Indices,
-		PKIsHandle:                    s.PKIsHandle,
-		IsCommonHandle:                s.IsCommonHandle,
-		UpdateTS:                      s.UpdateTS,
-		ColumnsOffset:                 s.ColumnsOffset,
-		NameToColID:                   s.NameToColID,
-		HasUniqueColumn:               s.HasUniqueColumn,
-		RowColumnsOffset:              s.RowColumnsOffset,
-		ColumnsFlag:                   s.ColumnsFlag,
-		HandleIndexID:                 s.HandleIndexID,
-		IndexColumnsOffset:            s.IndexColumnsOffset,
-		RowColInfos:                   s.RowColInfos,
-		RowColFieldTps:                s.RowColFieldTps,
-		HandleColID:                   s.HandleColID,
-		RowColFieldTpsSlice:           s.RowColFieldTpsSlice,
-		VirtualColumnCount:            s.VirtualColumnCount,
-		RowColInfosWithoutVirtualCols: s.RowColInfosWithoutVirtualCols,
-		PreSQLs:                       s.PreSQLs,
-	}
-	newColumnSchema.Columns = make([]*model.ColumnInfo, 0, len(s.Columns))
-	rowColumnsCurrentOffset := 0
-	columnsOffset := make(map[string]int, len(newColumnSchema.Columns))
-	for _, srcCol := range newColumnSchema.Columns {
-		if !IsColCDCVisible(srcCol) {
-			continue
-		}
-		colInfo := srcCol.Clone()
-		colInfo.Offset = rowColumnsCurrentOffset
-		newColumnSchema.Columns = append(newColumnSchema.Columns, colInfo)
-		columnsOffset[colInfo.Name.O] = rowColumnsCurrentOffset
-		rowColumnsCurrentOffset += 1
-	}
-	// Keep all the index info even if it contains virtual columns for simplicity
-	for _, indexInfo := range newColumnSchema.Indices {
-		for _, col := range indexInfo.Columns {
-			col.Offset = columnsOffset[col.Name.O]
-		}
-	}
-	return newColumnSchema
 }

@@ -17,7 +17,8 @@ import (
 	"strings"
 
 	"github.com/pingcap/log"
-	"github.com/pingcap/tiflow/pkg/quotes"
+	"github.com/pingcap/ticdc/pkg/common"
+	"github.com/pingcap/ticdc/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -27,51 +28,6 @@ const (
 	// so we use 4 as the common index column count. It will be used to pre-allocate slice space.
 	CommonIndexColumnsCount = 4
 )
-
-// SameTypeTargetAndColumns check whether two row changes have same type, target
-// and columns, so they can be merged to a multi-value DML.
-func SameTypeTargetAndColumns(lhs *RowChange, rhs *RowChange) bool {
-	if lhs.tp != rhs.tp {
-		return false
-	}
-	if lhs.sourceTable.Schema == rhs.sourceTable.Schema &&
-		lhs.sourceTable.Table == rhs.sourceTable.Table {
-		return true
-	}
-	if lhs.targetTable.Schema != rhs.targetTable.Schema ||
-		lhs.targetTable.Table != rhs.targetTable.Table {
-		return false
-	}
-
-	// when the targets are the same and the sources are not the same (same
-	// group of shard tables), this piece of code is run.
-	var lhsCols, rhsCols []string
-	switch lhs.tp {
-	case RowChangeDelete:
-		lhsCols, _ = lhs.whereColumnsAndValues()
-		rhsCols, _ = rhs.whereColumnsAndValues()
-	case RowChangeUpdate:
-		// not supported yet
-		return false
-	case RowChangeInsert:
-		for _, col := range lhs.sourceTableInfo.GetColumns() {
-			lhsCols = append(lhsCols, col.Name.L)
-		}
-		for _, col := range rhs.sourceTableInfo.GetColumns() {
-			rhsCols = append(rhsCols, col.Name.L)
-		}
-	}
-
-	if len(lhsCols) != len(rhsCols) {
-		return false
-	}
-	for i := 0; i < len(lhsCols); i++ {
-		if lhsCols[i] != rhsCols[i] {
-			return false
-		}
-	}
-	return true
-}
 
 // GenDeleteSQL generates the DELETE SQL and its arguments.
 // Input `changes` should have same target table and same columns for WHERE
@@ -135,7 +91,7 @@ func GenUpdateSQL(changes ...*RowChange) (string, []any) {
 		whenCaseStmts[i] = whereBuf.String()
 	}
 
-	// Build gegerated columns lower name set to accelerate the following check
+	// Build generated columns lower name set to accelerate the following check
 	targetGeneratedColSet := generatedColumnsNameSet(first.targetTableInfo.GetColumns())
 
 	// Generate `ColumnName`=CASE WHEN .. THEN .. END
@@ -152,7 +108,7 @@ func GenUpdateSQL(changes ...*RowChange) (string, []any) {
 			buf.WriteString(", ")
 		}
 
-		buf.WriteString(quotes.QuoteName(column.Name.String()) + "=CASE")
+		buf.WriteString(common.QuoteName(column.Name.String()) + "=CASE")
 		for i := range changes {
 			buf.WriteString(" WHEN ")
 			buf.WriteString(whenCaseStmts[i])
@@ -197,7 +153,7 @@ func GenUpdateSQL(changes ...*RowChange) (string, []any) {
 			log.Panic("len(whereValues) != len(whereColumns)",
 				zap.Int("len(whereValues)", len(whereValues)),
 				zap.Int("len(whereColumns)", len(whereColumns)),
-				zap.Any("whereValues", whereValues),
+				zap.String("whereValues", util.RedactArgs(whereValues)),
 				zap.Stringer("sourceTable", change.sourceTable))
 		}
 
@@ -246,7 +202,7 @@ func GenInsertSQL(tp DMLType, changes ...*RowChange) (string, []interface{}) {
 	columnNum := 0
 	var skipColIdx []int
 
-	// build gegerated columns lower name set to accelerate the following check
+	// build generated columns lower name set to accelerate the following check
 	generatedColumns := generatedColumnsNameSet(first.targetTableInfo.GetColumns())
 	for i, col := range first.sourceTableInfo.GetColumns() {
 		if _, ok := generatedColumns[col.Name.L]; ok {
@@ -258,7 +214,7 @@ func GenInsertSQL(tp DMLType, changes ...*RowChange) (string, []interface{}) {
 			buf.WriteByte(',')
 		}
 		columnNum++
-		buf.WriteString(quotes.QuoteName(col.Name.O))
+		buf.WriteString(common.QuoteName(col.Name.O))
 	}
 	buf.WriteString(") VALUES ")
 	holder := valuesHolder(columnNum)
@@ -284,7 +240,7 @@ func GenInsertSQL(tp DMLType, changes ...*RowChange) (string, []interface{}) {
 			}
 			writtenFirstCol = true
 
-			colName := quotes.QuoteName(col.Name.O)
+			colName := common.QuoteName(col.Name.O)
 			buf.WriteString(colName + "=VALUES(" + colName + ")")
 		}
 	}

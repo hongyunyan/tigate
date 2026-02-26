@@ -12,7 +12,6 @@ MAX_RETRIES=10
 function run() {
 	rm -rf $WORK_DIR && mkdir -p $WORK_DIR
 	start_tidb_cluster --workdir $WORK_DIR
-	cd $WORK_DIR
 
 	pd_addr="http://$UP_PD_HOST_1:$UP_PD_PORT_1"
 	TOPIC_NAME="ticdc-changefeed-pause-resume-$RANDOM"
@@ -30,7 +29,7 @@ function run() {
 	now=$(run_cdc_cli_tso_query $UP_PD_HOST_1 $UP_PD_PORT_1)
 	# 90s after now
 	target_ts=$(($now + 90 * 10 ** 3 * 2 ** 18))
-	changefeed_id=$(cdc cli changefeed create --sink-uri="$SINK_URI" --target-ts=$target_ts 2>&1 | tail -n2 | head -n1 | awk '{print $2}')
+	changefeed_id=$(cdc_cli_changefeed create --sink-uri="$SINK_URI" --target-ts=$target_ts 2>&1 | grep '^ID:' | head -n1 | awk -F ' ' '{print $2}')
 
 	case $SINK_TYPE in
 	kafka) run_kafka_consumer $WORK_DIR "kafka://127.0.0.1:9092/$TOPIC_NAME?protocol=open-protocol&partition-num=4&version=${KAFKA_VERSION}&max-message-bytes=10485760" ;;
@@ -47,12 +46,12 @@ function run() {
 
 	sleep 90
 
-	ensure $MAX_RETRIES check_changefeed_state $pd_addr $changefeed_id "finished" "null" ""
+	ensure $MAX_RETRIES check_changefeed_state "$pd_addr" "$changefeed_id" "finished" "null" ""
 
 	cleanup_process $CDC_BINARY
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 run $*
 check_logs $WORK_DIR
 echo "[$(date)] <<<<<< run test case $TEST_NAME success! >>>>>>"

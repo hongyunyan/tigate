@@ -18,24 +18,93 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/common"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
+	"github.com/pingcap/ticdc/pkg/util"
 	"github.com/pingcap/tidb/pkg/util/chunk"
-	"github.com/pingcap/tiflow/pkg/quotes"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
+
+type tsPair struct {
+	startTs  uint64
+	commitTs uint64
+}
 
 type preparedDMLs struct {
 	sqls            []string
 	values          [][]interface{}
 	rowCount        int
 	approximateSize int64
-	startTs         []uint64
+	tsPairs         []tsPair
+}
+
+func (d *preparedDMLs) LogWithoutValues() string {
+	// Calculate total count
+	totalCount := len(d.sqls)
+	var logBuilder strings.Builder
+	logBuilder.WriteString(fmt.Sprintf("Total SQL Count: %d, Row Count: %d,", totalCount, d.rowCount))
+
+	// Build SQL statements and arguments section
+	for i, sql := range d.sqls {
+		// Add formatted SQL and args to log content
+		logBuilder.WriteString(fmt.Sprintf("[%03d] Query: %s,", i+1, sql))
+	}
+	logBuilder.WriteString("End")
+
+	return logBuilder.String()
+}
+
+func (d *preparedDMLs) LogDebug(events []*commonEvent.DMLEvent, writerID int) {
+	if log.GetLevel() != zapcore.DebugLevel {
+		return
+	}
+
+	// Calculate total count
+	totalCount := len(d.sqls)
+
+	if len(d.sqls) == 0 {
+		log.Debug("No SQL statements to log")
+		return
+	}
+
+	// Build complete log content in a single string
+	var logBuilder strings.Builder
+	logBuilder.WriteString(fmt.Sprintf("Total SQL Count: %d, Row Count: %d, Writer ID: %d :", totalCount, d.rowCount, writerID))
+
+	// Build SQL statements and arguments section
+	for i, sql := range d.sqls {
+		var args []interface{}
+		if i < len(d.values) {
+			args = d.values[i]
+		}
+
+		logBuilder.WriteString(fmt.Sprintf("[%03d] Query: %s,", i+1, sql))
+		logBuilder.WriteString(fmt.Sprintf("      Args: %s,", util.RedactArgs(args)))
+	}
+
+	// Build timestamp information
+	commitTsList := make([]uint64, len(events))
+	startTsList := make([]uint64, len(events))
+	for i, event := range events {
+		commitTsList[i] = event.GetCommitTs()
+		startTsList[i] = event.GetStartTs()
+	}
+
+	logBuilder.WriteString(fmt.Sprintf("CommitTs: %v,", commitTsList))
+	logBuilder.WriteString(fmt.Sprintf("StartTs:  %v,", startTsList))
+	logBuilder.WriteString("End")
+
+	// Output the complete log content in a single call
+	log.Debug(logBuilder.String())
 }
 
 func (d *preparedDMLs) String() string {
-	return fmt.Sprintf("sqls: %v, values: %v, rowCount: %d, approximateSize: %d, startTs: %v", d.fmtSqls(), d.values, d.rowCount, d.approximateSize, d.startTs)
+	// SQL templates contain table/column names (schema info, not sensitive user data)
+	// Only values need redaction - they contain actual user data
+	return fmt.Sprintf("sqls: %v, values: %v, rowCount: %d, approximateSize: %d, startTs: %v",
+		d.fmtSqls(), util.RedactAny(d.values), d.rowCount, d.approximateSize, d.tsPairs)
 }
 
 func (d *preparedDMLs) fmtSqls() string {
@@ -52,7 +121,7 @@ var dmlsPool = sync.Pool{
 		return &preparedDMLs{
 			sqls:    make([]string, 0, 128),
 			values:  make([][]interface{}, 0, 128),
-			startTs: make([]uint64, 0, 128),
+			tsPairs: make([]tsPair, 0, 128),
 		}
 	},
 }
@@ -60,55 +129,49 @@ var dmlsPool = sync.Pool{
 func (d *preparedDMLs) reset() {
 	d.sqls = d.sqls[:0]
 	d.values = d.values[:0]
-	d.startTs = d.startTs[:0]
+	d.tsPairs = d.tsPairs[:0]
 	d.rowCount = 0
 	d.approximateSize = 0
 }
 
-// prepareReplace builds a parametrics REPLACE statement as following
+// prepareReplace builds a parametric REPLACE statement as following
 // sql: `REPLACE INTO `test`.`t` VALUES (?,?,?)`
 func buildInsert(
 	tableInfo *common.TableInfo,
 	row commonEvent.RowChange,
-	translateToInsert bool,
-) (string, []interface{}, error) {
-	args, err := getArgs(&row.Row, tableInfo, false)
-	if err != nil {
-		return "", nil, errors.Trace(err)
-	}
+	inSafeMode bool,
+) (string, []interface{}) {
+	args := getArgs(&row.Row, tableInfo)
 	if len(args) == 0 {
-		return "", nil, nil
+		return "", nil
 	}
 
 	var sql string
-	if translateToInsert {
-		sql = tableInfo.GetPreInsertSQL()
-	} else {
+	if inSafeMode {
 		sql = tableInfo.GetPreReplaceSQL()
+	} else {
+		sql = tableInfo.GetPreInsertSQL()
 	}
 
 	if sql == "" {
 		log.Panic("PreInsertSQL should not be empty")
 	}
 
-	return sql, args, nil
+	return sql, args
 }
 
 // prepareDelete builds a parametric DELETE statement as following
 // sql: `DELETE FROM `test`.`t` WHERE x = ? AND y >= ? LIMIT 1`
-func buildDelete(tableInfo *common.TableInfo, row commonEvent.RowChange, forceReplicate bool) (string, []interface{}, error) {
+func buildDelete(tableInfo *common.TableInfo, row commonEvent.RowChange) (string, []interface{}) {
 	var builder strings.Builder
 	quoteTable := tableInfo.TableName.QuoteString()
 	builder.WriteString("DELETE FROM ")
 	builder.WriteString(quoteTable)
 	builder.WriteString(" WHERE ")
 
-	colNames, whereArgs, err := whereSlice(&row.PreRow, tableInfo, forceReplicate)
-	if err != nil {
-		return "", nil, errors.Trace(err)
-	}
+	colNames, whereArgs := whereSlice(&row.PreRow, tableInfo)
 	if len(whereArgs) == 0 {
-		return "", nil, nil
+		return "", nil
 	}
 	args := make([]interface{}, 0, len(whereArgs))
 	for i := 0; i < len(colNames); i++ {
@@ -116,40 +179,34 @@ func buildDelete(tableInfo *common.TableInfo, row commonEvent.RowChange, forceRe
 			builder.WriteString(" AND ")
 		}
 		if whereArgs[i] == nil {
-			builder.WriteString(quotes.QuoteName(colNames[i]))
+			builder.WriteString(common.QuoteName(colNames[i]))
 			builder.WriteString(" IS NULL")
 		} else {
-			builder.WriteString(quotes.QuoteName(colNames[i]))
+			builder.WriteString(common.QuoteName(colNames[i]))
 			builder.WriteString(" = ?")
 			args = append(args, whereArgs[i])
 		}
 	}
 	builder.WriteString(" LIMIT 1")
 	sql := builder.String()
-	return sql, args, nil
+	return sql, args
 }
 
-func buildUpdate(tableInfo *common.TableInfo, row commonEvent.RowChange, forceReplicate bool) (string, []interface{}, error) {
+func buildUpdate(tableInfo *common.TableInfo, row commonEvent.RowChange) (string, []interface{}) {
 	var builder strings.Builder
 	if tableInfo.GetPreUpdateSQL() == "" {
 		log.Panic("PreUpdateSQL should not be empty")
 	}
 	builder.WriteString(tableInfo.GetPreUpdateSQL())
 
-	args, err := getArgs(&row.Row, tableInfo, false)
-	if err != nil {
-		return "", nil, errors.Trace(err)
-	}
+	args := getArgs(&row.Row, tableInfo)
 	if len(args) == 0 {
-		return "", nil, nil
+		return "", nil
 	}
 
-	whereColNames, whereArgs, err := whereSlice(&row.PreRow, tableInfo, forceReplicate)
-	if err != nil {
-		return "", nil, errors.Trace(err)
-	}
+	whereColNames, whereArgs := whereSlice(&row.PreRow, tableInfo)
 	if len(whereArgs) == 0 {
-		return "", nil, nil
+		return "", nil
 	}
 
 	builder.WriteString(" WHERE ")
@@ -158,10 +215,10 @@ func buildUpdate(tableInfo *common.TableInfo, row commonEvent.RowChange, forceRe
 			builder.WriteString(" AND ")
 		}
 		if whereArgs[i] == nil {
-			builder.WriteString(quotes.QuoteName(whereColNames[i]))
+			builder.WriteString(common.QuoteName(whereColNames[i]))
 			builder.WriteString(" IS NULL")
 		} else {
-			builder.WriteString(quotes.QuoteName(whereColNames[i]))
+			builder.WriteString(common.QuoteName(whereColNames[i]))
 			builder.WriteString(" = ?")
 			args = append(args, whereArgs[i])
 		}
@@ -169,51 +226,172 @@ func buildUpdate(tableInfo *common.TableInfo, row commonEvent.RowChange, forceRe
 
 	builder.WriteString(" LIMIT 1")
 	sql := builder.String()
-	return sql, args, nil
+	return sql, args
 }
 
-func getArgs(row *chunk.Row, tableInfo *common.TableInfo, enableGeneratedColumn bool) ([]interface{}, error) {
-	args := make([]interface{}, 0, len(tableInfo.GetColumns()))
-	for i, col := range tableInfo.GetColumns() {
-		if col == nil || (tableInfo.GetColumnFlags()[col.ID].IsGeneratedColumn() && !enableGeneratedColumn) {
+// buildActiveActiveUpsertSQL builds the last-write-wins UPSERT used by active-active tables.
+// SQL rules:
+//  1. INSERT only contains visible business columns plus _tidb_origin_ts/_tidb_softdelete_time.
+//     _tidb_commit_ts is omitted because downstream TiDB fills it automatically.
+//  2. The VALUES for _tidb_origin_ts reuse each row's upstream _tidb_commit_ts so the origin column
+//     describes when the row was committed at the upstream cluster.
+//  3. ON DUPLICATE KEY UPDATE applies the LWW condition inline for every updated column:
+//     IFNULL(_tidb_origin_ts, _tidb_commit_ts) <= VALUES(_tidb_origin_ts).
+//     Avoid user variables (for example, @ticdc_lww_cond) because their evaluation order is not
+//     guaranteed and can cause cross-row/cross-column contamination in multi-row UPSERT statements.
+func buildActiveActiveUpsertSQL(
+	tableInfo *common.TableInfo,
+	rows []*commonEvent.RowChange,
+	commitTs []uint64,
+) (string, []interface{}) {
+	if tableInfo == nil || len(rows) == 0 {
+		return "", nil
+	}
+	if len(commitTs) != len(rows) {
+		log.Panic("mismatched commitTs and rows length",
+			zap.Int("rows", len(rows)), zap.Int("commitTs", len(commitTs)))
+	}
+
+	columns := tableInfo.GetColumns()
+	insertColumns := make([]string, 0, len(columns))
+	for _, col := range columns {
+		if col == nil || col.IsGenerated() {
 			continue
 		}
-		v, err := common.FormatColVal(row, col, i)
-		if err != nil {
-			return nil, err
+		if col.Name.O == commonEvent.CommitTsColumn {
+			// _tidb_commit_ts is kept downstream-only; do not emit it in INSERT columns.
+			continue
 		}
+		insertColumns = append(insertColumns, col.Name.O)
+	}
+	if len(insertColumns) == 0 {
+		return "", nil
+	}
+
+	valueOffsets := make([]int, len(insertColumns))
+	useCommitTs := make([]bool, len(insertColumns))
+	for i := range valueOffsets {
+		valueOffsets[i] = -1
+	}
+	for i, colName := range insertColumns {
+		if colName == commonEvent.OriginTsColumn {
+			// VALUES(_tidb_origin_ts) should reuse upstream commitTs to record origin.
+			useCommitTs[i] = true
+			continue
+		}
+		offset, ok := tableInfo.GetColumnOffsetByName(colName)
+		if !ok {
+			log.Panic("column not found when building active active SQL",
+				zap.String("column", colName), zap.Stringer("table", tableInfo.TableName))
+		}
+		valueOffsets[i] = offset
+	}
+
+	originQuoted := common.QuoteName(commonEvent.OriginTsColumn)
+	commitQuoted := common.QuoteName(commonEvent.CommitTsColumn)
+
+	var builder strings.Builder
+	builder.WriteString("INSERT INTO ")
+	builder.WriteString(tableInfo.TableName.QuoteString())
+	builder.WriteString(" (")
+	for i, colName := range insertColumns {
+		if i > 0 {
+			builder.WriteString(",")
+		}
+		builder.WriteString(common.QuoteName(colName))
+	}
+	builder.WriteString(") VALUES ")
+
+	args := make([]interface{}, 0, len(rows)*len(insertColumns))
+	for rowIdx, row := range rows {
+		if rowIdx > 0 {
+			builder.WriteString(",")
+		}
+		builder.WriteString("(")
+		for i := range insertColumns {
+			if i > 0 {
+				builder.WriteString(",")
+			}
+			builder.WriteString("?")
+		}
+		builder.WriteString(")")
+		for i := range insertColumns {
+			if useCommitTs[i] {
+				args = append(args, commitTs[rowIdx])
+				continue
+			}
+			offset := valueOffsets[i]
+			if offset < 0 || offset >= len(columns) {
+				log.Panic("invalid column offset when building active active SQL",
+					zap.Int("offset", offset), zap.Int("columnCount", len(columns)))
+			}
+			col := columns[offset]
+			v := common.ExtractColVal(&row.Row, col, offset)
+			args = append(args, v)
+		}
+	}
+
+	builder.WriteString(" ON DUPLICATE KEY UPDATE ")
+
+	cond := fmt.Sprintf("IFNULL(%s, %s) <= VALUES(%s)", originQuoted, commitQuoted, originQuoted)
+	for i, colName := range insertColumns {
+		quoted := common.QuoteName(colName)
+		if i > 0 {
+			builder.WriteString(",")
+		}
+		builder.WriteString(fmt.Sprintf("%s = IF((%s), VALUES(%s), %s)", quoted, cond, quoted, quoted))
+	}
+
+	return builder.String(), args
+}
+
+func getArgs(row *chunk.Row, tableInfo *common.TableInfo) []interface{} {
+	args := make([]interface{}, 0, len(tableInfo.GetColumns()))
+	for i, col := range tableInfo.GetColumns() {
+		if col == nil || col.IsGenerated() {
+			continue
+		}
+		v := common.ExtractColVal(row, col, i)
 		args = append(args, v)
 	}
-	return args, nil
+	return args
+}
+
+func getArgsWithGeneratedColumn(row *chunk.Row, tableInfo *common.TableInfo) []interface{} {
+	args := make([]interface{}, 0, len(tableInfo.GetColumns()))
+	for i, col := range tableInfo.GetColumns() {
+		if col == nil {
+			continue
+		}
+		v := common.ExtractColVal(row, col, i)
+		args = append(args, v)
+	}
+	return args
 }
 
 // whereSlice returns the column names and values for the WHERE clause
-func whereSlice(row *chunk.Row, tableInfo *common.TableInfo, forceReplicate bool) ([]string, []interface{}, error) {
+func whereSlice(row *chunk.Row, tableInfo *common.TableInfo) ([]string, []interface{}) {
 	args := make([]interface{}, 0, len(tableInfo.GetColumns()))
 	colNames := make([]string, 0, len(tableInfo.GetColumns()))
 	// Try to use unique key values when available
 	for i, col := range tableInfo.GetColumns() {
-		if col == nil || !tableInfo.GetColumnFlags()[col.ID].IsHandleKey() {
+		if col == nil || !tableInfo.IsHandleKey(col.ID) || col.IsVirtualGenerated() {
 			continue
 		}
 		colNames = append(colNames, col.Name.O)
-		v, err := common.FormatColVal(row, col, i)
-		if err != nil {
-			return nil, nil, errors.Trace(err)
-		}
+		v := common.ExtractColVal(row, col, i)
 		args = append(args, v)
 	}
 
-	// if no explicit row id but force replicate, use all key-values in where condition
-	if len(colNames) == 0 && forceReplicate {
+	// if no explicit row id, use all key-values in where condition
+	if len(colNames) == 0 {
 		for i, col := range tableInfo.GetColumns() {
-			colNames = append(colNames, col.Name.O)
-			v, err := common.FormatColVal(row, col, i)
-			if err != nil {
-				return nil, nil, errors.Trace(err)
+			if col != nil && !col.IsVirtualGenerated() {
+				colNames = append(colNames, col.Name.O)
+				v := common.ExtractColVal(row, col, i)
+				args = append(args, v)
 			}
-			args = append(args, v)
 		}
 	}
-	return colNames, args, nil
+	return colNames, args
 }

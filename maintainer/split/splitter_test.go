@@ -14,84 +14,77 @@
 package split
 
 import (
+	"context"
 	"testing"
 
 	"github.com/pingcap/ticdc/heartbeatpb"
-	"github.com/pingcap/ticdc/maintainer/replica"
-	"github.com/pingcap/ticdc/utils"
+	"github.com/pingcap/ticdc/maintainer/testutil"
+	"github.com/pingcap/ticdc/pkg/common"
+	appcontext "github.com/pingcap/ticdc/pkg/common/context"
+	"github.com/pingcap/ticdc/pkg/config"
+	"github.com/pingcap/ticdc/pkg/util"
 	"github.com/stretchr/testify/require"
 )
 
-func TestMapFindHole(t *testing.T) {
-	cases := []struct {
-		spans        []*heartbeatpb.TableSpan
-		rang         *heartbeatpb.TableSpan
-		expectedHole []*heartbeatpb.TableSpan
-	}{
-		{ // 0. all found.
-			spans: []*heartbeatpb.TableSpan{
-				{StartKey: []byte("t1_0"), EndKey: []byte("t1_1")},
-				{StartKey: []byte("t1_1"), EndKey: []byte("t1_2")},
-				{StartKey: []byte("t1_2"), EndKey: []byte("t2_0")},
-			},
-			rang: &heartbeatpb.TableSpan{StartKey: []byte("t1_0"), EndKey: []byte("t2_0")},
-		},
-		{ // 1. on hole in the middle.
-			spans: []*heartbeatpb.TableSpan{
-				{StartKey: []byte("t1_0"), EndKey: []byte("t1_1")},
-				{StartKey: []byte("t1_3"), EndKey: []byte("t1_4")},
-				{StartKey: []byte("t1_4"), EndKey: []byte("t2_0")},
-			},
-			rang: &heartbeatpb.TableSpan{StartKey: []byte("t1_0"), EndKey: []byte("t2_0")},
-			expectedHole: []*heartbeatpb.TableSpan{
-				{StartKey: []byte("t1_1"), EndKey: []byte("t1_3")},
-			},
-		},
-		{ // 2. two holes in the middle.
-			spans: []*heartbeatpb.TableSpan{
-				{StartKey: []byte("t1_0"), EndKey: []byte("t1_1")},
-				{StartKey: []byte("t1_2"), EndKey: []byte("t1_3")},
-				{StartKey: []byte("t1_4"), EndKey: []byte("t2_0")},
-			},
-			rang: &heartbeatpb.TableSpan{StartKey: []byte("t1_0"), EndKey: []byte("t2_0")},
-			expectedHole: []*heartbeatpb.TableSpan{
-				{StartKey: []byte("t1_1"), EndKey: []byte("t1_2")},
-				{StartKey: []byte("t1_3"), EndKey: []byte("t1_4")},
-			},
-		},
-		{ // 3. all missing.
-			spans: []*heartbeatpb.TableSpan{},
-			rang:  &heartbeatpb.TableSpan{StartKey: []byte("t1_0"), EndKey: []byte("t2_0")},
-			expectedHole: []*heartbeatpb.TableSpan{
-				{StartKey: []byte("t1_0"), EndKey: []byte("t2_0")},
-			},
-		},
-		{ // 4. start not found
-			spans: []*heartbeatpb.TableSpan{
-				{StartKey: []byte("t1_4"), EndKey: []byte("t2_0")},
-			},
-			rang: &heartbeatpb.TableSpan{StartKey: []byte("t1_0"), EndKey: []byte("t2_0")},
-			expectedHole: []*heartbeatpb.TableSpan{
-				{StartKey: []byte("t1_0"), EndKey: []byte("t1_4")},
-			},
-		},
-		{ // 5. end not found
-			spans: []*heartbeatpb.TableSpan{
-				{StartKey: []byte("t1_0"), EndKey: []byte("t1_1")},
-			},
-			rang: &heartbeatpb.TableSpan{StartKey: []byte("t1_0"), EndKey: []byte("t2_0")},
-			expectedHole: []*heartbeatpb.TableSpan{
-				{StartKey: []byte("t1_1"), EndKey: []byte("t2_0")},
-			},
-		},
+// TestNewSplitter tests the NewSplitter constructor function
+func TestNewSplitter(t *testing.T) {
+	re := require.New(t)
+
+	// Set up RegionCache service for testing
+	cache := NewMockRegionCache(nil)
+	appcontext.SetService(appcontext.RegionCache, cache)
+
+	// Set up PDAPIClient service for testing
+	mockPDClient := testutil.NewMockPDAPIClient()
+	appcontext.SetService(appcontext.PDAPIClient, mockPDClient)
+
+	cfID := common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceName)
+	cfg := &config.ChangefeedSchedulerConfig{
+		RegionThreshold:    util.AddressOf(100),
+		RegionCountPerSpan: util.AddressOf(10),
+		WriteKeyThreshold:  util.AddressOf(1000),
 	}
 
-	for i, cs := range cases {
-		m := utils.NewBtreeMap[*heartbeatpb.TableSpan, *replica.SpanReplication](heartbeatpb.LessTableSpan)
-		for _, span := range cs.spans {
-			m.ReplaceOrInsert(span, &replica.SpanReplication{})
-		}
-		holes := FindHoles(m, cs.rang)
-		require.Equalf(t, cs.expectedHole, holes, "case %d, %#v", i, cs)
+	splitter := NewSplitter(common.DefaultKeyspaceID, cfID, cfg)
+
+	re.NotNil(splitter)
+	re.Equal(cfID, splitter.changefeedID)
+	re.NotNil(splitter.regionCounterSplitter)
+	re.NotNil(splitter.writeBytesSplitter)
+}
+
+// TestSplitter_Split_ByRegion tests splitting by region count
+func TestSplitter_Split_ByRegion(t *testing.T) {
+	re := require.New(t)
+
+	// Set up RegionCache service for testing
+	cache := NewMockRegionCache(nil)
+	appcontext.SetService(appcontext.RegionCache, cache)
+	cache.regions.ReplaceOrInsert(heartbeatpb.TableSpan{StartKey: []byte("t1_0"), EndKey: []byte("t1_1")}, 1)
+	cache.regions.ReplaceOrInsert(heartbeatpb.TableSpan{StartKey: []byte("t1_1"), EndKey: []byte("t1_2")}, 2)
+	cache.regions.ReplaceOrInsert(heartbeatpb.TableSpan{StartKey: []byte("t1_2"), EndKey: []byte("t1_3")}, 3)
+	cache.regions.ReplaceOrInsert(heartbeatpb.TableSpan{StartKey: []byte("t1_3"), EndKey: []byte("t1_4")}, 4)
+	cache.regions.ReplaceOrInsert(heartbeatpb.TableSpan{StartKey: []byte("t1_4"), EndKey: []byte("t2_2")}, 5)
+	cache.regions.ReplaceOrInsert(heartbeatpb.TableSpan{StartKey: []byte("t2_2"), EndKey: []byte("t2_3")}, 6)
+
+	cfID := common.NewChangeFeedIDWithName("test", common.DefaultKeyspaceName)
+	cfg := &config.ChangefeedSchedulerConfig{
+		RegionThreshold:    util.AddressOf(2),
+		RegionCountPerSpan: util.AddressOf(10),
+		WriteKeyThreshold:  util.AddressOf(1000),
 	}
+
+	splitter := NewSplitter(0, cfID, cfg)
+
+	span := &heartbeatpb.TableSpan{
+		TableID:  1,
+		StartKey: []byte("t1"),
+		EndKey:   []byte("t2"),
+	}
+
+	// Test splitting by region count
+	spans := splitter.Split(context.Background(), span, 2, SplitTypeRegionCount)
+	re.Equal(2, len(spans))
+	re.Equal(&heartbeatpb.TableSpan{TableID: 1, StartKey: []byte("t1"), EndKey: []byte("t1_3")}, spans[0])
+	re.Equal(&heartbeatpb.TableSpan{TableID: 1, StartKey: []byte("t1_3"), EndKey: []byte("t2")}, spans[1])
 }

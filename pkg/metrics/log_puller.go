@@ -13,7 +13,9 @@
 
 package metrics
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 var (
 	LogPullerPrewriteCacheRowNum = prometheus.NewGauge(
@@ -45,10 +47,73 @@ var (
 			Name:      "resolved_ts_lag",
 			Help:      "The resolved ts lag of subscription client.",
 		})
+
+	SubscriptionClientRequestedRegionCount = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "subscription_client",
+			Name:      "requested_region_count",
+			Help:      "The number of requested regions",
+		}, []string{"state"})
+	RegionRequestFinishScanDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "ticdc",
+			Subsystem: "subscription_client",
+			Name:      "region_request_finish_scan_duration",
+			Help:      "duration (s) for region request to be finished.",
+			Buckets:   prometheus.ExponentialBuckets(0.00004, 2.0, 28), // 40us to 1.5h
+		})
+	SubscriptionClientAddRegionRequestDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "ticdc",
+			Subsystem: "subscription_client",
+			Name:      "add_region_request_duration",
+			Help:      "The cost of adding region request",
+			Buckets:   prometheus.ExponentialBuckets(0.00004, 2.0, 28), // 40us to 1.5h
+		})
+	SubscriptionClientSubscribedRegionCount = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "subscription_client",
+			Name:      "subscribed_region_count",
+			Help:      "The number of locked ranges",
+		})
+	SubscriptionClientResolveLockTaskDropCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "subscription_client",
+			Name:      "resolve_lock_task_drop_count",
+			Help:      "The number of resolve lock tasks dropped before being processed",
+		})
+
+	SubscriptionClientRegionEventHandleDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "ticdc",
+			Subsystem: "subscription_client",
+			Name:      "region_event_handle_duration",
+			Help:      "duration (s) for subscription client to handle region events and build KV cache",
+			Buckets:   prometheus.ExponentialBuckets(0.00004, 2.0, 28), // 40us to 1.5h
+		}, []string{"type"}) // types: entries, resolved, mixed, error.
+
+	SubscriptionClientConsumeKVEventsCallbackDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "ticdc",
+			Subsystem: "subscription_client",
+			Name:      "consume_kv_events_callback_duration",
+			Help:      "duration (s) from calling consumeKVEvents to wake callback execution",
+			Buckets:   prometheus.ExponentialBuckets(0.00004, 2.0, 28), // 40us to 1.5h
+		}, []string{"type"})
 )
 
-func InitLogPullerMetrics(registry *prometheus.Registry) {
+func initLogPullerMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(LogPullerPrewriteCacheRowNum)
 	registry.MustRegister(LogPullerMatcherCount)
 	registry.MustRegister(LogPullerResolvedTsLag)
+	registry.MustRegister(SubscriptionClientRequestedRegionCount)
+	registry.MustRegister(SubscriptionClientAddRegionRequestDuration)
+	registry.MustRegister(RegionRequestFinishScanDuration)
+	registry.MustRegister(SubscriptionClientSubscribedRegionCount)
+	registry.MustRegister(SubscriptionClientResolveLockTaskDropCounter)
+	registry.MustRegister(SubscriptionClientRegionEventHandleDuration)
+	registry.MustRegister(SubscriptionClientConsumeKVEventsCallbackDuration)
 }

@@ -17,14 +17,14 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/pingcap/ticdc/pkg/api"
+	bf "github.com/pingcap/ticdc/pkg/binlog-filter"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/integrity"
+	"github.com/pingcap/ticdc/pkg/security"
 	"github.com/pingcap/ticdc/pkg/util"
-	"github.com/pingcap/tiflow/cdc/model"
-	bf "github.com/pingcap/tiflow/pkg/binlog-filter"
-	"github.com/pingcap/tiflow/pkg/integrity"
-	"github.com/pingcap/tiflow/pkg/security"
 )
 
 // EmptyResponse return empty {} to http client
@@ -33,6 +33,19 @@ type EmptyResponse struct{}
 // LogLevelReq log level request
 type LogLevelReq struct {
 	Level string `json:"log_level"`
+}
+
+// RedactModeReq redaction mode request
+// Use redact_info_log to match CLI flag naming convention
+// Accepts: "off", "on", "marker" (case-insensitive)
+type RedactModeReq struct {
+	Mode string `json:"redact_info_log"`
+}
+
+// RedactModeResp redaction mode response
+type RedactModeResp struct {
+	PreviousMode string `json:"previous_mode"`
+	CurrentMode  string `json:"current_mode"`
 }
 
 // ListResponse is the response for all List APIs
@@ -47,10 +60,11 @@ type Tso struct {
 	LogicTime int64 `json:"logic_time"`
 }
 
-// Tables contains IneligibleTables and EligibleTables
+// Tables contains IneligibleTables, EligibleTables and AllTables
 type Tables struct {
 	IneligibleTables []TableName `json:"ineligible_tables,omitempty"`
 	EligibleTables   []TableName `json:"eligible_tables,omitempty"`
+	AllTables        []TableName `json:"all_tables,omitempty"`
 }
 
 // TableName contains table information
@@ -93,22 +107,22 @@ type PDConfig struct {
 
 // ChangefeedCommonInfo holds some common usage information of a changefeed
 type ChangefeedCommonInfo struct {
-	UpstreamID     uint64              `json:"upstream_id"`
-	ID             string              `json:"id"`
-	Namespace      string              `json:"namespace"`
-	FeedState      model.FeedState     `json:"state"`
-	CheckpointTSO  uint64              `json:"checkpoint_tso"`
-	CheckpointTime model.JSONTime      `json:"checkpoint_time"`
-	RunningError   *model.RunningError `json:"error"`
+	UpstreamID     uint64               `json:"upstream_id"`
+	ID             string               `json:"id"`
+	Keyspace       string               `json:"keyspace"`
+	FeedState      config.FeedState     `json:"state"`
+	CheckpointTSO  uint64               `json:"checkpoint_tso"`
+	CheckpointTime api.JSONTime         `json:"checkpoint_time"`
+	RunningError   *config.RunningError `json:"error"`
 }
 
 // SyncedStatusConfig represents synced check interval config for a changefeed
 type SyncedStatusConfig struct {
 	// The minimum interval between the latest synced ts and now required to reach synced state
-	SyncedCheckInterval int64 `json:"synced_check_interval"`
+	SyncedCheckInterval *int64 `json:"synced_check_interval"`
 	// The maximum interval between latest checkpoint ts and now or
 	// between latest sink's checkpoint ts and puller's checkpoint ts required to reach synced state
-	CheckpointInterval int64 `json:"checkpoint_interval"`
+	CheckpointInterval *int64 `json:"checkpoint_interval"`
 }
 
 // MarshalJSON marshal changefeed common info to json
@@ -118,11 +132,11 @@ func (c ChangefeedCommonInfo) MarshalJSON() ([]byte, error) {
 	// alias the original type to prevent recursive call of MarshalJSON
 	type Alias ChangefeedCommonInfo
 
-	if c.FeedState == model.StateUnInitialized {
-		c.FeedState = model.StateNormal
+	if c.FeedState == config.StateUnInitialized {
+		c.FeedState = config.StateNormal
 	}
-	if c.FeedState == model.StatePending {
-		c.FeedState = model.StateWarning
+	if c.FeedState == config.StatePending {
+		c.FeedState = config.StateWarning
 	}
 
 	return json.Marshal(struct {
@@ -134,7 +148,7 @@ func (c ChangefeedCommonInfo) MarshalJSON() ([]byte, error) {
 
 // ChangefeedConfig use by create changefeed api
 type ChangefeedConfig struct {
-	Namespace     string         `json:"namespace"`
+	Keyspace      string         `json:"keyspace"`
 	ID            string         `json:"changefeed_id"`
 	StartTs       uint64         `json:"start_ts"`
 	TargetTs      uint64         `json:"target_ts"`
@@ -145,7 +159,7 @@ type ChangefeedConfig struct {
 
 // ProcessorCommonInfo holds the common info of a processor
 type ProcessorCommonInfo struct {
-	Namespace    string `json:"namespace"`
+	Keyspace     string `json:"keyspace"`
 	ChangeFeedID string `json:"changefeed_id"`
 	CaptureID    string `json:"capture_id"`
 }
@@ -184,29 +198,40 @@ func (d *JSONDuration) UnmarshalJSON(b []byte) error {
 
 // ReplicaConfig is a duplicate of  config.ReplicaConfig
 type ReplicaConfig struct {
-	MemoryQuota           uint64 `json:"memory_quota"`
-	CaseSensitive         bool   `json:"case_sensitive"`
-	ForceReplicate        bool   `json:"force_replicate"`
-	IgnoreIneligibleTable bool   `json:"ignore_ineligible_table"`
-	CheckGCSafePoint      bool   `json:"check_gc_safe_point"`
-	EnableSyncPoint       *bool  `json:"enable_sync_point,omitempty"`
-	EnableTableMonitor    *bool  `json:"enable_table_monitor,omitempty"`
-	BDRMode               *bool  `json:"bdr_mode,omitempty"`
+	MemoryQuota           *uint64 `json:"memory_quota,omitempty"`
+	CaseSensitive         *bool   `json:"case_sensitive,omitempty"`
+	ForceReplicate        *bool   `json:"force_replicate,omitempty"`
+	IgnoreIneligibleTable *bool   `json:"ignore_ineligible_table,omitempty"`
+	CheckGCSafePoint      *bool   `json:"check_gc_safe_point,omitempty"`
+	EnableSyncPoint       *bool   `json:"enable_sync_point,omitempty"`
+	EnableTableMonitor    *bool   `json:"enable_table_monitor,omitempty"`
+	BDRMode               *bool   `json:"bdr_mode,omitempty"`
+	// EnableActiveActive enables active-active replication mode on top of BDR.
+	// It requires BDRMode to be true and is only supported by TiDB and storage sinks.
+	EnableActiveActive *bool `json:"enable_active_active,omitempty"`
+	// ActiveActiveProgressInterval controls how often the MySQL/TiDB sink updates the
+	// active-active progress table in EnableActiveActive mode (for hard delete safety checks).
+	ActiveActiveProgressInterval *JSONDuration `json:"active_active_progress_interval,omitempty"`
+	// ActiveActiveSyncStatsInterval controls how often the MySQL/TiDB sink queries
+	// the TiDB session variable @@tidb_cdc_active_active_sync_stats for conflict statistics.
+	// Set it to 0 to disable metric collection.
+	// This option only takes effect when EnableActiveActive is true and the downstream is TiDB.
+	ActiveActiveSyncStatsInterval *JSONDuration `json:"active_active_sync_stats_interval,omitempty"`
 
-	SyncPointInterval  *JSONDuration `json:"sync_point_interval,omitempty" swaggertype:"string"`
-	SyncPointRetention *JSONDuration `json:"sync_point_retention,omitempty" swaggertype:"string"`
+	SyncPointInterval  *JSONDuration `json:"sync_point_interval,omitempty"`
+	SyncPointRetention *JSONDuration `json:"sync_point_retention,omitempty"`
 
-	Filter                       *FilterConfig              `json:"filter"`
-	Mounter                      *MounterConfig             `json:"mounter"`
-	Sink                         *SinkConfig                `json:"sink"`
+	Filter                       *FilterConfig              `json:"filter,omitempty"`
+	Mounter                      *MounterConfig             `json:"mounter,omitempty"`
+	Sink                         *SinkConfig                `json:"sink,omitempty"`
 	Consistent                   *ConsistentConfig          `json:"consistent,omitempty"`
-	Scheduler                    *ChangefeedSchedulerConfig `json:"scheduler"`
-	Integrity                    *IntegrityConfig           `json:"integrity"`
+	Scheduler                    *ChangefeedSchedulerConfig `json:"scheduler,omitempty"`
+	Integrity                    *IntegrityConfig           `json:"integrity,omitempty"`
 	ChangefeedErrorStuckDuration *JSONDuration              `json:"changefeed_error_stuck_duration,omitempty"`
 	SyncedStatus                 *SyncedStatusConfig        `json:"synced_status,omitempty"`
 
 	// Deprecated: we don't use this field since v8.0.0.
-	SQLMode string `json:"sql_mode,omitempty"`
+	SQLMode *string `json:"sql_mode,omitempty"`
 }
 
 // ToInternalReplicaConfig coverts *v2.ReplicaConfig into *config.ReplicaConfig
@@ -218,28 +243,46 @@ func (c *ReplicaConfig) ToInternalReplicaConfig() *config.ReplicaConfig {
 func (c *ReplicaConfig) toInternalReplicaConfigWithOriginConfig(
 	res *config.ReplicaConfig,
 ) *config.ReplicaConfig {
-	res.MemoryQuota = c.MemoryQuota
-	res.CaseSensitive = c.CaseSensitive
-	res.ForceReplicate = c.ForceReplicate
-	res.CheckGCSafePoint = c.CheckGCSafePoint
+	if c.MemoryQuota != nil {
+		res.MemoryQuota = c.MemoryQuota
+	}
+	if c.CaseSensitive != nil {
+		res.CaseSensitive = c.CaseSensitive
+	}
+	if c.ForceReplicate != nil {
+		res.ForceReplicate = c.ForceReplicate
+	}
+	if c.CheckGCSafePoint != nil {
+		res.CheckGCSafePoint = c.CheckGCSafePoint
+	}
 	res.EnableSyncPoint = c.EnableSyncPoint
 	res.EnableTableMonitor = c.EnableTableMonitor
-	res.IgnoreIneligibleTable = c.IgnoreIneligibleTable
+	if c.IgnoreIneligibleTable != nil {
+		res.IgnoreIneligibleTable = c.IgnoreIneligibleTable
+	}
 	if c.SyncPointInterval != nil {
 		res.SyncPointInterval = &c.SyncPointInterval.duration
 	}
 	if c.SyncPointRetention != nil {
 		res.SyncPointRetention = &c.SyncPointRetention.duration
 	}
-	res.BDRMode = c.BDRMode
+	if c.BDRMode != nil {
+		res.BDRMode = c.BDRMode
+	}
+	if c.EnableActiveActive != nil {
+		res.EnableActiveActive = c.EnableActiveActive
+	}
+	if c.ActiveActiveProgressInterval != nil {
+		res.ActiveActiveProgressInterval = &c.ActiveActiveProgressInterval.duration
+	}
+	if c.ActiveActiveSyncStatsInterval != nil {
+		res.ActiveActiveSyncStatsInterval = &c.ActiveActiveSyncStatsInterval.duration
+	}
 
 	if c.Filter != nil {
-		var efs []*config.EventFilterRule
-		if len(c.Filter.EventFilters) != 0 {
-			efs = make([]*config.EventFilterRule, len(c.Filter.EventFilters))
-			for i, ef := range c.Filter.EventFilters {
-				efs[i] = ef.ToInternalEventFilterRule()
-			}
+		efs := make([]*config.EventFilterRule, 0, len(c.Filter.EventFilters))
+		for _, ef := range c.Filter.EventFilters {
+			efs = append(efs, ef.ToInternalEventFilterRule())
 		}
 		res.Filter = &config.FilterConfig{
 			Rules:            c.Filter.Rules,
@@ -248,18 +291,41 @@ func (c *ReplicaConfig) toInternalReplicaConfigWithOriginConfig(
 		}
 	}
 	if c.Consistent != nil {
-		res.Consistent = &config.ConsistentConfig{
-			Level:                 c.Consistent.Level,
-			MaxLogSize:            c.Consistent.MaxLogSize,
-			FlushIntervalInMs:     c.Consistent.FlushIntervalInMs,
-			MetaFlushIntervalInMs: c.Consistent.MetaFlushIntervalInMs,
-			EncodingWorkerNum:     c.Consistent.EncodingWorkerNum,
-			FlushWorkerNum:        c.Consistent.FlushWorkerNum,
-			Storage:               c.Consistent.Storage,
-			UseFileBackend:        c.Consistent.UseFileBackend,
-			Compression:           c.Consistent.Compression,
-			FlushConcurrency:      c.Consistent.FlushConcurrency,
+		if res.Consistent == nil {
+			res.Consistent = &config.ConsistentConfig{}
 		}
+
+		if c.Consistent.Level != nil {
+			res.Consistent.Level = c.Consistent.Level
+		}
+		if c.Consistent.MaxLogSize != nil {
+			res.Consistent.MaxLogSize = c.Consistent.MaxLogSize
+		}
+		if c.Consistent.FlushIntervalInMs != nil {
+			res.Consistent.FlushIntervalInMs = c.Consistent.FlushIntervalInMs
+		}
+		if c.Consistent.MetaFlushIntervalInMs != nil {
+			res.Consistent.MetaFlushIntervalInMs = c.Consistent.MetaFlushIntervalInMs
+		}
+		if c.Consistent.EncodingWorkerNum != nil {
+			res.Consistent.EncodingWorkerNum = c.Consistent.EncodingWorkerNum
+		}
+		if c.Consistent.FlushWorkerNum != nil {
+			res.Consistent.FlushWorkerNum = c.Consistent.FlushWorkerNum
+		}
+		if c.Consistent.Storage != nil {
+			res.Consistent.Storage = c.Consistent.Storage
+		}
+		if c.Consistent.UseFileBackend != nil {
+			res.Consistent.UseFileBackend = c.Consistent.UseFileBackend
+		}
+		if c.Consistent.Compression != nil {
+			res.Consistent.Compression = c.Consistent.Compression
+		}
+		if c.Consistent.FlushConcurrency != nil {
+			res.Consistent.FlushConcurrency = c.Consistent.FlushConcurrency
+		}
+
 		if c.Consistent.MemoryUsage != nil {
 			res.Consistent.MemoryUsage = &config.ConsistentMemoryUsage{
 				MemoryQuotaPercentage: c.Consistent.MemoryUsage.MemoryQuotaPercentage,
@@ -295,6 +361,7 @@ func (c *ReplicaConfig) toInternalReplicaConfigWithOriginConfig(
 				BinaryEncodingMethod: c.Sink.CSVConfig.BinaryEncodingMethod,
 				OutputOldValue:       c.Sink.CSVConfig.OutputOldValue,
 				OutputHandleKey:      c.Sink.CSVConfig.OutputHandleKey,
+				OutputFieldHeader:    c.Sink.CSVConfig.OutputFieldHeader,
 			}
 		}
 		var pulsarConfig *config.PulsarConfig
@@ -464,7 +531,6 @@ func (c *ReplicaConfig) toInternalReplicaConfigWithOriginConfig(
 			DateSeparator:                    c.Sink.DateSeparator,
 			EnablePartitionSeparator:         c.Sink.EnablePartitionSeparator,
 			FileIndexWidth:                   c.Sink.FileIndexWidth,
-			EnableKafkaSinkV2:                c.Sink.EnableKafkaSinkV2,
 			OnlyOutputUpdatedColumns:         c.Sink.OnlyOutputUpdatedColumns,
 			DeleteOnlyOutputHandleKeyColumns: c.Sink.DeleteOnlyOutputHandleKeyColumns,
 			ContentCompatible:                c.Sink.ContentCompatible,
@@ -504,31 +570,79 @@ func (c *ReplicaConfig) toInternalReplicaConfigWithOriginConfig(
 		}
 	}
 	if c.Mounter != nil {
-		res.Mounter = &config.MounterConfig{
-			WorkerNum: c.Mounter.WorkerNum,
+		if res.Mounter == nil {
+			res.Mounter = &config.MounterConfig{}
+		}
+
+		if c.Mounter.WorkerNum != nil {
+			res.Mounter.WorkerNum = *c.Mounter.WorkerNum
 		}
 	}
 	if c.Scheduler != nil {
-		res.Scheduler = &config.ChangefeedSchedulerConfig{
-			EnableTableAcrossNodes: c.Scheduler.EnableTableAcrossNodes,
-			RegionThreshold:        c.Scheduler.RegionThreshold,
-			WriteKeyThreshold:      c.Scheduler.WriteKeyThreshold,
-			SplitNumberPerNode:     c.Scheduler.SplitNumberPerNode,
+		if res.Scheduler == nil {
+			res.Scheduler = &config.ChangefeedSchedulerConfig{}
+		}
+
+		if c.Scheduler.EnableTableAcrossNodes != nil {
+			res.Scheduler.EnableTableAcrossNodes = c.Scheduler.EnableTableAcrossNodes
+		}
+		if c.Scheduler.RegionThreshold != nil {
+			res.Scheduler.RegionThreshold = c.Scheduler.RegionThreshold
+		}
+		if c.Scheduler.RegionCountPerSpan != nil {
+			res.Scheduler.RegionCountPerSpan = c.Scheduler.RegionCountPerSpan
+		}
+		if c.Scheduler.RegionCountRefreshInterval != nil {
+			res.Scheduler.RegionCountRefreshInterval = c.Scheduler.RegionCountRefreshInterval
+		}
+		if c.Scheduler.WriteKeyThreshold != nil {
+			res.Scheduler.WriteKeyThreshold = c.Scheduler.WriteKeyThreshold
+		}
+		if c.Scheduler.SchedulingTaskCountPerNode != nil {
+			res.Scheduler.SchedulingTaskCountPerNode = c.Scheduler.SchedulingTaskCountPerNode
+		}
+		if c.Scheduler.EnableSplittableCheck != nil {
+			res.Scheduler.EnableSplittableCheck = c.Scheduler.EnableSplittableCheck
+		}
+		if c.Scheduler.ForceSplit != nil {
+			res.Scheduler.ForceSplit = c.Scheduler.ForceSplit
+		}
+
+		if c.Scheduler.BalanceScoreThreshold != nil {
+			res.Scheduler.BalanceScoreThreshold = c.Scheduler.BalanceScoreThreshold
+		}
+		if c.Scheduler.MinTrafficPercentage != nil {
+			res.Scheduler.MinTrafficPercentage = c.Scheduler.MinTrafficPercentage
+		}
+		if c.Scheduler.MaxTrafficPercentage != nil {
+			res.Scheduler.MaxTrafficPercentage = c.Scheduler.MaxTrafficPercentage
 		}
 	}
 	if c.Integrity != nil {
-		res.Integrity = &integrity.Config{
-			IntegrityCheckLevel:   c.Integrity.IntegrityCheckLevel,
-			CorruptionHandleLevel: c.Integrity.CorruptionHandleLevel,
+		if res.Integrity == nil {
+			res.Integrity = &integrity.Config{}
+		}
+
+		if c.Integrity.IntegrityCheckLevel != nil {
+			res.Integrity.IntegrityCheckLevel = c.Integrity.IntegrityCheckLevel
+		}
+		if c.Integrity.CorruptionHandleLevel != nil {
+			res.Integrity.CorruptionHandleLevel = c.Integrity.CorruptionHandleLevel
 		}
 	}
 	if c.ChangefeedErrorStuckDuration != nil {
 		res.ChangefeedErrorStuckDuration = &c.ChangefeedErrorStuckDuration.duration
 	}
 	if c.SyncedStatus != nil {
-		res.SyncedStatus = &config.SyncedStatusConfig{
-			SyncedCheckInterval: c.SyncedStatus.SyncedCheckInterval,
-			CheckpointInterval:  c.SyncedStatus.CheckpointInterval,
+		if res.SyncedStatus == nil {
+			res.SyncedStatus = &config.SyncedStatusConfig{}
+		}
+
+		if c.SyncedStatus.SyncedCheckInterval != nil {
+			res.SyncedStatus.SyncedCheckInterval = c.SyncedStatus.SyncedCheckInterval
+		}
+		if c.SyncedStatus.CheckpointInterval != nil {
+			res.SyncedStatus.CheckpointInterval = c.SyncedStatus.CheckpointInterval
 		}
 	}
 	return res
@@ -547,6 +661,7 @@ func ToAPIReplicaConfig(c *config.ReplicaConfig) *ReplicaConfig {
 		EnableSyncPoint:       cloned.EnableSyncPoint,
 		EnableTableMonitor:    cloned.EnableTableMonitor,
 		BDRMode:               cloned.BDRMode,
+		EnableActiveActive:    cloned.EnableActiveActive,
 	}
 
 	if cloned.SyncPointInterval != nil {
@@ -556,14 +671,17 @@ func ToAPIReplicaConfig(c *config.ReplicaConfig) *ReplicaConfig {
 	if cloned.SyncPointRetention != nil {
 		res.SyncPointRetention = &JSONDuration{*cloned.SyncPointRetention}
 	}
+	if cloned.ActiveActiveProgressInterval != nil {
+		res.ActiveActiveProgressInterval = &JSONDuration{*cloned.ActiveActiveProgressInterval}
+	}
+	if cloned.ActiveActiveSyncStatsInterval != nil {
+		res.ActiveActiveSyncStatsInterval = &JSONDuration{*cloned.ActiveActiveSyncStatsInterval}
+	}
 
 	if cloned.Filter != nil {
-		var efs []EventFilterRule
-		if len(c.Filter.EventFilters) != 0 {
-			efs = make([]EventFilterRule, len(c.Filter.EventFilters))
-			for i, ef := range c.Filter.EventFilters {
-				efs[i] = ToAPIEventFilterRule(ef)
-			}
+		efs := make([]EventFilterRule, 0, len(cloned.Filter.EventFilters))
+		for _, ef := range cloned.Filter.EventFilters {
+			efs = append(efs, ToAPIEventFilterRule(ef))
 		}
 
 		res.Filter = &FilterConfig{
@@ -600,6 +718,7 @@ func ToAPIReplicaConfig(c *config.ReplicaConfig) *ReplicaConfig {
 				BinaryEncodingMethod: cloned.Sink.CSVConfig.BinaryEncodingMethod,
 				OutputOldValue:       cloned.Sink.CSVConfig.OutputOldValue,
 				OutputHandleKey:      cloned.Sink.CSVConfig.OutputHandleKey,
+				OutputFieldHeader:    cloned.Sink.CSVConfig.OutputFieldHeader,
 			}
 		}
 		var kafkaConfig *KafkaConfig
@@ -767,7 +886,6 @@ func ToAPIReplicaConfig(c *config.ReplicaConfig) *ReplicaConfig {
 			DateSeparator:                    cloned.Sink.DateSeparator,
 			EnablePartitionSeparator:         cloned.Sink.EnablePartitionSeparator,
 			FileIndexWidth:                   cloned.Sink.FileIndexWidth,
-			EnableKafkaSinkV2:                cloned.Sink.EnableKafkaSinkV2,
 			OnlyOutputUpdatedColumns:         cloned.Sink.OnlyOutputUpdatedColumns,
 			DeleteOnlyOutputHandleKeyColumns: cloned.Sink.DeleteOnlyOutputHandleKeyColumns,
 			ContentCompatible:                cloned.Sink.ContentCompatible,
@@ -808,17 +926,39 @@ func ToAPIReplicaConfig(c *config.ReplicaConfig) *ReplicaConfig {
 		}
 	}
 	if cloned.Consistent != nil {
-		res.Consistent = &ConsistentConfig{
-			Level:                 cloned.Consistent.Level,
-			MaxLogSize:            cloned.Consistent.MaxLogSize,
-			FlushIntervalInMs:     cloned.Consistent.FlushIntervalInMs,
-			MetaFlushIntervalInMs: cloned.Consistent.MetaFlushIntervalInMs,
-			EncodingWorkerNum:     c.Consistent.EncodingWorkerNum,
-			FlushWorkerNum:        c.Consistent.FlushWorkerNum,
-			Storage:               cloned.Consistent.Storage,
-			UseFileBackend:        cloned.Consistent.UseFileBackend,
-			Compression:           cloned.Consistent.Compression,
-			FlushConcurrency:      cloned.Consistent.FlushConcurrency,
+		if res.Consistent == nil {
+			res.Consistent = &ConsistentConfig{}
+		}
+
+		if cloned.Consistent.Level != nil {
+			res.Consistent.Level = cloned.Consistent.Level
+		}
+		if cloned.Consistent.MaxLogSize != nil {
+			res.Consistent.MaxLogSize = cloned.Consistent.MaxLogSize
+		}
+		if cloned.Consistent.FlushIntervalInMs != nil {
+			res.Consistent.FlushIntervalInMs = cloned.Consistent.FlushIntervalInMs
+		}
+		if cloned.Consistent.MetaFlushIntervalInMs != nil {
+			res.Consistent.MetaFlushIntervalInMs = cloned.Consistent.MetaFlushIntervalInMs
+		}
+		if cloned.Consistent.EncodingWorkerNum != nil {
+			res.Consistent.EncodingWorkerNum = cloned.Consistent.EncodingWorkerNum
+		}
+		if cloned.Consistent.FlushWorkerNum != nil {
+			res.Consistent.FlushWorkerNum = cloned.Consistent.FlushWorkerNum
+		}
+		if cloned.Consistent.Storage != nil {
+			res.Consistent.Storage = cloned.Consistent.Storage
+		}
+		if cloned.Consistent.UseFileBackend != nil {
+			res.Consistent.UseFileBackend = cloned.Consistent.UseFileBackend
+		}
+		if cloned.Consistent.Compression != nil {
+			res.Consistent.Compression = cloned.Consistent.Compression
+		}
+		if cloned.Consistent.FlushConcurrency != nil {
+			res.Consistent.FlushConcurrency = cloned.Consistent.FlushConcurrency
 		}
 		if cloned.Consistent.MemoryUsage != nil {
 			res.Consistent.MemoryUsage = &ConsistentMemoryUsage{
@@ -829,31 +969,73 @@ func ToAPIReplicaConfig(c *config.ReplicaConfig) *ReplicaConfig {
 
 	if cloned.Mounter != nil {
 		res.Mounter = &MounterConfig{
-			WorkerNum: cloned.Mounter.WorkerNum,
+			WorkerNum: &cloned.Mounter.WorkerNum,
 		}
 	}
 	if cloned.Scheduler != nil {
-		res.Scheduler = &ChangefeedSchedulerConfig{
-			EnableTableAcrossNodes: cloned.Scheduler.EnableTableAcrossNodes,
-			RegionThreshold:        cloned.Scheduler.RegionThreshold,
-			WriteKeyThreshold:      cloned.Scheduler.WriteKeyThreshold,
-			SplitNumberPerNode:     cloned.Scheduler.SplitNumberPerNode,
+		if res.Scheduler == nil {
+			res.Scheduler = &ChangefeedSchedulerConfig{}
+		}
+
+		if cloned.Scheduler.EnableTableAcrossNodes != nil {
+			res.Scheduler.EnableTableAcrossNodes = cloned.Scheduler.EnableTableAcrossNodes
+		}
+		if cloned.Scheduler.RegionThreshold != nil {
+			res.Scheduler.RegionThreshold = cloned.Scheduler.RegionThreshold
+		}
+		if cloned.Scheduler.RegionCountPerSpan != nil {
+			res.Scheduler.RegionCountPerSpan = cloned.Scheduler.RegionCountPerSpan
+		}
+		if cloned.Scheduler.RegionCountRefreshInterval != nil {
+			res.Scheduler.RegionCountRefreshInterval = cloned.Scheduler.RegionCountRefreshInterval
+		}
+		if cloned.Scheduler.WriteKeyThreshold != nil {
+			res.Scheduler.WriteKeyThreshold = cloned.Scheduler.WriteKeyThreshold
+		}
+		if cloned.Scheduler.SchedulingTaskCountPerNode != nil {
+			res.Scheduler.SchedulingTaskCountPerNode = cloned.Scheduler.SchedulingTaskCountPerNode
+		}
+		if cloned.Scheduler.EnableSplittableCheck != nil {
+			res.Scheduler.EnableSplittableCheck = cloned.Scheduler.EnableSplittableCheck
+		}
+		if cloned.Scheduler.ForceSplit != nil {
+			res.Scheduler.ForceSplit = cloned.Scheduler.ForceSplit
+		}
+		if cloned.Scheduler.BalanceScoreThreshold != nil {
+			res.Scheduler.BalanceScoreThreshold = cloned.Scheduler.BalanceScoreThreshold
+		}
+		if cloned.Scheduler.MinTrafficPercentage != nil {
+			res.Scheduler.MinTrafficPercentage = cloned.Scheduler.MinTrafficPercentage
+		}
+		if cloned.Scheduler.MaxTrafficPercentage != nil {
+			res.Scheduler.MaxTrafficPercentage = cloned.Scheduler.MaxTrafficPercentage
 		}
 	}
 
 	if cloned.Integrity != nil {
-		res.Integrity = &IntegrityConfig{
-			IntegrityCheckLevel:   cloned.Integrity.IntegrityCheckLevel,
-			CorruptionHandleLevel: cloned.Integrity.CorruptionHandleLevel,
+		if res.Integrity == nil {
+			res.Integrity = &IntegrityConfig{}
+		}
+
+		if cloned.Integrity.IntegrityCheckLevel != nil {
+			res.Integrity.IntegrityCheckLevel = cloned.Integrity.IntegrityCheckLevel
+		}
+		if cloned.Integrity.CorruptionHandleLevel != nil {
+			res.Integrity.CorruptionHandleLevel = cloned.Integrity.CorruptionHandleLevel
 		}
 	}
 	if cloned.ChangefeedErrorStuckDuration != nil {
 		res.ChangefeedErrorStuckDuration = &JSONDuration{*cloned.ChangefeedErrorStuckDuration}
 	}
 	if cloned.SyncedStatus != nil {
-		res.SyncedStatus = &SyncedStatusConfig{
-			SyncedCheckInterval: cloned.SyncedStatus.SyncedCheckInterval,
-			CheckpointInterval:  cloned.SyncedStatus.CheckpointInterval,
+		if res.SyncedStatus == nil {
+			res.SyncedStatus = &SyncedStatusConfig{}
+		}
+		if cloned.SyncedStatus.SyncedCheckInterval != nil {
+			res.SyncedStatus.SyncedCheckInterval = cloned.SyncedStatus.SyncedCheckInterval
+		}
+		if cloned.SyncedStatus.CheckpointInterval != nil {
+			res.SyncedStatus.CheckpointInterval = cloned.SyncedStatus.CheckpointInterval
 		}
 	}
 	return res
@@ -874,7 +1056,7 @@ type FilterConfig struct {
 
 // MounterConfig represents mounter config for a changefeed
 type MounterConfig struct {
-	WorkerNum int `json:"worker_num"`
+	WorkerNum *int `json:"worker_num,omitempty"`
 }
 
 // EventFilterRule is used by sql event filter and expression filter
@@ -895,10 +1077,10 @@ func (e EventFilterRule) ToInternalEventFilterRule() *config.EventFilterRule {
 	res := &config.EventFilterRule{
 		Matcher:                  e.Matcher,
 		IgnoreSQL:                e.IgnoreSQL,
-		IgnoreInsertValueExpr:    e.IgnoreInsertValueExpr,
-		IgnoreUpdateNewValueExpr: e.IgnoreUpdateNewValueExpr,
-		IgnoreUpdateOldValueExpr: e.IgnoreUpdateOldValueExpr,
-		IgnoreDeleteValueExpr:    e.IgnoreDeleteValueExpr,
+		IgnoreInsertValueExpr:    &e.IgnoreInsertValueExpr,
+		IgnoreUpdateNewValueExpr: &e.IgnoreUpdateNewValueExpr,
+		IgnoreUpdateOldValueExpr: &e.IgnoreUpdateOldValueExpr,
+		IgnoreDeleteValueExpr:    &e.IgnoreDeleteValueExpr,
 	}
 	if len(e.IgnoreEvent) != 0 {
 		res.IgnoreEvent = make([]bf.EventType, len(e.IgnoreEvent))
@@ -912,10 +1094,10 @@ func (e EventFilterRule) ToInternalEventFilterRule() *config.EventFilterRule {
 // ToAPIEventFilterRule converts *config.EventFilterRule to API EventFilterRule
 func ToAPIEventFilterRule(er *config.EventFilterRule) EventFilterRule {
 	res := EventFilterRule{
-		IgnoreInsertValueExpr:    er.IgnoreInsertValueExpr,
-		IgnoreUpdateNewValueExpr: er.IgnoreUpdateNewValueExpr,
-		IgnoreUpdateOldValueExpr: er.IgnoreUpdateOldValueExpr,
-		IgnoreDeleteValueExpr:    er.IgnoreDeleteValueExpr,
+		IgnoreInsertValueExpr:    util.GetOrZero(er.IgnoreInsertValueExpr),
+		IgnoreUpdateNewValueExpr: util.GetOrZero(er.IgnoreUpdateNewValueExpr),
+		IgnoreUpdateOldValueExpr: util.GetOrZero(er.IgnoreUpdateOldValueExpr),
+		IgnoreDeleteValueExpr:    util.GetOrZero(er.IgnoreDeleteValueExpr),
 	}
 	if len(er.Matcher) != 0 {
 		res.Matcher = make([]string, len(er.Matcher))
@@ -945,17 +1127,18 @@ type Table struct {
 // SinkConfig represents sink config for a changefeed
 // This is a duplicate of config.SinkConfig
 type SinkConfig struct {
-	Protocol                         *string             `json:"protocol,omitempty"`
-	SchemaRegistry                   *string             `json:"schema_registry,omitempty"`
-	CSVConfig                        *CSVConfig          `json:"csv,omitempty"`
-	DispatchRules                    []*DispatchRule     `json:"dispatchers,omitempty"`
-	ColumnSelectors                  []*ColumnSelector   `json:"column_selectors,omitempty"`
-	TxnAtomicity                     *string             `json:"transaction_atomicity,omitempty"`
-	EncoderConcurrency               *int                `json:"encoder_concurrency,omitempty"`
-	Terminator                       *string             `json:"terminator,omitempty"`
-	DateSeparator                    *string             `json:"date_separator,omitempty"`
-	EnablePartitionSeparator         *bool               `json:"enable_partition_separator,omitempty"`
-	FileIndexWidth                   *int                `json:"file_index_width,omitempty"`
+	Protocol                 *string           `json:"protocol,omitempty"`
+	SchemaRegistry           *string           `json:"schema_registry,omitempty"`
+	CSVConfig                *CSVConfig        `json:"csv,omitempty"`
+	DispatchRules            []*DispatchRule   `json:"dispatchers,omitempty"`
+	ColumnSelectors          []*ColumnSelector `json:"column_selectors,omitempty"`
+	TxnAtomicity             *string           `json:"transaction_atomicity,omitempty"`
+	EncoderConcurrency       *int              `json:"encoder_concurrency,omitempty"`
+	Terminator               *string           `json:"terminator,omitempty"`
+	DateSeparator            *string           `json:"date_separator,omitempty"`
+	EnablePartitionSeparator *bool             `json:"enable_partition_separator,omitempty"`
+	FileIndexWidth           *int              `json:"file_index_width,omitempty"`
+	// deprecated: it's become useless since v9.0.0
 	EnableKafkaSinkV2                *bool               `json:"enable_kafka_sink_v2,omitempty"`
 	OnlyOutputUpdatedColumns         *bool               `json:"only_output_updated_columns,omitempty"`
 	DeleteOnlyOutputHandleKeyColumns *bool               `json:"delete_only_output_handle_key_columns"`
@@ -985,6 +1168,7 @@ type CSVConfig struct {
 	BinaryEncodingMethod string `json:"binary_encoding_method"`
 	OutputOldValue       bool   `json:"output_old_value"`
 	OutputHandleKey      bool   `json:"output_handle_key"`
+	OutputFieldHeader    bool   `json:"output_field_header"`
 }
 
 // LargeMessageHandleConfig denotes the large message handling config
@@ -1016,18 +1200,18 @@ type ColumnSelector struct {
 // ConsistentConfig represents replication consistency config for a changefeed
 // This is a duplicate of config.ConsistentConfig
 type ConsistentConfig struct {
-	Level                 string `json:"level,omitempty"`
-	MaxLogSize            int64  `json:"max_log_size"`
-	FlushIntervalInMs     int64  `json:"flush_interval"`
-	MetaFlushIntervalInMs int64  `json:"meta_flush_interval"`
-	EncodingWorkerNum     int    `json:"encoding_worker_num"`
-	FlushWorkerNum        int    `json:"flush_worker_num"`
-	Storage               string `json:"storage,omitempty"`
-	UseFileBackend        bool   `json:"use_file_backend"`
-	Compression           string `json:"compression,omitempty"`
-	FlushConcurrency      int    `json:"flush_concurrency,omitempty"`
+	Level                 *string `json:"level,omitempty"`
+	MaxLogSize            *int64  `json:"max_log_size,omitempty"`
+	FlushIntervalInMs     *int64  `json:"flush_interval,omitempty"`
+	MetaFlushIntervalInMs *int64  `json:"meta_flush_interval,omitempty"`
+	EncodingWorkerNum     *int    `json:"encoding_worker_num,omitempty"`
+	FlushWorkerNum        *int    `json:"flush_worker_num,omitempty"`
+	Storage               *string `json:"storage,omitempty"`
+	UseFileBackend        *bool   `json:"use_file_backend,omitempty"`
+	Compression           *string `json:"compression,omitempty"`
+	FlushConcurrency      *int    `json:"flush_concurrency,omitempty"`
 
-	MemoryUsage *ConsistentMemoryUsage `json:"memory_usage"`
+	MemoryUsage *ConsistentMemoryUsage `json:"memory_usage,omitempty"`
 }
 
 // ConsistentMemoryUsage represents memory usage of Consistent module.
@@ -1040,20 +1224,41 @@ type ConsistentMemoryUsage struct {
 type ChangefeedSchedulerConfig struct {
 	// EnableTableAcrossNodes set true to split one table to multiple spans and
 	// distribute to multiple TiCDC nodes.
-	EnableTableAcrossNodes bool `toml:"enable_table_across_nodes" json:"enable_table_across_nodes"`
+	EnableTableAcrossNodes *bool `json:"enable_table_across_nodes,omitempty"`
 	// RegionThreshold is the region count threshold of splitting a table.
-	RegionThreshold int `toml:"region_threshold" json:"region_threshold"`
+	RegionThreshold *int `json:"region_threshold,omitempty"`
+	// RegionCountPerSpan is the maximax region count for each span when first splitted by RegionCountSpliiter
+	RegionCountPerSpan *int `json:"region_count_per_span,omitempty"`
+	// RegionCountRefreshInterval controls how often we refresh span region count with PD.
+	RegionCountRefreshInterval *time.Duration `json:"region_count_refresh_interval,omitempty"`
 	// WriteKeyThreshold is the written keys threshold of splitting a table.
-	WriteKeyThreshold int `toml:"write_key_threshold" json:"write_key_threshold"`
-	// SplitNumberPerNode is the number of splits per node.
-	SplitNumberPerNode int `toml:"split_number_per_node" json:"split_number_per_node"`
+	WriteKeyThreshold *int `json:"write_key_threshold,omitempty"`
+	// SchedulingTaskCountPerNode is the upper limit for scheduling tasks each node.
+	SchedulingTaskCountPerNode *int `json:"scheduling_task_count_per_node,omitempty"`
+	// EnableSplittableCheck controls whether to check if a table is splittable before splitting.
+	// If true, only tables with primary key and no unique key can be split.
+	// If false, all tables can be split without checking.
+	// For MySQL downstream, this is always set to true for data consistency.
+	EnableSplittableCheck *bool `json:"enable_splittable_check,omitempty"`
+	// ForceSplit controls whether to skip the splittable table check for MySQL downstream.
+	// If true, the splittable table check will be skipped even if the downstream is MySQL.
+	// This is useful for advanced users who are aware of the risks of splitting unsplittable tables.
+	// Default value is false.
+	ForceSplit *bool `json:"force_split,omitempty"`
+	// These config is used for adjust the frequency of balancing traffic.
+	// BalanceScoreThreshold is the score threshold for balancing traffic. Larger value means less frequent balancing.
+	BalanceScoreThreshold *int `json:"balance_score_threshold,omitempty"`
+	// MinTrafficPercentage is the minimum traffic percentage for balancing traffic. Larger value means less frequent balancing.
+	MinTrafficPercentage *float64 `json:"min_traffic_percentage,omitempty"`
+	// MaxTrafficPercentage is the maximum traffic percentage for balancing traffic. Less value means less frequent balancing.
+	MaxTrafficPercentage *float64 `json:"max_traffic_percentage,omitempty"`
 }
 
 // IntegrityConfig is the config for integrity check
 // This is a duplicate of Integrity.Config
 type IntegrityConfig struct {
-	IntegrityCheckLevel   string `json:"integrity_check_level"`
-	CorruptionHandleLevel string `json:"corruption_handle_level"`
+	IntegrityCheckLevel   *string `json:"integrity_check_level,omitempty"`
+	CorruptionHandleLevel *string `json:"corruption_handle_level,omitempty"`
 }
 
 // EtcdData contains key/value pair of etcd data
@@ -1073,7 +1278,7 @@ type ResolveLockReq struct {
 type ChangeFeedInfo struct {
 	UpstreamID uint64    `json:"upstream_id,omitempty"`
 	ID         string    `json:"id"`
-	Namespace  string    `json:"namespace"`
+	Keyspace   string    `json:"keyspace"`
 	SinkURI    string    `json:"sink_uri,omitempty"`
 	CreateTime time.Time `json:"create_time"`
 	// Start sync at this commit ts if `StartTs` is specify or using the CreateTime of changefeed.
@@ -1081,16 +1286,16 @@ type ChangeFeedInfo struct {
 	// The ChangeFeed will exits until sync to timestamp TargetTs
 	TargetTs uint64 `json:"target_ts,omitempty"`
 	// used for admin job notification, trigger watch event in capture
-	AdminJobType   model.AdminJobType `json:"admin_job_type,omitempty"`
-	Config         *ReplicaConfig     `json:"config,omitempty"`
-	State          model.FeedState    `json:"state,omitempty"`
-	Error          *RunningError      `json:"error,omitempty"`
-	CreatorVersion string             `json:"creator_version,omitempty"`
+	AdminJobType   config.AdminJobType  `json:"admin_job_type,omitempty"`
+	Config         *ReplicaConfig       `json:"config,omitempty"`
+	State          config.FeedState     `json:"state,omitempty"`
+	Error          *config.RunningError `json:"error,omitempty"`
+	CreatorVersion string               `json:"creator_version,omitempty"`
 
-	ResolvedTs     uint64                    `json:"resolved_ts"`
-	CheckpointTs   uint64                    `json:"checkpoint_ts"`
-	CheckpointTime model.JSONTime            `json:"checkpoint_time"`
-	TaskStatus     []model.CaptureTaskStatus `json:"task_status,omitempty"`
+	ResolvedTs     uint64                     `json:"resolved_ts"`
+	CheckpointTs   uint64                     `json:"checkpoint_ts"`
+	CheckpointTime api.JSONTime               `json:"checkpoint_time"`
+	TaskStatus     []config.CaptureTaskStatus `json:"task_status,omitempty"`
 
 	GID            common.GID `json:"gid"`
 	MaintainerAddr string     `json:"maintainer_addr,omitempty"`
@@ -1098,21 +1303,12 @@ type ChangeFeedInfo struct {
 
 // SyncedStatus describes the detail of a changefeed's synced status
 type SyncedStatus struct {
-	Synced           bool           `json:"synced"`
-	SinkCheckpointTs model.JSONTime `json:"sink_checkpoint_ts"`
-	PullerResolvedTs model.JSONTime `json:"puller_resolved_ts"`
-	LastSyncedTs     model.JSONTime `json:"last_synced_ts"`
-	NowTs            model.JSONTime `json:"now_ts"`
-	Info             string         `json:"info"`
-}
-
-// RunningError represents some running error from cdc components,
-// such as processor.
-type RunningError struct {
-	Time    *time.Time `json:"time,omitempty"`
-	Addr    string     `json:"addr"`
-	Code    string     `json:"code"`
-	Message string     `json:"message"`
+	Synced           bool         `json:"synced"`
+	SinkCheckpointTs api.JSONTime `json:"sink_checkpoint_ts"`
+	PullerResolvedTs api.JSONTime `json:"puller_resolved_ts"`
+	LastSyncedTs     api.JSONTime `json:"last_synced_ts"`
+	NowTs            api.JSONTime `json:"now_ts"`
+	Info             string       `json:"info"`
 }
 
 // toCredential generates a security.Credential from a PDConfig
@@ -1166,26 +1362,22 @@ type ProcessorDetail struct {
 	Tables []int64 `json:"table_ids"`
 }
 
-// Liveness is the liveness status of a capture.
-// Liveness can only be changed from alive to stopping, and no way back.
-type Liveness int32
-
 // ServerStatus holds some common information of a server
 type ServerStatus struct {
-	Version   string   `json:"version"`
-	GitHash   string   `json:"git_hash"`
-	ID        string   `json:"id"`
-	ClusterID string   `json:"cluster_id"`
-	Pid       int      `json:"pid"`
-	IsOwner   bool     `json:"is_owner"`
-	Liveness  Liveness `json:"liveness"`
+	Version   string       `json:"version"`
+	GitHash   string       `json:"git_hash"`
+	ID        string       `json:"id"`
+	ClusterID string       `json:"cluster_id"`
+	Pid       int          `json:"pid"`
+	IsOwner   bool         `json:"is_owner"`
+	Liveness  api.Liveness `json:"liveness"`
 }
 
 // Capture holds common information of a capture in cdc
 type Capture struct {
 	ID string `json:"id"`
 	// IsCoordinator is true if the capture is the coordinator of the TiCDC cluster
-	// We make its json key as `is_owner` to keep the compatibility with old TiCDC.
+	// We make its json key as `is-owner` to keep the compatibility with old TiCDC.
 	IsCoordinator bool   `json:"is_owner"`
 	AdvertiseAddr string `json:"address"`
 	ClusterID     string `json:"cluster_id"`
@@ -1307,11 +1499,11 @@ type CloudStorageConfig struct {
 
 // ChangefeedStatus holds common information of a changefeed in cdc
 type ChangefeedStatus struct {
-	State        string        `json:"state,omitempty"`
-	ResolvedTs   uint64        `json:"resolved_ts"`
-	CheckpointTs uint64        `json:"checkpoint_ts"`
-	LastError    *RunningError `json:"last_error,omitempty"`
-	LastWarning  *RunningError `json:"last_warning,omitempty"`
+	State        string               `json:"state,omitempty"`
+	ResolvedTs   uint64               `json:"resolved_ts"`
+	CheckpointTs uint64               `json:"checkpoint_ts"`
+	LastError    *config.RunningError `json:"last_error,omitempty"`
+	LastWarning  *config.RunningError `json:"last_warning,omitempty"`
 }
 
 // GlueSchemaRegistryConfig represents a glue schema registry configuration

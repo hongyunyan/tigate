@@ -16,13 +16,14 @@ package csv
 import (
 	"bytes"
 
+	commonType "github.com/pingcap/ticdc/pkg/common"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
 	"github.com/pingcap/ticdc/pkg/sink/codec/common"
-	"github.com/pingcap/tiflow/pkg/sink/codec"
 )
 
 // batchEncoder encodes the events into the byte of a batch into.
 type batchEncoder struct {
+	header    []byte
 	valueBuf  *bytes.Buffer
 	callback  func()
 	batchSize int
@@ -39,9 +40,13 @@ func NewTxnEventEncoder(config *common.Config) common.TxnEventEncoder {
 
 // AppendTxnEvent implements the TxnEventEncoder interface
 func (b *batchEncoder) AppendTxnEvent(event *commonEvent.DMLEvent) error {
+	if b.config.CSVOutputFieldHeader && b.batchSize == 0 {
+		b.setHeader(event.TableInfo)
+	}
 	for {
 		row, ok := event.GetNextRow()
 		if !ok {
+			event.Rewind()
 			break
 		}
 		msg, err := rowChangedEvent2CSVMsg(b.config, &commonEvent.RowEvent{
@@ -64,16 +69,27 @@ func (b *batchEncoder) Build() (messages []*common.Message) {
 	if b.batchSize == 0 {
 		return nil
 	}
-	ret := common.NewMsg(nil, b.valueBuf.Bytes())
+	ret := common.NewMsg(b.header, b.valueBuf.Bytes())
 	ret.SetRowsCount(b.batchSize)
 	ret.Callback = b.callback
-	if b.valueBuf.Cap() > codec.MemBufShrinkThreshold {
+	if b.valueBuf.Cap() > common.MemBufShrinkThreshold {
 		b.valueBuf = &bytes.Buffer{}
 	} else {
 		b.valueBuf.Reset()
 	}
 	b.callback = nil
 	b.batchSize = 0
+	b.header = nil
 
 	return []*common.Message{ret}
+}
+
+func (b *batchEncoder) setHeader(tableInfo *commonType.TableInfo) {
+	buf := &bytes.Buffer{}
+	colNames := make([]string, 0, len(tableInfo.GetColumns()))
+	for _, col := range tableInfo.GetColumns() {
+		colNames = append(colNames, col.Name.O)
+	}
+	buf.Write(encodeHeader(b.config, colNames))
+	b.header = buf.Bytes()
 }

@@ -11,8 +11,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:generate msgp
-
 package common
 
 import (
@@ -63,9 +61,44 @@ func (v *RawKVEntry) IsResolved() bool {
 	return v.OpType == OpTypeResolved
 }
 
+func (v *RawKVEntry) IsDelete() bool {
+	return v.OpType == OpTypeDelete
+}
+
 // IsUpdate checks if the event is an update event.
 func (v *RawKVEntry) IsUpdate() bool {
-	return v.OpType == OpTypePut && v.OldValue != nil && v.Value != nil
+	return v.OpType == OpTypePut && len(v.OldValue) > 0 && len(v.Value) > 0
+}
+
+// IsInsert checks if the event is an insert event.
+func (v *RawKVEntry) IsInsert() bool {
+	return v.OpType == OpTypePut && len(v.OldValue) == 0
+}
+
+func (v *RawKVEntry) SplitUpdate() (deleteRow, insertRow *RawKVEntry, err error) {
+	if !v.IsUpdate() {
+		return nil, nil, nil
+	}
+
+	deleteRow = &RawKVEntry{
+		OpType:   OpTypeDelete,
+		CRTs:     v.CRTs,
+		StartTs:  v.StartTs,
+		RegionID: v.RegionID,
+		Key:      v.Key,
+		OldValue: v.OldValue,
+	}
+
+	insertRow = &RawKVEntry{
+		OpType:   OpTypePut,
+		CRTs:     v.CRTs,
+		StartTs:  v.StartTs,
+		RegionID: v.RegionID,
+		Key:      v.Key,
+		Value:    v.Value,
+	}
+
+	return deleteRow, insertRow, nil
 }
 
 func (v *RawKVEntry) String() string {
@@ -75,10 +108,9 @@ func (v *RawKVEntry) String() string {
 		v.OpType, string(v.Key), string(v.Value), string(v.OldValue), v.StartTs, v.CRTs, v.RegionID)
 }
 
-// ApproximateDataSize calculate the approximate size of protobuf binary
-// representation of this event.
-func (v *RawKVEntry) ApproximateDataSize() int64 {
-	return int64(len(v.Key) + len(v.Value) + len(v.OldValue))
+// GetSize return the size of the RawKVEntry in bytes
+func (v *RawKVEntry) GetSize() int64 {
+	return int64(len(v.Key)+len(v.Value)+len(v.OldValue)) + 40 // 4*uint32 + 3*uint64
 }
 
 // Encode serializes the RawKVEntry into a byte slice
@@ -108,6 +140,7 @@ func (v *RawKVEntry) Encode() []byte {
 }
 
 // Decode deserializes a byte slice into a RawKVEntry
+// Note: the `data` slice may be changed after calling this function, so do not keep reference to it.
 func (v *RawKVEntry) Decode(data []byte) error {
 	if len(data) < 36 { // Minimum size for fixed-length fields
 		return fmt.Errorf("insufficient data length")
@@ -135,13 +168,21 @@ func (v *RawKVEntry) Decode(data []byte) error {
 		return fmt.Errorf("insufficient data for variable-length fields")
 	}
 
-	v.Key = data[offset : offset+int(v.KeyLen)]
+	// the `data` slice may be changed, so we copy it here
+	v.Key = make([]byte, v.KeyLen)
+	copy(v.Key, data[offset:offset+int(v.KeyLen)])
 	offset += int(v.KeyLen)
 
-	v.Value = data[offset : offset+int(v.ValueLen)]
+	v.Value = make([]byte, v.ValueLen)
+	copy(v.Value, data[offset:offset+int(v.ValueLen)])
 	offset += int(v.ValueLen)
 
-	v.OldValue = data[offset : offset+int(v.OldValueLen)]
+	if v.OldValueLen > 0 {
+		v.OldValue = make([]byte, v.OldValueLen)
+		copy(v.OldValue, data[offset:offset+int(v.OldValueLen)])
+	} else {
+		v.OldValue = nil
+	}
 
 	return nil
 }

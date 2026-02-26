@@ -21,23 +21,25 @@ import (
 	v2 "github.com/pingcap/ticdc/api/v2"
 	"github.com/pingcap/ticdc/cmd/cdc/factory"
 	"github.com/pingcap/ticdc/cmd/util"
-	apiv2client "github.com/pingcap/ticdc/pkg/api/v2"
+	apiClient "github.com/pingcap/ticdc/pkg/api/v2"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
+	putil "github.com/pingcap/ticdc/pkg/util"
 	"github.com/spf13/cobra"
 	"github.com/tikv/client-go/v2/oracle"
 )
 
 // resumeChangefeedOptions defines flags for the `cli changefeed resume` command.
 type resumeChangefeedOptions struct {
-	apiClient apiv2client.APIV2Interface
+	apiClient apiClient.APIV2Interface
 
 	changefeedID          string
-	namespace             string
+	keyspace              string
 	changefeedDetail      *v2.ChangeFeedInfo
 	noConfirm             bool
 	overwriteCheckpointTs string
 	currentTso            *v2.Tso
 	checkpointTs          uint64
+	verbose               bool
 
 	upstreamPDAddrs  string
 	upstreamCaPath   string
@@ -53,7 +55,7 @@ func newResumeChangefeedOptions() *resumeChangefeedOptions {
 // addFlags receives a *cobra.Command reference and binds
 // flags related to template printing to it.
 func (o *resumeChangefeedOptions) addFlags(cmd *cobra.Command) {
-	cmd.PersistentFlags().StringVarP(&o.namespace, "namespace", "n", "default", "Replication task (changefeed) Namespace")
+	cmd.PersistentFlags().StringVarP(&o.keyspace, "keyspace", "k", "default", "Replication task (changefeed) Keyspace")
 	cmd.PersistentFlags().StringVarP(&o.changefeedID, "changefeed-id", "c", "", "Replication task (changefeed) ID")
 	cmd.PersistentFlags().BoolVar(&o.noConfirm, "no-confirm", false, "Don't ask user whether to ignore ineligible table")
 	cmd.PersistentFlags().StringVar(&o.overwriteCheckpointTs, "overwrite-checkpoint-ts", "",
@@ -66,6 +68,7 @@ func (o *resumeChangefeedOptions) addFlags(cmd *cobra.Command) {
 		"Certificate path for TLS connection to upstream")
 	cmd.PersistentFlags().StringVar(&o.upstreamKeyPath, "upstream-key", "",
 		"Private key path for TLS connection to upstream")
+	cmd.PersistentFlags().BoolVarP(&o.verbose, "verbose", "v", false, "Print verbose information when updating a changefeed. Caution: This will list all tables to be replicated by the changefeed. If the number of tables is extremely large, it may flood your screen.")
 	// we don't support specify there flags below when cdc version <= 6.3.0
 	_ = cmd.PersistentFlags().MarkHidden("upstream-pd")
 	_ = cmd.PersistentFlags().MarkHidden("upstream-ca")
@@ -130,7 +133,7 @@ func (o *resumeChangefeedOptions) getTSO(ctx context.Context) (*v2.Tso, error) {
 func (o *resumeChangefeedOptions) getChangefeedInfo(ctx context.Context) (
 	*v2.ChangeFeedInfo, error,
 ) {
-	detail, err := o.apiClient.Changefeeds().Get(ctx, o.namespace, o.changefeedID)
+	detail, err := o.apiClient.Changefeeds().Get(ctx, o.keyspace, o.changefeedID)
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +197,7 @@ func (o *resumeChangefeedOptions) validateParams(ctx context.Context) error {
 
 // run the `cli changefeed resume` command.
 func (o *resumeChangefeedOptions) run(cmd *cobra.Command) error {
-	ctx := context.Background()
+	ctx := cmd.Context()
 
 	if err := o.validateParams(ctx); err != nil {
 		return err
@@ -204,8 +207,49 @@ func (o *resumeChangefeedOptions) run(cmd *cobra.Command) error {
 	if err := o.confirmResumeChangefeedCheck(cmd); err != nil {
 		return err
 	}
-	err := o.apiClient.Changefeeds().Resume(ctx, cfg, o.namespace, o.changefeedID)
-
+	var (
+		tables = &v2.Tables{}
+		err1   error
+	)
+	overwrite := o.checkpointTs != 0
+	if overwrite {
+		cf, err := o.apiClient.Changefeeds().Get(ctx, o.keyspace, o.changefeedID)
+		if err != nil {
+			return err
+		}
+		tables, err1 = o.apiClient.Changefeeds().GetAllTables(ctx, &v2.VerifyTableConfig{
+			ReplicaConfig: cf.Config,
+			StartTs:       cf.CheckpointTs,
+		}, o.keyspace)
+		if err1 == nil {
+			if len(tables.IneligibleTables) != 0 {
+				if putil.GetOrZero(cf.Config.ForceReplicate) {
+					cmd.Printf("[WARN] Force to replicate some ineligible tables, "+
+						"these tables do not have a primary key or a not-null unique key: %#v\n"+
+						"[WARN] This may cause data redundancy, "+
+						"please refer to the official documentation for details.\n",
+						tables.IneligibleTables)
+				} else {
+					cmd.Printf("[WARN] Some tables are not eligible to replicate, "+
+						"because they do not have a primary key or a not-null unique key: %#v\n",
+						tables.IneligibleTables)
+				}
+			}
+		}
+	}
+	err := o.apiClient.Changefeeds().Resume(ctx, cfg, o.keyspace, o.changefeedID)
+	if err != nil {
+		return err
+	}
+	cmd.Printf("Resume changefeed successfully! \nID: %s\n", o.changefeedID)
+	if overwrite {
+		cmd.Printf("IneligibleTablesCount: %d\nEligibleTablesCount: %d\nAllTablesCount: %d\nWarning: %s\n", len(tables.IneligibleTables), len(tables.EligibleTables), len(tables.AllTables), err1)
+		if o.verbose {
+			cmd.Printf("EligibleTables: %s\n", formatTableNames(tables.EligibleTables))
+			cmd.Printf("IneligibleTables: %s\n", formatTableNames(tables.IneligibleTables))
+			cmd.Printf("AllTables: %s\n", formatTableNames(tables.AllTables))
+		}
+	}
 	return err
 }
 

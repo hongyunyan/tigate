@@ -16,7 +16,6 @@ package cloudstorage
 import (
 	"context"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -29,14 +28,12 @@ import (
 	"github.com/pingcap/log"
 	commonType "github.com/pingcap/ticdc/pkg/common"
 	appcontext "github.com/pingcap/ticdc/pkg/common/context"
+	"github.com/pingcap/ticdc/pkg/config"
+	"github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/hash"
 	"github.com/pingcap/ticdc/pkg/pdutil"
+	"github.com/pingcap/ticdc/pkg/util"
 	"github.com/pingcap/tidb/br/pkg/storage"
-	"github.com/pingcap/tiflow/cdc/model"
-	"github.com/pingcap/tiflow/engine/pkg/clock"
-	"github.com/pingcap/tiflow/pkg/config"
-	"github.com/pingcap/tiflow/pkg/errors"
-	"github.com/pingcap/tiflow/pkg/hash"
-	"github.com/pingcap/tiflow/pkg/util"
 	"github.com/tikv/client-go/v2/oracle"
 	"go.uber.org/zap"
 )
@@ -44,8 +41,9 @@ import (
 const (
 	// 3 is the length of "CDC", and the file number contains
 	// at least 6 digits (e.g. CDC000001.csv).
-	minFileNamePrefixLen = 3 + config.MinFileIndexWidth
-	defaultIndexFileName = "meta/CDC.index"
+	minFileNamePrefixLen                 = 3 + config.MinFileIndexWidth
+	defaultTableAcrossNodesIndexFileName = "meta/CDC_%s.index"
+	defaultIndexFileName                 = "meta/CDC.index"
 
 	// The following constants are used to generate file paths.
 	schemaFileNameFormat = "schema_%d_%010d.json"
@@ -112,8 +110,11 @@ func generateSchemaFilePath(
 	return path.Join(dir, name)
 }
 
-func generateDataFileName(index uint64, extension string, fileIndexWidth int) string {
+func generateDataFileName(enableTableAcrossNodes bool, dispatcherID string, index uint64, extension string, fileIndexWidth int) string {
 	indexFmt := "%0" + strconv.Itoa(fileIndexWidth) + "d"
+	if enableTableAcrossNodes {
+		return fmt.Sprintf("CDC_%s_"+indexFmt+"%s", dispatcherID, index, extension)
+	}
 	return fmt.Sprintf("CDC"+indexFmt+"%s", index, extension)
 }
 
@@ -132,6 +133,7 @@ type VersionedTableName struct {
 	// schema storage. It can either be finished ts of a DDL event,
 	// or be the checkpoint ts when processor is restarted.
 	TableInfoVersion uint64
+	DispatcherID     commonType.DispatcherID
 }
 
 // FilePathGenerator is used to generate data file path and index file path.
@@ -155,12 +157,6 @@ func NewFilePathGenerator(
 	extension string,
 ) *FilePathGenerator {
 	pdClock := appcontext.GetService[pdutil.Clock](appcontext.DefaultPDClock)
-	if pdClock == nil {
-		pdClock = pdutil.NewMonotonicClock(clock.New())
-		log.Warn("pd clock is not set in storage sink, use local clock instead",
-			zap.String("namespace", changefeedID.Namespace()),
-			zap.Stringer("changefeedID", changefeedID.ID()))
-	}
 	return &FilePathGenerator{
 		changefeedID: changefeedID,
 		config:       config,
@@ -175,13 +171,14 @@ func NewFilePathGenerator(
 
 // CheckOrWriteSchema checks whether the schema file exists in the storage and
 // write scheme.json if necessary.
+// It returns true if there is a newer schema version in storage than the passed table version.
 func (f *FilePathGenerator) CheckOrWriteSchema(
 	ctx context.Context,
 	table VersionedTableName,
 	tableInfo *commonType.TableInfo,
-) error {
+) (bool, error) {
 	if _, ok := f.versionMap[table]; ok {
-		return nil
+		return false, nil
 	}
 
 	var def TableDefinition
@@ -189,25 +186,25 @@ func (f *FilePathGenerator) CheckOrWriteSchema(
 	if !def.IsTableSchema() {
 		// only check schema for table
 		log.Error("invalid table schema",
-			zap.String("namespace", f.changefeedID.Namespace()),
+			zap.String("keyspace", f.changefeedID.Keyspace()),
 			zap.Stringer("changefeedID", f.changefeedID.ID()),
 			zap.Any("versionedTableName", table),
 			zap.Any("tableInfo", tableInfo))
-		return errors.ErrInternalCheckFailed.GenWithStackByArgs("invalid table schema in FilePathGenerator")
+		return false, errors.ErrInternalCheckFailed.GenWithStackByArgs("invalid table schema in FilePathGenerator")
 	}
 
 	// Case 1: point check if the schema file exists.
 	tblSchemaFile, err := def.GenerateSchemaFilePath()
 	if err != nil {
-		return err
+		return false, err
 	}
 	exist, err := f.storage.FileExists(ctx, tblSchemaFile)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if exist {
 		f.versionMap[table] = table.TableInfoVersion
-		return nil
+		return false, nil
 	}
 
 	// walk the table meta path to find the last schema file
@@ -216,9 +213,10 @@ func (f *FilePathGenerator) CheckOrWriteSchema(
 	lastVersion := uint64(0)
 	subDir := fmt.Sprintf(tableSchemaPrefix, def.Schema, def.Table)
 	checksumSuffix := fmt.Sprintf("%010d.json", checksum)
+	hasNewerSchemaVersion := false
 	err = f.storage.WalkDir(ctx, &storage.WalkOption{
 		SubDir:    subDir, /* use subDir to prevent walk the whole storage */
-		ObjPrefix: subDir + "schema_",
+		ObjPrefix: "schema_",
 	}, func(path string, _ int64) error {
 		schemaFileCnt++
 		if !strings.HasSuffix(path, checksumSuffix) {
@@ -227,12 +225,15 @@ func (f *FilePathGenerator) CheckOrWriteSchema(
 		version, parsedChecksum := mustParseSchemaName(path)
 		if parsedChecksum != checksum {
 			log.Error("invalid schema file name",
-				zap.String("namespace", f.changefeedID.Namespace()),
+				zap.String("keyspace", f.changefeedID.Keyspace()),
 				zap.Stringer("changefeedID", f.changefeedID.ID()),
 				zap.String("path", path), zap.Any("checksum", checksum))
 			errMsg := fmt.Sprintf("invalid schema filename in storage sink, "+
 				"expected checksum: %d, actual checksum: %d", checksum, parsedChecksum)
 			return errors.ErrInternalCheckFailed.GenWithStackByArgs(errMsg)
+		}
+		if version > table.TableInfoVersion {
+			hasNewerSchemaVersion = true
 		}
 		if version > lastVersion {
 			lastVersion = version
@@ -240,13 +241,24 @@ func (f *FilePathGenerator) CheckOrWriteSchema(
 		return nil
 	})
 	if err != nil {
-		return err
+		return false, err
+	}
+	if hasNewerSchemaVersion {
+		return true, nil
 	}
 
 	// Case 2: the table meta path is not empty.
 	if schemaFileCnt != 0 && lastVersion != 0 {
+		log.Info("table schema file with exact version not found, using latest available",
+			zap.String("keyspace", f.changefeedID.Keyspace()),
+			zap.Stringer("changefeedID", f.changefeedID.ID()),
+			zap.Any("versionedTableName", table),
+			zap.Uint64("tableVersion", lastVersion),
+			zap.Uint32("checksum", checksum))
+		// record the last version of the table schema file.
+		// we don't need to write schema file to external storage again.
 		f.versionMap[table] = lastVersion
-		return nil
+		return false, nil
 	}
 
 	// Case 3: the table meta path is empty, which happens when:
@@ -254,17 +266,17 @@ func (f *FilePathGenerator) CheckOrWriteSchema(
 	//  b. the schema file is deleted by the consumer. We write schema file to external storage too.
 	if schemaFileCnt != 0 && lastVersion == 0 {
 		log.Warn("no table schema file found in an non-empty meta path",
-			zap.String("namespace", f.changefeedID.Namespace()),
+			zap.String("keyspace", f.changefeedID.Keyspace()),
 			zap.Stringer("changefeedID", f.changefeedID.ID()),
 			zap.Any("versionedTableName", table),
 			zap.Uint32("checksum", checksum))
 	}
 	encodedDetail, err := def.MarshalWithQuery()
 	if err != nil {
-		return err
+		return false, err
 	}
 	f.versionMap[table] = table.TableInfoVersion
-	return f.storage.WriteFile(ctx, tblSchemaFile, encodedDetail)
+	return false, f.storage.WriteFile(ctx, tblSchemaFile, encodedDetail)
 }
 
 // SetClock is used for unit test
@@ -296,6 +308,9 @@ func (f *FilePathGenerator) GenerateDateStr() string {
 func (f *FilePathGenerator) GenerateIndexFilePath(tbl VersionedTableName, date string) string {
 	dir := f.generateDataDirPath(tbl, date)
 	name := defaultIndexFileName
+	if f.config.EnableTableAcrossNodes {
+		name = fmt.Sprintf(defaultTableAcrossNodesIndexFileName, tbl.DispatcherID.String())
+	}
 	return path.Join(dir, name)
 }
 
@@ -304,11 +319,47 @@ func (f *FilePathGenerator) GenerateDataFilePath(
 	ctx context.Context, tbl VersionedTableName, date string,
 ) (string, error) {
 	dir := f.generateDataDirPath(tbl, date)
-	name, err := f.generateDataFileName(ctx, tbl, date)
+	newIndexFile := false
+	if idx, ok := f.fileIndex[tbl]; !ok {
+		fileIdx, err := f.getFileIdxFromIndexFile(ctx, tbl, date)
+		if err != nil {
+			return "", err
+		}
+		f.fileIndex[tbl] = &indexWithDate{
+			prevDate: date,
+			currDate: date,
+			index:    fileIdx,
+		}
+		newIndexFile = true
+	} else {
+		idx.currDate = date
+	}
+	// if date changed, reset the counter
+	if f.fileIndex[tbl].prevDate != f.fileIndex[tbl].currDate {
+		f.fileIndex[tbl].prevDate = f.fileIndex[tbl].currDate
+		f.fileIndex[tbl].index = 0
+	}
+	f.fileIndex[tbl].index++
+	name := generateDataFileName(f.config.EnableTableAcrossNodes, tbl.DispatcherID.String(), f.fileIndex[tbl].index, f.extension, f.config.FileIndexWidth)
+	dataFile := path.Join(dir, name)
+	exist, err := f.storage.FileExists(ctx, dataFile)
 	if err != nil {
 		return "", err
 	}
-	return path.Join(dir, name), nil
+	if !exist {
+		return dataFile, nil
+	}
+	if newIndexFile {
+		log.Warn("the data file exists and the index file is stale",
+			zap.String("keyspace", f.changefeedID.Keyspace()),
+			zap.Stringer("changefeedID", f.changefeedID.ID()),
+			zap.Any("versionedTableName", tbl),
+			zap.String("dataFile", dataFile))
+	}
+	// if the file already exists, which means the fileIndex is stale,
+	// we need to delete the file index in memory and re-generate the file path with the updated file index until we find a non-existing file path.
+	delete(f.fileIndex, tbl)
+	return f.GenerateDataFilePath(ctx, tbl, date)
 }
 
 func (f *FilePathGenerator) generateDataDirPath(tbl VersionedTableName, date string) string {
@@ -329,33 +380,7 @@ func (f *FilePathGenerator) generateDataDirPath(tbl VersionedTableName, date str
 	return path.Join(elems...)
 }
 
-func (f *FilePathGenerator) generateDataFileName(
-	ctx context.Context, tbl VersionedTableName, date string,
-) (string, error) {
-	if idx, ok := f.fileIndex[tbl]; !ok {
-		fileIdx, err := f.getNextFileIdxFromIndexFile(ctx, tbl, date)
-		if err != nil {
-			return "", err
-		}
-		f.fileIndex[tbl] = &indexWithDate{
-			prevDate: date,
-			currDate: date,
-			index:    fileIdx,
-		}
-	} else {
-		idx.currDate = date
-	}
-
-	// if date changed, reset the counter
-	if f.fileIndex[tbl].prevDate != f.fileIndex[tbl].currDate {
-		f.fileIndex[tbl].prevDate = f.fileIndex[tbl].currDate
-		f.fileIndex[tbl].index = 0
-	}
-	f.fileIndex[tbl].index++
-	return generateDataFileName(f.fileIndex[tbl].index, f.extension, f.config.FileIndexWidth), nil
-}
-
-func (f *FilePathGenerator) getNextFileIdxFromIndexFile(
+func (f *FilePathGenerator) getFileIdxFromIndexFile(
 	ctx context.Context, tbl VersionedTableName, date string,
 ) (uint64, error) {
 	indexFile := f.GenerateIndexFilePath(tbl, date)
@@ -372,64 +397,28 @@ func (f *FilePathGenerator) getNextFileIdxFromIndexFile(
 		return 0, err
 	}
 	fileName := strings.TrimSuffix(string(data), "\n")
-	maxFileIdx, err := f.fetchIndexFromFileName(fileName)
-	if err != nil {
-		return 0, err
-	}
-
-	lastFilePath := path.Join(
-		f.generateDataDirPath(tbl, date),                                       // file dir
-		generateDataFileName(maxFileIdx, f.extension, f.config.FileIndexWidth), // file name
-	)
-	var lastFileExists, lastFileIsEmpty bool
-	lastFileExists, err = f.storage.FileExists(ctx, lastFilePath)
-	if err != nil {
-		return 0, err
-	}
-
-	if lastFileExists {
-		fileReader, err := f.storage.Open(ctx, lastFilePath, nil)
-		if err != nil {
-			return 0, err
-		}
-		readBytes, err := fileReader.Read(make([]byte, 1))
-		if err != nil && err != io.EOF {
-			return 0, err
-		}
-		lastFileIsEmpty = readBytes == 0
-		if err := fileReader.Close(); err != nil {
-			return 0, err
-		}
-	}
-
-	var fileIdx uint64
-	if lastFileExists && !lastFileIsEmpty {
-		fileIdx = maxFileIdx
-	} else {
-		// Reuse the old index number if the last file does not exist.
-		fileIdx = maxFileIdx - 1
-	}
-	return fileIdx, nil
+	return FetchIndexFromFileName(fileName, f.extension)
 }
 
-func (f *FilePathGenerator) fetchIndexFromFileName(fileName string) (uint64, error) {
-	var fileIdx uint64
-	var err error
-
-	if len(fileName) < minFileNamePrefixLen+len(f.extension) ||
+func FetchIndexFromFileName(fileName string, extension string) (uint64, error) {
+	if len(fileName) < minFileNamePrefixLen+len(extension) ||
 		!strings.HasPrefix(fileName, "CDC") ||
-		!strings.HasSuffix(fileName, f.extension) {
+		!strings.HasSuffix(fileName, extension) {
 		return 0, errors.WrapError(errors.ErrStorageSinkInvalidFileName,
 			fmt.Errorf("'%s' is a invalid file name", fileName))
 	}
 
-	extIdx := strings.Index(fileName, f.extension)
-	fileIdxStr := fileName[3:extIdx]
-	if fileIdx, err = strconv.ParseUint(fileIdxStr, 10, 64); err != nil {
-		return 0, errors.WrapError(errors.ErrStorageSinkInvalidFileName, err)
+	// CDC[_{dispatcherID}_]{num}.fileExtension
+	pathRE, err := regexp.Compile(`CDC(?:_(\w+)_)?(\d+).\w+`)
+	if err != nil {
+		return 0, err
 	}
 
-	return fileIdx, nil
+	matches := pathRE.FindStringSubmatch(fileName)
+	if len(matches) != 3 {
+		return 0, fmt.Errorf("cannot match dml path pattern for %s", fileName)
+	}
+	return strconv.ParseUint(matches[2], 10, 64)
 }
 
 var dateSeparatorDayRegexp *regexp.Regexp
@@ -440,7 +429,7 @@ func RemoveExpiredFiles(
 	_ commonType.ChangeFeedID,
 	storage storage.ExternalStorage,
 	cfg *Config,
-	checkpointTs model.Ts,
+	checkpointTs uint64,
 ) (uint64, error) {
 	if cfg.DateSeparator != config.DateSeparatorDay.String() {
 		return 0, nil
@@ -456,7 +445,8 @@ func RemoveExpiredFiles(
 
 	cnt := uint64(0)
 	err := util.RemoveFilesIf(ctx, storage, func(path string) bool {
-		// the path is like: <schema>/<table>/<tableVersion>/<partitionID>/<date>/CDC{num}.extension
+		// the path is like: <schema>/<table>/<tableVersion>/<partitionID>/<date>/CDC_{dispatcher}_{num}.extension
+		// or <schema>/<table>/<tableVersion>/<partitionID>/<date>/CDC{num}.extension
 		match := dateSeparatorDayRegexp.FindString(path)
 		if match != "" && match < expiredDate {
 			cnt++
@@ -486,7 +476,7 @@ func RemoveEmptyDirs(
 			files, err := os.ReadDir(path)
 			if err == nil && len(files) == 0 {
 				log.Debug("Deleting empty directory",
-					zap.String("namespace", id.Namespace()),
+					zap.String("keyspace", id.Keyspace()),
 					zap.Stringer("changeFeedID", id.ID()),
 					zap.String("path", path))
 				os.Remove(path)

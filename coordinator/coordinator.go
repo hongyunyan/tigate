@@ -21,9 +21,11 @@ import (
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/coordinator/changefeed"
+	"github.com/pingcap/ticdc/coordinator/gccleaner"
 	"github.com/pingcap/ticdc/pkg/common"
 	appcontext "github.com/pingcap/ticdc/pkg/common/context"
 	"github.com/pingcap/ticdc/pkg/config"
+	"github.com/pingcap/ticdc/pkg/config/kerneltype"
 	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/messaging"
 	"github.com/pingcap/ticdc/pkg/metrics"
@@ -31,10 +33,9 @@ import (
 	"github.com/pingcap/ticdc/pkg/pdutil"
 	"github.com/pingcap/ticdc/pkg/server"
 	"github.com/pingcap/ticdc/pkg/txnutil/gc"
+	"github.com/pingcap/ticdc/pkg/util"
 	"github.com/pingcap/ticdc/server/watcher"
 	"github.com/pingcap/ticdc/utils/chann"
-	"github.com/pingcap/ticdc/utils/threadpool"
-	"github.com/pingcap/tiflow/cdc/model"
 	"github.com/tikv/client-go/v2/oracle"
 	pd "github.com/tikv/pd/client"
 	"go.uber.org/atomic"
@@ -67,8 +68,6 @@ import (
 // 5. Controller reports checkpoint TS
 // 6. Coordinator saves checkpoint TS to meta store
 
-var updateGCTickerInterval = 1 * time.Minute
-
 // coordinator implements the Coordinator interface
 type coordinator struct {
 	nodeInfo     *node.Info
@@ -79,18 +78,22 @@ type coordinator struct {
 	controller *Controller
 	backend    changefeed.Backend
 
-	mc            messaging.MessageCenter
-	taskScheduler threadpool.ThreadPool
+	mc             messaging.MessageCenter
+	gcManager      gc.Manager
+	gcTickInterval time.Duration
+	gcCleaner      *gccleaner.Cleaner
 
-	gcManager gc.Manager
-	pdClient  pd.Client
-	pdClock   pdutil.Clock
+	pdClient pd.Client
+	pdClock  pdutil.Clock
 
 	// eventCh is used to receive the event from message center, basically these messages
 	// are from maintainer.
 	eventCh *chann.DrainableChann[*Event]
 	// changefeedChangeCh is used to receive the changefeed change from the controller
-	changefeedChangeCh chan []*ChangefeedChange
+	changefeedChangeCh chan []*changefeedChange
+
+	// msgGuardWaitGroup guards Add/Wait so Stop never races with new recv handlers.
+	msgGuardWaitGroup util.GuardedWaitGroup
 
 	cancel func()
 	closed atomic.Bool
@@ -98,7 +101,6 @@ type coordinator struct {
 
 func New(node *node.Info,
 	pdClient pd.Client,
-	pdClock pdutil.Clock,
 	backend changefeed.Backend,
 	gcServiceID string,
 	version int64,
@@ -107,37 +109,33 @@ func New(node *node.Info,
 ) server.Coordinator {
 	mc := appcontext.GetService[messaging.MessageCenter](appcontext.MessageCenter)
 	c := &coordinator{
-		version:            version,
-		nodeInfo:           node,
-		gcServiceID:        gcServiceID,
-		lastTickTime:       time.Now(),
-		gcManager:          gc.NewManager(gcServiceID, pdClient, pdClock),
+		version:        version,
+		nodeInfo:       node,
+		gcServiceID:    gcServiceID,
+		gcManager:      gc.NewManager(gcServiceID, pdClient),
+		gcCleaner:      gccleaner.New(pdClient, gcServiceID),
+		gcTickInterval: time.Minute,
+		lastTickTime:   time.Now(),
+
 		eventCh:            chann.NewAutoDrainChann[*Event](),
 		pdClient:           pdClient,
-		pdClock:            pdClock,
+		pdClock:            appcontext.GetService[pdutil.Clock](appcontext.DefaultPDClock),
 		mc:                 mc,
-		changefeedChangeCh: make(chan []*ChangefeedChange, 1024),
+		changefeedChangeCh: make(chan []*changefeedChange, 1024),
 		backend:            backend,
 	}
 	// handle messages from message center
 	mc.RegisterHandler(messaging.CoordinatorTopic, c.recvMessages)
-
-	c.taskScheduler = threadpool.NewThreadPoolDefault()
-	c.closed.Store(false)
-
-	controller := NewController(
+	c.controller = NewController(
 		c.version,
 		c.nodeInfo,
 		c.changefeedChangeCh,
 		c.backend,
 		c.eventCh,
-		c.taskScheduler,
 		batchSize,
 		balanceCheckInterval,
 		c.pdClient,
 	)
-
-	c.controller = controller
 
 	nodeManager := appcontext.GetService[*watcher.NodeManager](watcher.NodeManagerName)
 	nodeManager.RegisterOwnerChangeHandler(
@@ -147,18 +145,28 @@ func New(node *node.Info,
 				log.Info("Coordinator changed, and I am not the coordinator, stop myself",
 					zap.String("selfID", string(c.nodeInfo.ID)),
 					zap.String("newCoordinatorID", newCoordinatorID))
-				c.AsyncStop()
+				c.Stop()
 			}
 		})
 
 	return c
 }
 
-func (c *coordinator) recvMessages(_ context.Context, msg *messaging.TargetMessage) error {
-	if c.closed.Load() {
+func (c *coordinator) recvMessages(ctx context.Context, msg *messaging.TargetMessage) error {
+	if !c.msgGuardWaitGroup.AddIf(func() bool {
+		return !c.closed.Load()
+	}) {
 		return nil
 	}
-	c.eventCh.In() <- &Event{message: msg}
+	defer c.msgGuardWaitGroup.Done()
+
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	default:
+		c.eventCh.In() <- &Event{message: msg}
+	}
+
 	return nil
 }
 
@@ -167,13 +175,21 @@ func (c *coordinator) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	c.cancel = cancel
 
-	eg, cctx := errgroup.WithContext(ctx)
+	eg, ctx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
-		return c.run(cctx)
+		return c.run(ctx)
 	})
 	eg.Go(func() error {
-		return c.runHandleEvent(cctx)
+		return c.runHandleEvent(ctx)
 	})
+	eg.Go(func() error {
+		return c.gcCleaner.Run(ctx)
+	})
+
+	eg.Go(func() error {
+		return c.controller.collectMetrics(ctx)
+	})
+
 	return eg.Wait()
 }
 
@@ -183,25 +199,25 @@ func (c *coordinator) Run(ctx context.Context) error {
 // 3. handle the state changed event
 func (c *coordinator) run(ctx context.Context) error {
 	failpoint.Inject("InjectUpdateGCTickerInterval", func(val failpoint.Value) {
-		updateGCTickerInterval = time.Duration(val.(int) * int(time.Millisecond))
+		c.gcTickInterval = time.Duration(val.(int) * int(time.Second))
 	})
-	gcTick := time.NewTicker(updateGCTickerInterval)
-
-	defer gcTick.Stop()
-	updateMetricsTicker := time.NewTicker(time.Second * 1)
-	defer updateMetricsTicker.Stop()
-
 	failpoint.Inject("coordinator-run-with-error", func() error {
 		return errors.New("coordinator run with error")
 	})
+
+	gcTicker := time.NewTicker(c.gcTickInterval)
+	defer gcTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-gcTick.C:
-			if err := c.updateGCSafepoint(ctx); err != nil {
-				log.Warn("update gc safepoint failed",
-					zap.Error(err))
+			return context.Cause(ctx)
+		case <-gcTicker.C:
+			// BeginGCTick must happen before updateGCSafepoint so tasks added in this tick
+			// will not be undone by the same tick.
+			c.gcCleaner.BeginGCTick()
+			err := c.updateGCSafepoint(ctx)
+			if err == nil {
+				c.gcCleaner.OnUpdateGCSafepointSucceeded()
 			}
 			now := time.Now()
 			metrics.CoordinatorCounter.Add(float64(now.Sub(c.lastTickTime)) / float64(time.Second))
@@ -226,16 +242,16 @@ func (c *coordinator) runHandleEvent(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return context.Cause(ctx)
 		case event := <-c.eventCh.Out():
-			c.controller.HandleEvent(event)
+			c.controller.HandleEvent(ctx, event)
 		}
 	}
 }
 
 func (c *coordinator) handleStateChange(
 	ctx context.Context,
-	event *ChangefeedChange,
+	event *changefeedChange,
 ) error {
 	cf := c.controller.getChangefeed(event.changefeedID)
 	if cf == nil {
@@ -249,10 +265,10 @@ func (c *coordinator) handleStateChange(
 	cfInfo.State = event.state
 	cfInfo.Error = event.err
 	progress := config.ProgressNone
-	if event.state == model.StateFailed || event.state == model.StateFinished {
+	if event.state == config.StateFailed || event.state == config.StateFinished {
 		progress = config.ProgressStopping
 	}
-	if err := c.backend.UpdateChangefeed(context.Background(), cfInfo, cf.GetStatus().CheckpointTs, progress); err != nil {
+	if err = c.backend.UpdateChangefeed(ctx, cfInfo, cf.GetStatus().CheckpointTs, progress); err != nil {
 		log.Error("failed to update changefeed state",
 			zap.Error(err))
 		return errors.Trace(err)
@@ -260,64 +276,50 @@ func (c *coordinator) handleStateChange(
 	cf.SetInfo(cfInfo)
 
 	switch event.state {
-	case model.StateWarning:
+	case config.StateWarning:
 		c.controller.operatorController.StopChangefeed(ctx, event.changefeedID, false)
 		c.controller.updateChangefeedEpoch(ctx, event.changefeedID)
 		c.controller.moveChangefeedToSchedulingQueue(event.changefeedID, false, false)
-	case model.StateFailed, model.StateFinished:
+	case config.StateFailed, config.StateFinished:
 		c.controller.operatorController.StopChangefeed(ctx, event.changefeedID, false)
-	case model.StateNormal:
-		log.Info("changefeed is resumed or created successfully, try to delete its safeguard gc safepoint",
-			zap.String("changefeed", event.changefeedID.String()))
-		// We need to clean its gc safepoint when changefeed is resumed or created
-		gcServiceID := c.getEnsureGCServiceID(gc.EnsureGCServiceCreating)
-		err := gc.UndoEnsureChangefeedStartTsSafety(ctx, c.pdClient, gcServiceID, event.changefeedID)
-		if err != nil {
-			log.Warn("failed to delete create changefeed gc safepoint", zap.Error(err))
-		}
-		gcServiceID = c.getEnsureGCServiceID(gc.EnsureGCServiceResuming)
-		err = gc.UndoEnsureChangefeedStartTsSafety(ctx, c.pdClient, gcServiceID, event.changefeedID)
-		if err != nil {
-			log.Warn("failed to delete resume changefeed gc safepoint", zap.Error(err))
-		}
 	default:
 	}
 	return nil
 }
 
 // checkStaleCheckpointTs checks if the checkpointTs is stale, if it is, it will send a state change event to the stateChangedCh
-func (c *coordinator) checkStaleCheckpointTs(ctx context.Context, id common.ChangeFeedID, reportedCheckpointTs uint64) {
-	err := c.gcManager.CheckStaleCheckpointTs(ctx, id, reportedCheckpointTs)
+func (c *coordinator) checkStaleCheckpointTs(ctx context.Context, changefeed *changefeed.Changefeed, reportedCheckpointTs uint64) {
+	id := changefeed.ID
+	err := c.gcManager.CheckStaleCheckpointTs(changefeed.GetKeyspaceID(), id, reportedCheckpointTs)
+	if err == nil {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err != nil {
-		errCode, _ := errors.RFCCode(err)
-		state := model.StateFailed
-		if !errors.IsChangefeedGCFastFailErrorCode(errCode) {
-			state = model.StateWarning
-		}
-		change := &ChangefeedChange{
-			changefeedID: id,
-			state:        state,
-			err: &model.RunningError{
-				Code:    string(errCode),
-				Message: err.Error(),
-			},
-			changeType: ChangeState,
-		}
-		select {
-		case <-ctx.Done():
-			log.Warn("Failed to send state change event to stateChangedCh since context timeout, "+
-				"there may be a lot of state need to be handled. Try next time",
-				zap.String("changefeed", id.String()),
-				zap.Error(ctx.Err()))
-			return
-		case c.changefeedChangeCh <- []*ChangefeedChange{change}:
-		}
+
+	errCode, _ := errors.RFCCode(err)
+	state := config.StateWarning
+	if errors.IsChangefeedGCFastFailErrorCode(errCode) {
+		state = config.StateFailed
+	}
+
+	change := newChangefeedChange(changefeed, state, ChangeState, &config.RunningError{
+		Code:    string(errCode),
+		Message: err.Error(),
+	})
+
+	select {
+	case <-ctx.Done():
+		log.Warn("Failed to send state change event to stateChangedCh since context timeout, "+
+			"there may be a lot of state need to be handled. Try next time",
+			zap.String("changefeed", id.String()),
+			zap.Error(context.Cause(ctx)))
+	case c.changefeedChangeCh <- []*changefeedChange{change}:
 	}
 }
 
-func (c *coordinator) saveCheckpointTs(ctx context.Context, changes []*ChangefeedChange) error {
+func (c *coordinator) saveCheckpointTs(ctx context.Context, changes []*changefeedChange) error {
 	statusMap := make(map[common.ChangeFeedID]uint64)
 	cfsMap := make(map[common.ChangeFeedID]*changefeed.Changefeed)
 	for _, change := range changes {
@@ -329,7 +331,7 @@ func (c *coordinator) saveCheckpointTs(ctx context.Context, changes []*Changefee
 		if upCf.GetLastSavedCheckPointTs() < reportedCheckpointTs {
 			statusMap[upCf.ID] = reportedCheckpointTs
 			cfsMap[upCf.ID] = upCf
-			c.checkStaleCheckpointTs(ctx, upCf.ID, reportedCheckpointTs)
+			c.checkStaleCheckpointTs(ctx, upCf, reportedCheckpointTs)
 		}
 	}
 	if len(statusMap) == 0 {
@@ -353,12 +355,12 @@ func (c *coordinator) saveCheckpointTs(ctx context.Context, changes []*Changefee
 }
 
 func (c *coordinator) CreateChangefeed(ctx context.Context, info *config.ChangeFeedInfo) error {
-	err := c.controller.CreateChangefeed(ctx, info)
-	if err != nil {
-		return errors.Trace(err)
+	if err := c.controller.CreateChangefeed(ctx, info); err != nil {
+		return err
 	}
-	// update gc safepoint after create changefeed
-	return c.updateGCSafepoint(ctx)
+
+	c.gcCleaner.Add(info.ChangefeedID, info.KeyspaceID, gc.EnsureGCServiceCreating)
+	return nil
 }
 
 func (c *coordinator) RemoveChangefeed(ctx context.Context, id common.ChangeFeedID) (uint64, error) {
@@ -370,29 +372,48 @@ func (c *coordinator) PauseChangefeed(ctx context.Context, id common.ChangeFeedI
 }
 
 func (c *coordinator) ResumeChangefeed(ctx context.Context, id common.ChangeFeedID, newCheckpointTs uint64, overwriteCheckpointTs bool) error {
-	return c.controller.ResumeChangefeed(ctx, id, newCheckpointTs, overwriteCheckpointTs)
+	if err := c.controller.ResumeChangefeed(ctx, id, newCheckpointTs, overwriteCheckpointTs); err != nil {
+		return err
+	}
+	if overwriteCheckpointTs {
+		cf := c.controller.getChangefeed(id)
+		if cf != nil {
+			c.gcCleaner.Add(id, cf.GetKeyspaceID(), gc.EnsureGCServiceResuming)
+		}
+	}
+	return nil
 }
 
 func (c *coordinator) UpdateChangefeed(ctx context.Context, change *config.ChangeFeedInfo) error {
 	return c.controller.UpdateChangefeed(ctx, change)
 }
 
-func (c *coordinator) ListChangefeeds(ctx context.Context) ([]*config.ChangeFeedInfo, []*config.ChangeFeedStatus, error) {
-	return c.controller.ListChangefeeds(ctx)
+func (c *coordinator) ListChangefeeds(ctx context.Context, keyspace string) ([]*config.ChangeFeedInfo, []*config.ChangeFeedStatus, error) {
+	return c.controller.ListChangefeeds(ctx, keyspace)
 }
 
 func (c *coordinator) GetChangefeed(ctx context.Context, changefeedDisplayName common.ChangeFeedDisplayName) (*config.ChangeFeedInfo, *config.ChangeFeedStatus, error) {
 	return c.controller.GetChangefeed(ctx, changefeedDisplayName)
 }
 
-func (c *coordinator) AsyncStop() {
+func (c *coordinator) Initialized() bool {
+	return c.controller.initialized.Load()
+}
+
+func (c *coordinator) Stop() {
 	if c.closed.CompareAndSwap(false, true) {
 		c.mc.DeRegisterHandler(messaging.CoordinatorTopic)
+		// Ensure no handler is still writing to eventCh before closing it.
+		c.msgGuardWaitGroup.Wait()
 		c.controller.Stop()
-		c.taskScheduler.Stop()
-		c.eventCh.CloseAndDrain()
 		c.cancel()
+		// close eventCh after cancel, to avoid send or get event from the channel
+		c.eventCh.CloseAndDrain()
 	}
+}
+
+func (c *coordinator) RequestResolvedTsFromLogCoordinator(ctx context.Context, changefeedDisplayName common.ChangeFeedDisplayName) {
+	c.controller.RequestResolvedTsFromLogCoordinator(ctx, changefeedDisplayName)
 }
 
 func (c *coordinator) sendMessages(msgs []*messaging.TargetMessage) {
@@ -405,10 +426,8 @@ func (c *coordinator) sendMessages(msgs []*messaging.TargetMessage) {
 	}
 }
 
-func (c *coordinator) updateGCSafepoint(
-	ctx context.Context,
-) error {
-	minCheckpointTs := c.controller.calculateGCSafepoint()
+func (c *coordinator) updateGlobalGcSafepoint(ctx context.Context) error {
+	minCheckpointTs := c.controller.calculateGlobalGCSafepoint()
 	// check if the upstream has a changefeed, if not we should update the gc safepoint
 	if minCheckpointTs == math.MaxUint64 {
 		ts := c.pdClock.CurrentTime()
@@ -418,11 +437,39 @@ func (c *coordinator) updateGCSafepoint(
 	// (checkpointTs - 1) from TiKV, so (checkpointTs - 1) should be an upper
 	// bound for the GC safepoint.
 	gcSafepointUpperBound := minCheckpointTs - 1
-	err := c.gcManager.TryUpdateGCSafePoint(ctx, gcSafepointUpperBound, false)
+	err := c.gcManager.TryUpdateServiceGCSafepoint(ctx, gcSafepointUpperBound)
 	return errors.Trace(err)
 }
 
-// GetEnsureGCServiceID return the prefix for the gc service id when changefeed is creating
-func (c *coordinator) getEnsureGCServiceID(tag string) string {
-	return c.gcServiceID + tag
+func (c *coordinator) updateAllKeyspaceGcBarriers(ctx context.Context) error {
+	barrierMap := c.controller.calculateKeyspaceGCBarrier()
+
+	var retErr error
+	for meta, barrierTS := range barrierMap {
+		if err := c.updateKeyspaceGcBarrier(ctx, meta, barrierTS); err != nil {
+			log.Warn("update keyspace gc barrier failed",
+				zap.Uint32("keyspaceID", meta.ID), zap.String("keyspaceName", meta.Name),
+				zap.Uint64("barrierTS", barrierTS), zap.Error(err))
+			retErr = err
+		}
+	}
+	return retErr
+}
+
+func (c *coordinator) updateKeyspaceGcBarrier(
+	ctx context.Context, meta common.KeyspaceMeta, barrierTS uint64,
+) error {
+	barrierTsUpperBound := barrierTS - 1
+	err := c.gcManager.TryUpdateKeyspaceGCBarrier(ctx, meta.ID, meta.Name, barrierTsUpperBound)
+	return errors.Trace(err)
+}
+
+// updateGCSafepoint update the gc safepoint
+// On next gen, we should update the gc barrier for all keyspaces
+// Otherwise we should update the global gc safepoint
+func (c *coordinator) updateGCSafepoint(ctx context.Context) error {
+	if kerneltype.IsNextGen() {
+		return c.updateAllKeyspaceGcBarriers(ctx)
+	}
+	return c.updateGlobalGcSafepoint(ctx)
 }

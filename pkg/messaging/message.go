@@ -24,15 +24,19 @@ import (
 	"github.com/pingcap/ticdc/logservice/logservicepb"
 	"github.com/pingcap/ticdc/pkg/common"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
+	"github.com/pingcap/ticdc/pkg/config"
+	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/filter"
+	"github.com/pingcap/ticdc/pkg/integrity"
 	"github.com/pingcap/ticdc/pkg/node"
+	"github.com/pingcap/ticdc/pkg/util"
 	"go.uber.org/zap"
 )
 
 type IOType int32
 
 var LogServiceEventTypes = []IOType{
-	TypeDMLEvent,
+	TypeBatchDMLEvent,
 	TypeDDLEvent,
 	TypeBatchResolvedTs,
 	TypeSyncPointEvent,
@@ -45,49 +49,67 @@ func (t IOType) IsLogServiceEvent() bool {
 	return slices.Contains(LogServiceEventTypes, t)
 }
 
+// Please do not modify the value of the constants in this section.
+// When you need to add new type, please chose a new value for the constant.
 const (
-	TypeInvalid IOType = iota
+	TypeInvalid IOType = 0
 	// LogService related
-	TypeDMLEvent
-	TypeDDLEvent
-	TypeBatchResolvedTs
-	TypeSyncPointEvent
-	TypeHandshakeEvent
-	TypeReadyEvent
-	TypeNotReusableEvent
+	TypeBatchDMLEvent    IOType = 1
+	TypeDDLEvent         IOType = 2
+	TypeBatchResolvedTs  IOType = 3
+	TypeSyncPointEvent   IOType = 4
+	TypeHandshakeEvent   IOType = 5
+	TypeReadyEvent       IOType = 6
+	TypeNotReusableEvent IOType = 7
 
 	// LogCoordinator related
-	TypeLogCoordinatorBroadcastRequest
-	TypeEventStoreState
-	TypeReusableEventServiceRequest
-	TypeReusableEventServiceResponse
+	TypeLogCoordinatorBroadcastRequest  IOType = 8
+	TypeEventStoreState                 IOType = 9
+	TypeReusableEventServiceRequest     IOType = 10
+	TypeReusableEventServiceResponse    IOType = 11
+	TypeLogCoordinatorResolvedTsRequest IOType = 12
 
-	TypeHeartBeatRequest
-	TypeHeartBeatResponse
-	TypeScheduleDispatcherRequest
-	TypeRegisterDispatcherRequest
-	TypeCheckpointTsMessage
-	TypeBlockStatusRequest
+	// EventCollector related
+	TypeHeartBeatRequest            IOType = 13
+	TypeHeartBeatResponse           IOType = 14
+	TypeScheduleDispatcherRequest   IOType = 15
+	TypeDispatcherRequest           IOType = 16
+	TypeCheckpointTsMessage         IOType = 17
+	TypeBlockStatusRequest          IOType = 18
+	TypeDispatcherHeartbeat         IOType = 19
+	TypeDispatcherHeartbeatResponse IOType = 20
+	TypeRedoMetaMessage             IOType = 21
+	TypeMergeDispatcherRequest      IOType = 22
+	TypeCongestionControl           IOType = 23
 
-	TypeCoordinatorBootstrapRequest
-	TypeCoordinatorBootstrapResponse
-	TypeAddMaintainerRequest
-	TypeRemoveMaintainerRequest
-	TypeMaintainerHeartbeatRequest
-	TypeMaintainerBootstrapRequest
-	TypeMaintainerBootstrapResponse
-	TypeMaintainerPostBootstrapRequest
-	TypeMaintainerPostBootstrapResponse
-	TypeMaintainerCloseRequest
-	TypeMaintainerCloseResponse
+	// Coordinator related
+	TypeCoordinatorBootstrapRequest      IOType = 24
+	TypeCoordinatorBootstrapResponse     IOType = 25
+	TypeAddMaintainerRequest             IOType = 26
+	TypeRemoveMaintainerRequest          IOType = 27
+	TypeMaintainerHeartbeatRequest       IOType = 28
+	TypeMaintainerBootstrapRequest       IOType = 29
+	TypeMaintainerBootstrapResponse      IOType = 30
+	TypeMaintainerPostBootstrapRequest   IOType = 31
+	TypeMaintainerPostBootstrapResponse  IOType = 32
+	TypeMaintainerCloseRequest           IOType = 33
+	TypeMaintainerCloseResponse          IOType = 34
+	TypeLogCoordinatorResolvedTsResponse IOType = 35
 
-	TypeMessageHandShake
+	TypeMessageHandShake IOType = 36
+
+	// used to upload changefeed metrics from event store to log coordinator
+	TypeLogCoordinatorChangefeedStates     IOType = 37
+	TypeRedoResolvedTsProgressMessage      IOType = 38
+	TypeRedoResolvedTsForwardMessage       IOType = 39
+	TypeDispatcherSetChecksumUpdateRequest IOType = 40
+	TypeDispatcherSetChecksumAckResponse   IOType = 41
 )
 
 func (t IOType) String() string {
 	switch t {
-	case TypeDMLEvent:
-		return "DMLEvent"
+	case TypeBatchDMLEvent:
+		return "BatchDMLEvent"
 	case TypeDDLEvent:
 		return "DDLEvent"
 	case TypeSyncPointEvent:
@@ -102,6 +124,10 @@ func (t IOType) String() string {
 		return "TypeNotReusableEvent"
 	case TypeLogCoordinatorBroadcastRequest:
 		return "TypeLogCoordinatorBroadcastRequest"
+	case TypeLogCoordinatorResolvedTsRequest:
+		return "TypeLogCoordinatorResolvedTsRequest"
+	case TypeLogCoordinatorResolvedTsResponse:
+		return "TypeLogCoordinatorResolvedTsResponse"
 	case TypeReusableEventServiceRequest:
 		return "TypeReusableEventServiceRequest"
 	case TypeReusableEventServiceResponse:
@@ -126,10 +152,10 @@ func (t IOType) String() string {
 		return "MaintainerHeartbeatRequest"
 	case TypeCoordinatorBootstrapResponse:
 		return "CoordinatorBootstrapResponse"
-	case TypeRegisterDispatcherRequest:
-		return "RegisterDispatcherRequest"
+	case TypeDispatcherRequest:
+		return "DispatcherRequest"
 	case TypeMaintainerBootstrapRequest:
-		return "BootstrapMaintainerRequest"
+		return "MaintainerBootstrapRequest"
 	case TypeMaintainerBootstrapResponse:
 		return "MaintainerBootstrapResponse"
 	case TypeMaintainerPostBootstrapRequest:
@@ -144,76 +170,133 @@ func (t IOType) String() string {
 		return "MessageHandShake"
 	case TypeCheckpointTsMessage:
 		return "CheckpointTsMessage"
+	case TypeDispatcherHeartbeat:
+		return "DispatcherHeartbeat"
+	case TypeRedoMetaMessage:
+		return "RedoMetaMessage"
+	case TypeRedoResolvedTsProgressMessage:
+		return "RedoResolvedTsProgressMessage"
+	case TypeRedoResolvedTsForwardMessage:
+		return "RedoResolvedTsForwardMessage"
+	case TypeDispatcherSetChecksumUpdateRequest:
+		return "DispatcherSetChecksumUpdateRequest"
+	case TypeDispatcherSetChecksumAckResponse:
+		return "DispatcherSetChecksumAckResponse"
+	case TypeDispatcherHeartbeatResponse:
+		return "DispatcherHeartbeatResponse"
+	case TypeCongestionControl:
+		return "CongestionControl"
+	case TypeMergeDispatcherRequest:
+		return "MergeDispatcherRequest"
+	case TypeLogCoordinatorChangefeedStates:
+		return "TypeLogCoordinatorChangefeedStates"
 	default:
 	}
 	return "Unknown"
 }
 
-type RegisterDispatcherRequest struct {
-	*eventpb.RegisterDispatcherRequest
+type DispatcherRequest struct {
+	*eventpb.DispatcherRequest
 }
 
-func (r RegisterDispatcherRequest) Marshal() ([]byte, error) {
-	return r.RegisterDispatcherRequest.Marshal()
+func (r DispatcherRequest) Marshal() ([]byte, error) {
+	return r.DispatcherRequest.Marshal()
 }
 
-func (r RegisterDispatcherRequest) Unmarshal(data []byte) error {
-	return r.RegisterDispatcherRequest.Unmarshal(data)
+func (r DispatcherRequest) Unmarshal(data []byte) error {
+	return r.DispatcherRequest.Unmarshal(data)
 }
 
-func (r RegisterDispatcherRequest) GetID() common.DispatcherID {
+func (r DispatcherRequest) GetID() common.DispatcherID {
 	return common.NewDispatcherIDFromPB(r.DispatcherId)
 }
 
-func (r RegisterDispatcherRequest) GetClusterID() uint64 {
-	return 0
+func (r DispatcherRequest) GetClusterID() uint64 {
+	return r.ClusterId
 }
 
-func (r RegisterDispatcherRequest) GetTopic() string {
+func (r DispatcherRequest) GetTopic() string {
 	return EventCollectorTopic
 }
 
-func (r RegisterDispatcherRequest) GetServerID() string {
+func (r DispatcherRequest) GetServerID() string {
 	return r.ServerId
 }
 
-func (r RegisterDispatcherRequest) GetTableSpan() *heartbeatpb.TableSpan {
+func (r DispatcherRequest) GetTableSpan() *heartbeatpb.TableSpan {
 	return r.TableSpan
 }
 
-func (r RegisterDispatcherRequest) GetStartTs() uint64 {
+func (r DispatcherRequest) GetStartTs() uint64 {
 	return r.StartTs
 }
 
-func (r RegisterDispatcherRequest) GetChangefeedID() common.ChangeFeedID {
+func (r DispatcherRequest) GetChangefeedID() common.ChangeFeedID {
 	return common.NewChangefeedIDFromPB(r.ChangefeedId)
 }
 
-func (r RegisterDispatcherRequest) GetFilter() filter.Filter {
+func (r DispatcherRequest) GetFilter() filter.Filter {
 	changefeedID := r.GetChangefeedID()
 	filter, err := filter.
 		GetSharedFilterStorage().
-		GetOrSetFilter(changefeedID, r.RegisterDispatcherRequest.FilterConfig, "", false)
+		GetOrSetFilter(changefeedID, r.DispatcherRequest.FilterConfig, r.GetTimezone().String())
 	if err != nil {
-		log.Panic("create filter failed", zap.Error(err), zap.Any("filterConfig", r.RegisterDispatcherRequest.FilterConfig))
+		log.Panic("create filter failed", zap.Error(err), zap.Any("filterConfig", r.DispatcherRequest.FilterConfig))
 	}
 	return filter
 }
 
-func (r RegisterDispatcherRequest) SyncPointEnabled() bool {
+func (r DispatcherRequest) SyncPointEnabled() bool {
 	return r.EnableSyncPoint
 }
 
-func (r RegisterDispatcherRequest) GetSyncPointTs() uint64 {
+func (r DispatcherRequest) GetSyncPointTs() uint64 {
 	return r.SyncPointTs
 }
 
-func (r RegisterDispatcherRequest) GetSyncPointInterval() time.Duration {
+func (r DispatcherRequest) GetSyncPointInterval() time.Duration {
 	return time.Duration(r.SyncPointInterval) * time.Second
 }
 
-func (r RegisterDispatcherRequest) IsOnlyReuse() bool {
+func (r DispatcherRequest) IsOnlyReuse() bool {
 	return r.OnlyReuse
+}
+
+func (r DispatcherRequest) GetBdrMode() bool {
+	return r.BdrMode
+}
+
+func (r DispatcherRequest) GetIntegrity() *integrity.Config {
+	if r.DispatcherRequest.Integrity == nil {
+		return &integrity.Config{
+			IntegrityCheckLevel:   util.AddressOf(integrity.CheckLevelNone),
+			CorruptionHandleLevel: util.AddressOf(integrity.CorruptionHandleLevelWarn),
+		}
+	}
+	return &integrity.Config{
+		IntegrityCheckLevel:   util.AddressOf(r.DispatcherRequest.Integrity.IntegrityCheckLevel),
+		CorruptionHandleLevel: util.AddressOf(r.DispatcherRequest.Integrity.CorruptionHandleLevel),
+	}
+}
+
+func (r DispatcherRequest) GetTimezone() *time.Location {
+	tz, err := util.GetTimezone(r.DispatcherRequest.GetTimezone())
+	if err != nil {
+		log.Panic("Can't load time zone from dispatcher info", zap.Error(err))
+	}
+	return tz
+}
+
+func (r DispatcherRequest) GetEpoch() uint64 {
+	return r.Epoch
+}
+
+func (r DispatcherRequest) IsOutputRawChangeEvent() bool {
+	return r.OutputRawChangeEvent
+}
+
+func (r DispatcherRequest) GetTxnAtomicity() config.AtomicityLevel {
+	return config.AtomicityLevel(r.TxnAtomicity)
 }
 
 type IOTypeT interface {
@@ -224,8 +307,8 @@ type IOTypeT interface {
 func decodeIOType(ioType IOType, value []byte) (IOTypeT, error) {
 	var m IOTypeT
 	switch ioType {
-	case TypeDMLEvent:
-		m = &commonEvent.DMLEvent{}
+	case TypeBatchDMLEvent:
+		m = &commonEvent.BatchDMLEvent{}
 	case TypeDDLEvent:
 		m = &commonEvent.DDLEvent{}
 	case TypeSyncPointEvent:
@@ -264,8 +347,10 @@ func decodeIOType(ioType IOType, value []byte) (IOTypeT, error) {
 		m = &heartbeatpb.MaintainerHeartbeat{}
 	case TypeCoordinatorBootstrapResponse:
 		m = &heartbeatpb.CoordinatorBootstrapResponse{}
-	case TypeRegisterDispatcherRequest:
-		m = &RegisterDispatcherRequest{}
+	case TypeDispatcherRequest:
+		m = &DispatcherRequest{
+			DispatcherRequest: &eventpb.DispatcherRequest{},
+		}
 	case TypeMaintainerBootstrapResponse:
 		m = &heartbeatpb.MaintainerBootstrapResponse{}
 	case TypeMaintainerPostBootstrapRequest:
@@ -280,8 +365,33 @@ func decodeIOType(ioType IOType, value []byte) (IOTypeT, error) {
 		m = &heartbeatpb.MaintainerBootstrapRequest{}
 	case TypeCheckpointTsMessage:
 		m = &heartbeatpb.CheckpointTsMessage{}
+	case TypeDispatcherHeartbeat:
+		m = &commonEvent.DispatcherHeartbeat{}
+	case TypeDispatcherHeartbeatResponse:
+		m = &commonEvent.DispatcherHeartbeatResponse{}
+	case TypeRedoMetaMessage:
+		m = &heartbeatpb.RedoMetaMessage{}
+	case TypeRedoResolvedTsProgressMessage:
+		m = &heartbeatpb.RedoResolvedTsProgressMessage{}
+	case TypeRedoResolvedTsForwardMessage:
+		m = &heartbeatpb.RedoResolvedTsForwardMessage{}
+	case TypeDispatcherSetChecksumUpdateRequest:
+		m = &heartbeatpb.DispatcherSetChecksumUpdateRequest{}
+	case TypeDispatcherSetChecksumAckResponse:
+		m = &heartbeatpb.DispatcherSetChecksumAckResponse{}
+	case TypeCongestionControl:
+		m = &commonEvent.CongestionControl{}
+	case TypeMergeDispatcherRequest:
+		m = &heartbeatpb.MergeDispatcherRequest{}
+	case TypeLogCoordinatorChangefeedStates:
+		m = &logservicepb.ChangefeedStates{}
+	case TypeLogCoordinatorResolvedTsRequest:
+		m = &heartbeatpb.LogCoordinatorResolvedTsRequest{}
+	case TypeLogCoordinatorResolvedTsResponse:
+		m = &heartbeatpb.LogCoordinatorResolvedTsResponse{}
 	default:
-		log.Panic("Unimplemented IOType", zap.Stringer("Type", ioType))
+		log.Debug("Unimplemented IOType, ignore the message", zap.Stringer("Type", ioType))
+		return nil, errors.ErrUnimplementedIOType.GenWithStackByArgs(int(ioType))
 	}
 	err := m.Unmarshal(value)
 	return m, err
@@ -311,8 +421,8 @@ type TargetMessage struct {
 func NewSingleTargetMessage(To node.ID, Topic string, Message IOTypeT, Group ...uint64) *TargetMessage {
 	var ioType IOType
 	switch Message.(type) {
-	case *commonEvent.DMLEvent:
-		ioType = TypeDMLEvent
+	case *commonEvent.BatchDMLEvent:
+		ioType = TypeBatchDMLEvent
 	case *commonEvent.DDLEvent:
 		ioType = TypeDDLEvent
 	case *commonEvent.SyncPointEvent:
@@ -353,8 +463,8 @@ func NewSingleTargetMessage(To node.ID, Topic string, Message IOTypeT, Group ...
 		ioType = TypeMaintainerHeartbeatRequest
 	case *heartbeatpb.CoordinatorBootstrapResponse:
 		ioType = TypeCoordinatorBootstrapResponse
-	case *RegisterDispatcherRequest:
-		ioType = TypeRegisterDispatcherRequest
+	case *DispatcherRequest:
+		ioType = TypeDispatcherRequest
 	case *heartbeatpb.MaintainerBootstrapResponse:
 		ioType = TypeMaintainerBootstrapResponse
 	case *heartbeatpb.MaintainerPostBootstrapRequest:
@@ -367,6 +477,30 @@ func NewSingleTargetMessage(To node.ID, Topic string, Message IOTypeT, Group ...
 		ioType = TypeMaintainerCloseResponse
 	case *heartbeatpb.CheckpointTsMessage:
 		ioType = TypeCheckpointTsMessage
+	case *commonEvent.DispatcherHeartbeat:
+		ioType = TypeDispatcherHeartbeat
+	case *commonEvent.DispatcherHeartbeatResponse:
+		ioType = TypeDispatcherHeartbeatResponse
+	case *heartbeatpb.RedoMetaMessage:
+		ioType = TypeRedoMetaMessage
+	case *heartbeatpb.RedoResolvedTsProgressMessage:
+		ioType = TypeRedoResolvedTsProgressMessage
+	case *heartbeatpb.RedoResolvedTsForwardMessage:
+		ioType = TypeRedoResolvedTsForwardMessage
+	case *heartbeatpb.DispatcherSetChecksumUpdateRequest:
+		ioType = TypeDispatcherSetChecksumUpdateRequest
+	case *heartbeatpb.DispatcherSetChecksumAckResponse:
+		ioType = TypeDispatcherSetChecksumAckResponse
+	case *commonEvent.CongestionControl:
+		ioType = TypeCongestionControl
+	case *heartbeatpb.MergeDispatcherRequest:
+		ioType = TypeMergeDispatcherRequest
+	case *logservicepb.ChangefeedStates:
+		ioType = TypeLogCoordinatorChangefeedStates
+	case *heartbeatpb.LogCoordinatorResolvedTsRequest:
+		ioType = TypeLogCoordinatorResolvedTsRequest
+	case *heartbeatpb.LogCoordinatorResolvedTsResponse:
+		ioType = TypeLogCoordinatorResolvedTsResponse
 	default:
 		panic("unknown io type")
 	}

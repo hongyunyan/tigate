@@ -20,8 +20,8 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
+	pclock "github.com/pingcap/ticdc/pkg/clock"
 	"github.com/pingcap/ticdc/pkg/retry"
-	pclock "github.com/pingcap/tiflow/engine/pkg/clock"
 	"github.com/tikv/client-go/v2/oracle"
 	pd "github.com/tikv/pd/client"
 	"go.uber.org/zap"
@@ -152,7 +152,10 @@ func NewClock4Test() Clock {
 }
 
 func (c *Clock4Test) CurrentTime() time.Time {
-	return time.Now()
+	if c.ts == 0 {
+		return time.Now()
+	}
+	return oracle.GetTimeFromTS(c.ts)
 }
 
 func (c *Clock4Test) CurrentTS() uint64 {

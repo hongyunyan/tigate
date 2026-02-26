@@ -21,8 +21,8 @@ import (
 	"github.com/pingcap/ticdc/pkg/common"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
 	timodel "github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/charset"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/stretchr/testify/require"
@@ -33,7 +33,7 @@ func generateTableDef() (TableDefinition, *common.TableInfo) {
 	ft := types.NewFieldType(mysql.TypeLong)
 	ft.SetFlag(mysql.PriKeyFlag | mysql.NotNullFlag)
 	col := &timodel.ColumnInfo{
-		Name:         pmodel.NewCIStr("Id"),
+		Name:         ast.NewCIStr("Id"),
 		FieldType:    *ft,
 		DefaultValue: 10,
 	}
@@ -43,7 +43,7 @@ func generateTableDef() (TableDefinition, *common.TableInfo) {
 	ft.SetFlag(mysql.NotNullFlag)
 	ft.SetFlen(128)
 	col = &timodel.ColumnInfo{
-		Name:         pmodel.NewCIStr("LastName"),
+		Name:         ast.NewCIStr("LastName"),
 		FieldType:    *ft,
 		DefaultValue: "Default LastName",
 	}
@@ -52,7 +52,7 @@ func generateTableDef() (TableDefinition, *common.TableInfo) {
 	ft = types.NewFieldType(mysql.TypeVarchar)
 	ft.SetFlen(64)
 	col = &timodel.ColumnInfo{
-		Name:         pmodel.NewCIStr("FirstName"),
+		Name:         ast.NewCIStr("FirstName"),
 		FieldType:    *ft,
 		DefaultValue: "Default FirstName",
 	}
@@ -60,22 +60,20 @@ func generateTableDef() (TableDefinition, *common.TableInfo) {
 
 	ft = types.NewFieldType(mysql.TypeDatetime)
 	col = &timodel.ColumnInfo{
-		Name:         pmodel.NewCIStr("Birthday"),
+		Name:         ast.NewCIStr("Birthday"),
 		FieldType:    *ft,
 		DefaultValue: 12345678,
 	}
 	columns = append(columns, col)
 
-	tableInfo := &common.TableInfo{
-		TableName: common.TableName{
-			Schema:  "schema1",
-			Table:   "table1",
-			TableID: 20,
-		},
-	}
-
+	tableInfo := common.WrapTableInfo("schema1", &timodel.TableInfo{
+		ID:       20,
+		Name:     ast.NewCIStr("table1"),
+		Columns:  columns,
+		UpdateTS: 100,
+	})
 	var def TableDefinition
-	def.FromTableInfo(tableInfo.GetSchemaName(), tableInfo.GetTableName(), tableInfo, tableInfo.UpdateTS(), false)
+	def.FromTableInfo(tableInfo.GetSchemaName(), tableInfo.GetTableName(), tableInfo, tableInfo.GetUpdateTS(), false)
 	return def, tableInfo
 }
 
@@ -424,10 +422,12 @@ func TestTableDefinition(t *testing.T) {
 
 	def = TableDefinition{}
 	event := &commonEvent.DDLEvent{
-		FinishedTs: tableInfo.UpdateTS(),
+		FinishedTs: tableInfo.GetUpdateTS(),
 		Type:       byte(timodel.ActionAddColumn),
 		Query:      "alter table schema1.table1 add Birthday date",
 		TableInfo:  tableInfo,
+		SchemaName: "schema1",
+		TableName:  "table1",
 	}
 	def.FromDDLEvent(event, false)
 	encodedDef, err = json.MarshalIndent(def, "", "    ")
@@ -476,7 +476,7 @@ func TestTableDefinition(t *testing.T) {
 
 	event, err = def.ToDDLEvent()
 	require.NoError(t, err)
-	require.Equal(t, timodel.ActionAddColumn, event.Type)
+	require.Equal(t, byte(timodel.ActionAddColumn), event.Type)
 	require.Equal(t, uint64(100), event.FinishedTs)
 }
 

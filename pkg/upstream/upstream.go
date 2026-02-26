@@ -24,15 +24,18 @@ import (
 	"github.com/benbjohnson/clock"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/common"
+	"github.com/pingcap/ticdc/pkg/config/kerneltype"
 	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/etcd"
 	"github.com/pingcap/ticdc/pkg/pdutil"
+	"github.com/pingcap/ticdc/pkg/retry"
+	"github.com/pingcap/ticdc/pkg/security"
 	tidbkv "github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/store/driver"
-	"github.com/pingcap/tiflow/pkg/security"
 	tikvconfig "github.com/tikv/client-go/v2/config"
 	"github.com/tikv/client-go/v2/tikv"
 	pd "github.com/tikv/pd/client"
+	pdopt "github.com/tikv/pd/client/opt"
 	uatomic "github.com/uber-go/atomic"
 	clientV3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
@@ -52,6 +55,7 @@ const (
 	closed
 
 	maxIdleDuration = time.Minute * 30
+	defaultMaxRetry = 50
 )
 
 // Upstream holds resources of a TiDB cluster, it can be shared by many changefeeds
@@ -63,7 +67,7 @@ type Upstream struct {
 	PdEndpoints    []string
 	SecurityConfig *security.Credential
 	PDClient       pd.Client
-	etcdCli        *clientV3.Client
+	etcdCli        etcd.Client
 	session        *concurrency.Session
 
 	KVStorage   tidbkv.Storage
@@ -98,13 +102,16 @@ func newUpstream(pdEndpoints []string,
 // CreateTiStore creates a tikv storage client
 // Note: It will return a same storage if the urls connect to a same pd cluster,
 // so must be careful when you call storage.Close().
-func CreateTiStore(urls string, credential *security.Credential) (tidbkv.Storage, error) {
+func CreateTiStore(ctx context.Context, urls string, credential *security.Credential, keyspaceName string) (tidbkv.Storage, error) {
 	urlv, err := common.NewURLsValue(urls)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
 	tiPath := fmt.Sprintf("tikv://%s?disableGC=true", urlv.HostString())
+	if kerneltype.IsNextGen() && keyspaceName != "" {
+		tiPath += "&keyspaceName=" + keyspaceName
+	}
 	securityCfg := tikvconfig.Security{
 		ClusterSSLCA:    credential.CAPath,
 		ClusterSSLCert:  credential.CertPath,
@@ -112,9 +119,22 @@ func CreateTiStore(urls string, credential *security.Credential) (tidbkv.Storage
 		ClusterVerifyCN: credential.CertAllowedCN,
 	}
 	d := driver.TiKVDriver{}
-	// we should use OpenWithOptions to open a storage to avoid modifying tidb's GlobalConfig
-	// so that we can create different storage in TiCDC by different urls and credential
-	tiStore, err := d.OpenWithOptions(tiPath, driver.WithSecurity(securityCfg))
+	var tiStore tidbkv.Storage
+	err = retry.Do(ctx, func() error {
+		// we should use OpenWithOptions to open a storage to avoid modifying tidb's GlobalConfig
+		// so that we can create different storage in TiCDC by different urls and credential
+		tiStore, err = d.OpenWithOptions(tiPath, driver.WithSecurity(securityCfg))
+		return err
+	}, retry.WithMaxTries(defaultMaxRetry),
+		retry.WithBackoffBaseDelay(200),
+		retry.WithBackoffMaxDelay(4000),
+		retry.WithIsRetryableErr(func(err error) bool {
+			switch errors.Cause(err) {
+			case context.Canceled:
+				return false
+			}
+			return true
+		}))
 	if err != nil {
 		return nil, errors.WrapError(errors.ErrNewStore, err)
 	}
@@ -122,7 +142,7 @@ func CreateTiStore(urls string, credential *security.Credential) (tidbkv.Storage
 }
 
 // init initializes the upstream
-func initUpstream(ctx context.Context, up *Upstream) error {
+func initUpstream(ctx context.Context, up *Upstream, cfg *NodeTopologyCfg) error {
 	ctx, up.cancel = context.WithCancel(ctx)
 	grpcTLSOption, err := up.SecurityConfig.ToGRPCDialOption()
 	if err != nil {
@@ -134,11 +154,11 @@ func initUpstream(ctx context.Context, up *Upstream) error {
 	// default upstream always use the pdClient pass from cdc server
 	if !up.isDefaultUpstream {
 		up.PDClient, err = pd.NewClientWithContext(
-			ctx, up.PdEndpoints, up.SecurityConfig.PDSecurityOption(),
+			ctx, "cdc-upstream", up.PdEndpoints, up.SecurityConfig.PDSecurityOption(),
 			// the default `timeout` is 3s, maybe too small if the pd is busy,
 			// set to 10s to avoid frequent timeout.
-			pd.WithCustomTimeoutOption(10*time.Second),
-			pd.WithGRPCDialOptions(
+			pdopt.WithCustomTimeoutOption(10*time.Second),
+			pdopt.WithGRPCDialOptions(
 				grpcTLSOption,
 				grpc.WithConnectParams(grpc.ConnectParams{
 					Backoff: backoff.Config{
@@ -159,7 +179,7 @@ func initUpstream(ctx context.Context, up *Upstream) error {
 		if err != nil {
 			return errors.Trace(err)
 		}
-		up.etcdCli = etcdCli
+		up.etcdCli = etcd.NewWrappedClient(etcdCli)
 	}
 	clusterID := up.PDClient.GetClusterID(ctx)
 	if up.ID != 0 && up.ID != clusterID {
@@ -170,7 +190,7 @@ func initUpstream(ctx context.Context, up *Upstream) error {
 	}
 	up.ID = clusterID
 
-	up.KVStorage, err = CreateTiStore(strings.Join(up.PdEndpoints, ","), up.SecurityConfig)
+	up.KVStorage, err = CreateTiStore(ctx, strings.Join(up.PdEndpoints, ","), up.SecurityConfig, "")
 	if err != nil {
 		up.err.Store(err)
 		return errors.Trace(err)
@@ -198,6 +218,11 @@ func initUpstream(ctx context.Context, up *Upstream) error {
 			zap.Error(err),
 			zap.Uint64("upstreamID", up.ID),
 			zap.Strings("upstreamEndpoints", up.PdEndpoints))
+	}
+
+	err = up.registerTopologyInfo(ctx, cfg)
+	if err != nil {
+		return errors.Trace(err)
 	}
 
 	up.wg.Add(1)
@@ -328,4 +353,28 @@ func (up *Upstream) shouldClose() bool {
 	}
 
 	return false
+}
+
+// Put ticdc topology information to etcd, the prefix is
+// "/topology/ticdc/{clusterID}/{ip:port}"
+// tidb-dashboard will use this information to show the topology
+// information of the ticdc cluster.
+func (up *Upstream) registerTopologyInfo(ctx context.Context, cfg *NodeTopologyCfg) error {
+	lease, err := up.etcdCli.Grant(ctx, cfg.SessionTTL)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	up.session, err = up.etcdCli.NewSession(concurrency.WithLease(lease.ID))
+	if err != nil {
+		return errors.Trace(err)
+	}
+	// register capture info to upstream pd
+	key := fmt.Sprintf(topologyTiCDC, cfg.GCServiceID, cfg.AdvertiseAddr)
+	value, err := cfg.Info.Marshal()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	_, err = up.etcdCli.Put(ctx, key, string(value), clientV3.WithLease(up.session.Lease()))
+	return errors.WrapError(errors.ErrPDEtcdAPIError, err)
 }

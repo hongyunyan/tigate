@@ -14,6 +14,8 @@
 package errors
 
 import (
+	"fmt"
+
 	"github.com/pingcap/errors"
 )
 
@@ -23,6 +25,10 @@ var (
 	ErrChangeFeedNotExists = errors.Normalize(
 		"changefeed not exists, %s",
 		errors.RFCCodeText("CDC:ErrChangeFeedNotExists"),
+	)
+	ErrChangeFeedAlreadyExists = errors.Normalize(
+		"changefeed already exists, %s",
+		errors.RFCCodeText("CDC:ErrChangeFeedAlreadyExists"),
 	)
 	ErrEtcdAPIError = errors.Normalize(
 		"etcd api returns error",
@@ -36,12 +42,20 @@ var (
 		"capture not exists, %s",
 		errors.RFCCodeText("CDC:ErrCaptureNotExist"),
 	)
+	ErrSchedulerRequestFailed = errors.Normalize(
+		"scheduler request failed, %s",
+		errors.RFCCodeText("CDC:ErrSchedulerRequestFailed"),
+	)
+	ErrGetAllStoresFailed = errors.Normalize(
+		"get stores from pd failed",
+		errors.RFCCodeText("CDC:ErrGetAllStoresFailed"),
+	)
 	ErrMetaListDatabases = errors.Normalize(
 		"meta store list databases",
 		errors.RFCCodeText("CDC:ErrMetaListDatabases"),
 	)
 	ErrDDLSchemaNotFound = errors.Normalize(
-		"cannot find mysql.tidb_ddl_job schema",
+		"cannot find schema: %s",
 		errors.RFCCodeText("CDC:ErrDDLSchemaNotFound"),
 	)
 	ErrPDEtcdAPIError = errors.Normalize(
@@ -54,6 +68,10 @@ var (
 	)
 
 	// codec related errors
+	ErrDDLUnsupportType = errors.Normalize(
+		"unsupport ddl type %s, query %s",
+		errors.RFCCodeText("CDC:ErrDDLUnsupportType"),
+	)
 	ErrEncodeFailed = errors.Normalize(
 		"encode failed",
 		errors.RFCCodeText("CDC:ErrEncodeFailed"),
@@ -77,6 +95,12 @@ var (
 		errors.RFCCodeText("CDC:ErrColumnSelectorFailed"),
 	)
 
+	// Errors caused by unexpected behavior from external systems
+	ErrTiDBUnexpectedJobMeta = errors.Normalize(
+		"unexpected `job_meta` from tidb",
+		errors.RFCCodeText("CDC:ErrTiDBUnexpectedJobMeta"),
+	)
+
 	// ErrVersionIncompatible is an error for running CDC on an incompatible Cluster.
 	ErrVersionIncompatible = errors.Normalize(
 		"version is incompatible: %s",
@@ -85,6 +109,14 @@ var (
 	ErrClusterIDMismatch = errors.Normalize(
 		"cluster ID mismatch, tikv cluster ID is %d and request cluster ID is %d",
 		errors.RFCCodeText("CDC:ErrClusterIDMismatch"),
+	)
+	ErrSameUpstreamDownstream = errors.Normalize(
+		"upstream and downstream are the same, %s",
+		errors.RFCCodeText("CDC:ErrSameUpstreamDownstream"),
+	)
+	ErrActiveActiveTSOIndexIncompatible = errors.Normalize(
+		"active active tso index is incompatible, %s",
+		errors.RFCCodeText("CDC:ErrActiveActiveTSOIndexIncompatible"),
 	)
 	ErrMultipleCDCClustersExist = errors.Normalize(
 		"multiple TiCDC clusters exist while using --pd",
@@ -148,6 +180,10 @@ var (
 		"Codec invalid config",
 		errors.RFCCodeText("CDC:ErrCodecInvalidConfig"),
 	)
+	ErrCompressionFailed = errors.Normalize(
+		"Compression failed",
+		errors.RFCCodeText("CDC:ErrCompressionFailed"),
+	)
 	ErrSinkURIInvalid = errors.Normalize(
 		"sink uri invalid '%s'",
 		errors.RFCCodeText("CDC:ErrSinkURIInvalid"),
@@ -160,6 +196,14 @@ var (
 	ErrSinkUnknownProtocol = errors.Normalize(
 		"unknown '%s' message protocol for sink",
 		errors.RFCCodeText("CDC:ErrSinkUnknownProtocol"),
+	)
+	ErrExecDDLFailed = errors.Normalize(
+		"exec DDL failed %s",
+		errors.RFCCodeText("CDC:ErrExecDDLFailed"),
+	)
+	ErrDDLStateNotFound = errors.Normalize(
+		"DDL state not found %s",
+		errors.RFCCodeText("CDC:ErrDDLStateNotFound"),
 	)
 	ErrMySQLTxnError = errors.Normalize(
 		"MySQL txn error",
@@ -201,6 +245,10 @@ var (
 		"schema manager API error, %s",
 		errors.RFCCodeText("CDC:ErrAvroSchemaAPIError"),
 	)
+	ErrAvroInvalidMessage = errors.Normalize(
+		"avro invalid message format, %s",
+		errors.RFCCodeText("CDC:ErrAvroInvalidMessage"),
+	)
 	ErrOpenProtocolCodecInvalidData = errors.Normalize(
 		"open-protocol codec invalid data",
 		errors.RFCCodeText("CDC:ErrOpenProtocolCodecInvalidData"),
@@ -214,25 +262,83 @@ var (
 		errors.RFCCodeText("CDC:ErrSinkInvalidConfig"),
 	)
 	ErrMessageTooLarge = errors.Normalize(
-		"message is too large",
+		"message is too large. table:%s, length:%d, maxMessageBytes:%d",
 		errors.RFCCodeText("CDC:ErrMessageTooLarge"),
 	)
 	ErrStorageSinkInvalidDateSeparator = errors.Normalize(
 		"date separator in storage sink is invalid",
 		errors.RFCCodeText("CDC:ErrStorageSinkInvalidDateSeparator"),
 	)
+	ErrCSVEncodeFailed = errors.Normalize(
+		"csv encode failed",
+		errors.RFCCodeText("CDC:ErrCSVEncodeFailed"),
+	)
+	ErrCSVDecodeFailed = errors.Normalize(
+		"csv decode failed",
+		errors.RFCCodeText("CDC:ErrCSVDecodeFailed"),
+	)
 	ErrDebeziumEncodeFailed = errors.Normalize(
 		"debezium encode failed",
 		errors.RFCCodeText("CDC:ErrDebeziumEncodeFailed"),
+	)
+	ErrDebeziumInvalidMessage = errors.Normalize(
+		"debezium invalid message format, %s",
+		errors.RFCCodeText("CDC:ErrDebeziumInvalidMessage"),
+	)
+	ErrDebeziumEmptyValueMessage = errors.Normalize(
+		"debezium value should not be empty",
+		errors.RFCCodeText("CDC:ErrDebeziumEmptyValueMessage"),
 	)
 	ErrStorageSinkInvalidConfig = errors.Normalize(
 		"storage sink config invalid",
 		errors.RFCCodeText("CDC:ErrStorageSinkInvalidConfig"),
 	)
+	ErrStorageSinkInvalidFileName = errors.Normalize(
+		"filename in storage sink is invalid",
+		errors.RFCCodeText("CDC:ErrStorageSinkInvalidFileName"),
+	)
+
+	// utilities related errors
+	ErrToTLSConfigFailed = errors.Normalize(
+		"generate tls config failed",
+		errors.RFCCodeText("CDC:ErrToTLSConfigFailed"),
+	)
+	ErrCheckClusterVersionFromPD = errors.Normalize(
+		"failed to request PD %s, please try again later",
+		errors.RFCCodeText("CDC:ErrCheckClusterVersionFromPD"),
+	)
+	ErrNewSemVersion = errors.Normalize(
+		"create sem version",
+		errors.RFCCodeText("CDC:ErrNewSemVersion"),
+	)
+	ErrCheckDirWritable = errors.Normalize(
+		"check dir writable failed",
+		errors.RFCCodeText("CDC:ErrCheckDirWritable"),
+	)
+	ErrCheckDirValid = errors.Normalize(
+		"check dir valid failed",
+		errors.RFCCodeText("CDC:ErrCheckDirValid"),
+	)
 	ErrURLFormatInvalid = errors.Normalize(
 		"url format is invalid",
 		errors.RFCCodeText("CDC:ErrURLFormatInvalid"),
 	)
+	ErrIntersectNoOverlap = errors.Normalize(
+		"span doesn't overlap: %+v vs %+v",
+		errors.RFCCodeText("CDC:ErrIntersectNoOverlap"),
+	)
+	ErrOperateOnClosedNotifier = errors.Normalize(
+		"operate on a closed notifier",
+		errors.RFCCodeText("CDC:ErrOperateOnClosedNotifier"),
+	)
+	ErrDiskFull = errors.Normalize(
+		"failed to preallocate file because disk is full",
+		errors.RFCCodeText("CDC:ErrDiskFull"))
+	ErrWaitFreeMemoryTimeout = errors.Normalize(
+		"wait free memory timeout",
+		errors.RFCCodeText("CDC:ErrWaitFreeMemoryTimeout"),
+	)
+
 	// encode/decode, data format and data integrity errors
 	ErrInvalidRecordKey = errors.Normalize(
 		"invalid record key - %q",
@@ -258,6 +364,22 @@ var (
 		"unmarshal failed",
 		errors.RFCCodeText("CDC:ErrUnmarshalFailed"),
 	)
+	ErrInvalidChangefeedID = errors.Normalize(
+		`bad changefeed id, please match the pattern "^[a-zA-Z0-9]+(\-[a-zA-Z0-9]+)*$", the length should no more than %d, eg, "simple-changefeed-task"`,
+		errors.RFCCodeText("CDC:ErrInvalidChangefeedID"),
+	)
+	ErrInvalidKeyspace = errors.Normalize(
+		`bad keyspace, please match the pattern "^[a-zA-Z0-9]+(\-[a-zA-Z0-9]+)*$", the length should no more than %d, eg, "simple-keyspace-test"`,
+		errors.RFCCodeText("CDC:ErrInvalidKeyspace"),
+	)
+	ErrKeyspaceNotFound = errors.Normalize(
+		"keyspace not found: %d",
+		errors.RFCCodeText("CDC:ErrKeyspaceNotFound"),
+	)
+	ErrKeyspaceIDInvalid = errors.Normalize(
+		"keyspace id is invalid",
+		errors.RFCCodeText("CDC:ErrKeyspaceIDInvalid"),
+	)
 	ErrInvalidEtcdKey = errors.Normalize(
 		"invalid key: %s",
 		errors.RFCCodeText("CDC:ErrInvalidEtcdKey"),
@@ -267,6 +389,35 @@ var (
 		"can not found schema snapshot, ts: %d",
 		errors.RFCCodeText("CDC:ErrSchemaSnapshotNotFound"),
 	)
+	ErrSchemaStorageTableMiss = errors.Normalize(
+		"table %d not found",
+		errors.RFCCodeText("CDC:ErrSchemaStorageTableMiss"),
+	)
+	ErrSnapshotSchemaNotFound = errors.Normalize(
+		"schema %d not found in schema snapshot",
+		errors.RFCCodeText("CDC:ErrSnapshotSchemaNotFound"),
+	)
+	ErrSnapshotTableNotFound = errors.Normalize(
+		"table %d not found in schema snapshot",
+		errors.RFCCodeText("CDC:ErrSnapshotTableNotFound"),
+	)
+	ErrSnapshotSchemaExists = errors.Normalize(
+		"schema %s(%d) already exists",
+		errors.RFCCodeText("CDC:ErrSnapshotSchemaExists"),
+	)
+	ErrSnapshotTableExists = errors.Normalize(
+		"table %s.%s already exists",
+		errors.RFCCodeText("CDC:ErrSnapshotTableExists"),
+	)
+	ErrInvalidDDLJob = errors.Normalize(
+		"invalid ddl job(%d)",
+		errors.RFCCodeText("CDC:ErrInvalidDDLJob"),
+	)
+	ErrExchangePartition = errors.Normalize(
+		"exchange partition failed, %s",
+		errors.RFCCodeText("CDC:ErrExchangePartition"),
+	)
+
 	ErrCorruptedDataMutation = errors.Normalize(
 		"Changefeed %s.%s stopped due to corrupted data mutation received",
 		errors.RFCCodeText("CDC:ErrCorruptedDataMutation"))
@@ -308,6 +459,10 @@ var (
 		"invalid api parameter",
 		errors.RFCCodeText("CDC:ErrAPIInvalidParam"),
 	)
+	ErrAPIGetPDClientFailed = errors.Normalize(
+		"failed to get PDClient to connect PD, please recheck",
+		errors.RFCCodeText("CDC:ErrAPIGetPDClientFailed"),
+	)
 	ErrInternalServerError = errors.Normalize(
 		"internal server error",
 		errors.RFCCodeText("CDC:ErrInternalServerError"),
@@ -343,6 +498,11 @@ var (
 		"owner not found",
 		errors.RFCCodeText("CDC:ErrOwnerNotFound"),
 	)
+	ErrTableIneligible = errors.Normalize(
+		"some tables are not eligible to replicate(%v), "+
+			"if you want to ignore these tables, please set ignore_ineligible_table to true",
+		errors.RFCCodeText("CDC:ErrTableIneligible"),
+	)
 	// EtcdWorker related errors. Internal use only.
 	// ErrEtcdTryAgain is used by a PatchFunc to force a transaction abort.
 	ErrEtcdTryAgain = errors.Normalize(
@@ -376,16 +536,38 @@ var (
 		"patch ops:%d of a single changefeed exceed etcd txn max ops:%d",
 		errors.RFCCodeText("CDC:ErrEtcdTxnOpsExceed"),
 	)
+	ErrEtcdMigrateFailed = errors.Normalize(
+		"etcd meta data migrate failed:%s",
+		errors.RFCCodeText("CDC:ErrEtcdMigrateFailed"),
+	)
 	ErrChangefeedUnretryable = errors.Normalize(
 		"changefeed is in unretryable state, please check the error message"+
 			", and you should manually handle it",
 		errors.RFCCodeText("CDC:ErrChangefeedUnretryable"),
 	)
 
+	// workerpool errors
+	ErrWorkerPoolHandleCancelled = errors.Normalize(
+		"workerpool handle is cancelled",
+		errors.RFCCodeText("CDC:ErrWorkerPoolHandleCancelled"),
+	)
+	ErrAsyncPoolExited = errors.Normalize(
+		"asyncPool has exited. Report a bug if seen externally.",
+		errors.RFCCodeText("CDC:ErrAsyncPoolExited"),
+	)
+	ErrWorkerPoolGracefulUnregisterTimedOut = errors.Normalize(
+		"workerpool handle graceful unregister timed out",
+		errors.RFCCodeText("CDC:ErrWorkerPoolGracefulUnregisterTimedOut"),
+	)
+
 	// sorter errors
 	ErrIllegalSorterParameter = errors.Normalize(
 		"illegal parameter for sorter: %s",
 		errors.RFCCodeText("CDC:ErrIllegalSorterParameter"),
+	)
+	ErrConflictingFileLocks = errors.Normalize(
+		"file lock conflict: %s",
+		errors.RFCCodeText("ErrConflictingFileLocks"),
 	)
 	// RESTful client error
 	ErrRewindRequestBodyError = errors.Normalize(
@@ -409,6 +591,18 @@ var (
 	ErrUpdateServiceSafepointFailed = errors.Normalize(
 		"updating service safepoint failed",
 		errors.RFCCodeText("CDC:ErrUpdateServiceSafepointFailed"),
+	)
+	ErrUpdateGCBarrierFailed = errors.Normalize(
+		"updating gc barrier failed",
+		errors.RFCCodeText("CDC:ErrUpdateGCBarrierFailed"),
+	)
+	ErrGetGCBarrierFailed = errors.Normalize(
+		"get gc barrier failed",
+		errors.RFCCodeText("CDC:ErrGetGCBarrierFailed"),
+	)
+	ErrLoadKeyspaceFailed = errors.Normalize(
+		"loading keyspace failed",
+		errors.RFCCodeText("CDC:ErrLoadKeyspaceFailed"),
 	)
 	ErrUpstreamMissMatch = errors.Normalize(
 		"upstream missmatch,old: %d, new %d",
@@ -446,6 +640,10 @@ var (
 		"invalid ignore event type: '%s'",
 		errors.RFCCodeText("CDC:ErrInvalidIgnoreEventType"),
 	)
+	ErrInvalidEventType = errors.Normalize(
+		"sink doesn't support this type of block event: '%s'",
+		errors.RFCCodeText("CDC:ErrInvalidEventType"),
+	)
 	ErrSyncRenameTableFailed = errors.Normalize(
 		"table's old name is not in filter rule, and its new name in filter rule "+
 			"table id '%d', ddl query: [%s], it's an unexpected behavior, "+
@@ -458,6 +656,10 @@ var (
 		"invalid replica config, %s",
 		errors.RFCCodeText("CDC:ErrInvalidReplicaConfig"),
 	)
+	ErrInternalCheckFailed = errors.Normalize(
+		"internal check failed, %s",
+		errors.RFCCodeText("CDC:ErrInternalCheckFailed"),
+	)
 
 	ErrInvalidGlueSchemaRegistryConfig = errors.Normalize(
 		"invalid glue schema registry config, %s",
@@ -466,12 +668,16 @@ var (
 
 	ErrMetaOpFailed = errors.Normalize(
 		"unexpected meta operation failure: %s",
-		errors.RFCCodeText("DFLOW:ErrMetaOpFailed"),
+		errors.RFCCodeText("CDC:ErrMetaOpFailed"),
 	)
 
 	ErrUnexpected = errors.Normalize(
 		"cdc met unexpected error: %s",
 		errors.RFCCodeText("CDC:ErrUnexpected"),
+	)
+	ErrGetDiskInfo = errors.Normalize(
+		"get dir disk info failed",
+		errors.RFCCodeText("CDC:ErrGetDiskInfo"),
 	)
 	ErrLoadTimezone = errors.Normalize(
 		"load timezone",
@@ -486,4 +692,237 @@ var (
 		"user %s unauthorized, error: %s",
 		errors.RFCCodeText("CDC:ErrUnauthorized"),
 	)
+
+	ErrExternalStorageAPI = errors.Normalize(
+		"external storage api",
+		errors.RFCCodeText("CDC:ErrS3StorageAPI"),
+	)
+	ErrConsistentStorage = errors.Normalize(
+		"consistent storage (%s) not support",
+		errors.RFCCodeText("CDC:ErrConsistentStorage"),
+	)
+	ErrStorageInitialize = errors.Normalize(
+		"fail to open storage for redo log",
+		errors.RFCCodeText("CDC:ErrStorageInitialize"),
+	)
+
+	ErrRedoConfigInvalid = errors.Normalize(
+		"redo log config invalid",
+		errors.RFCCodeText("CDC:ErrRedoConfigInvalid"),
+	)
+	ErrRedoDownloadFailed = errors.Normalize(
+		"redo log down load to local failed",
+		errors.RFCCodeText("CDC:ErrRedoDownloadFailed"),
+	)
+	ErrRedoWriterStopped = errors.Normalize(
+		"redo log writer stopped",
+		errors.RFCCodeText("CDC:ErrRedoWriterStopped"),
+	)
+	ErrRedoFileOp = errors.Normalize(
+		"redo file operation",
+		errors.RFCCodeText("CDC:ErrRedoFileOp"),
+	)
+	ErrRedoFileSizeExceed = errors.Normalize(
+		"redo file size %d exceeds maximum %d",
+		errors.RFCCodeText("CDC:ErrRedoFileSizeExceed"),
+	)
+	ErrRedoMetaFileNotFound = errors.Normalize(
+		"no redo meta file found in dir: %s",
+		errors.RFCCodeText("CDC:ErrRedoMetaFileNotFound"),
+	)
+	ErrRedoMetaInitialize = errors.Normalize(
+		"initialize meta for redo log",
+		errors.RFCCodeText("CDC:ErrRedoMetaInitialize"),
+	)
+	ErrPulsarInvalidConfig = errors.Normalize(
+		"pulsar config invalid %s",
+		errors.RFCCodeText("CDC:ErrPulsarInvalidConfig"),
+	)
+	ErrPulsarNewProducer = errors.Normalize(
+		"new pulsar producer",
+		errors.RFCCodeText("CDC:ErrPulsarNewProducer"),
+	)
+	ErrPulsarProducerClosed = errors.Normalize(
+		"pulsar producer closed",
+		errors.RFCCodeText("CDC:ErrPulsarProducerClosed"),
+	)
+	ErrPulsarAsyncSendMessage = errors.Normalize(
+		"pulsar async send message failed",
+		errors.RFCCodeText("CDC:ErrPulsarAsyncSendMessage"),
+	)
+	ErrFailToCreateExternalStorage = errors.Normalize(
+		"failed to create external storage",
+		errors.RFCCodeText("CDC:ErrFailToCreateExternalStorage"),
+	)
+	// retry error
+	ErrReachMaxTry = errors.Normalize("reach maximum try: %s, error: %s",
+		errors.RFCCodeText("CDC:ErrReachMaxTry"),
+	)
+	// tcp server error
+	ErrTCPServerClosed = errors.Normalize("The TCP server has been closed",
+		errors.RFCCodeText("CDC:ErrTCPServerClosed"),
+	)
+
+	// puller related errors
+	ErrAddRegionRequestRetryLimitExceeded = errors.Normalize(
+		"add region request retry limit exceeded",
+		errors.RFCCodeText("CDC:ErrAddRegionRequestRetryLimitExceeded"),
+	)
+
+	// Application specific errors from apperror package
+	ErrChangefeedRetryable = errors.Normalize(
+		"changefeed is in retryable state",
+		errors.RFCCodeText("CDC:ErrChangefeedRetryable"),
+	)
+	ErrChangefeedInitTableTriggerDispatcherFailed = errors.Normalize(
+		"failed to init table trigger dispatcher",
+		errors.RFCCodeText("CDC:ErrChangefeedInitTableTriggerDispatcherFailed"),
+	)
+	ErrDDLEventError = errors.Normalize(
+		"ddl event meets error",
+		errors.RFCCodeText("CDC:ErrDDLEventError"),
+	)
+	ErrTableIsNotFounded = errors.Normalize(
+		"table is not found",
+		errors.RFCCodeText("CDC:ErrTableIsNotFounded"),
+	)
+	ErrTableNotSupportMove = errors.Normalize(
+		"table is not supported to move",
+		errors.RFCCodeText("CDC:ErrTableNotSupportMove"),
+	)
+	ErrMaintainerNotFounded = errors.Normalize(
+		"maintainer is not found",
+		errors.RFCCodeText("CDC:ErrMaintainerNotFounded"),
+	)
+	ErrTimeout = errors.Normalize(
+		"timeout",
+		errors.RFCCodeText("CDC:ErrTimeout"),
+	)
+	ErrNodeIsNotFound = errors.Normalize(
+		"node is not found",
+		errors.RFCCodeText("CDC:ErrNodeIsNotFound"),
+	)
+	ErrOperatorIsNil = errors.Normalize(
+		"operator created failed",
+		errors.RFCCodeText("CDC:ErrOperatorIsNil"),
+	)
+
+	ErrTableAfterDDLNotSplitable = errors.Normalize(
+		"the ddl event will break splitable of this table",
+		errors.RFCCodeText("CDC:ErrTableAfterNotSplitable"),
+	)
+
+	ErrConfigInvalidTimezone = errors.Normalize(
+		"invalid timezone string: %s",
+		errors.RFCCodeText("CDC:ErrConfigInvalidTimezone"),
+	)
+
+	ErrUnimplementedIOType = errors.Normalize(
+		"unimplemented IOType: %d",
+		errors.RFCCodeText("CDC:ErrUnimplementedIOType"),
+	)
 )
+
+// ErrorType defines the type of application errors
+type ErrorType int
+
+const (
+	// ErrorTypeUnknown is the default error type.
+	ErrorTypeUnknown ErrorType = 0
+
+	ErrorTypeEpochMismatch  ErrorType = 1
+	ErrorTypeEpochSmaller   ErrorType = 2
+	ErrorTypeTaskIDMismatch ErrorType = 3
+
+	ErrorTypeInvalid    ErrorType = 101
+	ErrorTypeIncomplete ErrorType = 102
+	ErrorTypeDecodeData ErrorType = 103
+	ErrorTypeBufferFull ErrorType = 104
+	ErrorTypeDuplicate  ErrorType = 105
+	ErrorTypeNotExist   ErrorType = 106
+	ErrorTypeClosed     ErrorType = 107
+
+	ErrorTypeConnectionFailed     ErrorType = 201
+	ErrorTypeConnectionNotFound   ErrorType = 202
+	ErrorTypeMessageCongested     ErrorType = 204
+	ErrorTypeMessageReceiveFailed ErrorType = 205
+	ErrorTypeMessageSendFailed    ErrorType = 206
+	ErrorTypeTargetNotFound       ErrorType = 207
+	ErrorTypeInvalidMessage       ErrorType = 208
+	ErrorTypeTargetMismatch       ErrorType = 209
+
+	ErrorInvalidDDLEvent ErrorType = 301
+)
+
+func (t ErrorType) String() string {
+	switch t {
+	case ErrorTypeUnknown:
+		return "Unknown"
+	case ErrorTypeEpochMismatch:
+		return "EpochMismatch"
+	case ErrorTypeEpochSmaller:
+		return "EpochSmaller"
+	case ErrorTypeTaskIDMismatch:
+		return "TaskIDMismatch"
+	case ErrorTypeInvalid:
+		return "Invalid"
+	case ErrorTypeIncomplete:
+		return "Incomplete"
+	case ErrorTypeDecodeData:
+		return "DecodeData"
+	case ErrorTypeBufferFull:
+		return "BufferFull"
+	case ErrorTypeDuplicate:
+		return "Duplicate"
+	case ErrorTypeNotExist:
+		return "NotExist"
+	case ErrorTypeClosed:
+		return "Closed"
+	case ErrorTypeConnectionFailed:
+		return "ConnectionFailed"
+	case ErrorTypeConnectionNotFound:
+		return "ConnectionNotFound"
+	case ErrorTypeMessageCongested:
+		return "MessageCongested"
+	case ErrorTypeMessageReceiveFailed:
+		return "MessageReceiveFailed"
+	case ErrorTypeMessageSendFailed:
+		return "MessageSendFailed"
+	default:
+		return "Unknown"
+	}
+}
+
+// AppError represents an application-specific error
+type AppError struct {
+	Type   ErrorType
+	Reason string
+}
+
+// NewAppErrorS creates a new AppError with only type
+func NewAppErrorS(t ErrorType) *AppError {
+	return &AppError{
+		Type:   t,
+		Reason: "",
+	}
+}
+
+// NewAppError creates a new AppError with type and reason
+func NewAppError(t ErrorType, reason string) *AppError {
+	return &AppError{
+		Type:   t,
+		Reason: reason,
+	}
+}
+
+func (e AppError) Error() string {
+	return fmt.Sprintf("ErrorType: %s, Reason: %s", e.Type, e.Reason)
+}
+
+func (e AppError) GetType() ErrorType {
+	return e.Type
+}
+
+func (e AppError) Equal(err AppError) bool {
+	return e.Type == err.Type
+}

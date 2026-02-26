@@ -14,18 +14,38 @@
 package event
 
 import (
-	"encoding/json"
+	"encoding/binary"
+	"fmt"
 
 	"github.com/pingcap/ticdc/pkg/common"
 )
 
+var _ Event = &SyncPointEvent{}
+
+const (
+	SyncPointEventVersion1 = 1
+)
+
 // Implement Event / FlushEvent / BlockEvent interface
 type SyncPointEvent struct {
-	// State is the state of sender when sending this event.
-	State          EventSenderState    `json:"state"`
-	DispatcherID   common.DispatcherID `json:"dispatcher_id"`
-	CommitTs       uint64              `json:"commit_ts"`
-	PostTxnFlushed []func()            `msg:"-"`
+	DispatcherID common.DispatcherID
+	CommitTs     uint64
+	// The seq of the event. It is set by event service.
+	Seq uint64
+	// The epoch of the event. It is set by event service.
+	Epoch          uint64
+	Version        byte
+	PostTxnFlushed []func()
+}
+
+func NewSyncPointEvent(id common.DispatcherID, commitTs uint64, seq uint64, epoch uint64) *SyncPointEvent {
+	return &SyncPointEvent{
+		DispatcherID: id,
+		CommitTs:     commitTs,
+		Seq:          seq,
+		Epoch:        epoch,
+		Version:      SyncPointEventVersion1,
+	}
 }
 
 func (e *SyncPointEvent) GetType() int {
@@ -45,26 +65,21 @@ func (e *SyncPointEvent) GetStartTs() common.Ts {
 }
 
 func (e *SyncPointEvent) GetSize() int64 {
-	return int64(e.State.GetSize() + e.DispatcherID.GetSize() + 8)
+	// Size does not include header or version (those are only for serialization)
+	// Only business data: Seq(8) + Epoch(8) + DispatcherID + CommitTs(8)
+	return int64(8 + 8 + e.DispatcherID.GetSize() + 8)
 }
 
 func (e *SyncPointEvent) IsPaused() bool {
-	return e.State.IsPaused()
-}
-
-func (e SyncPointEvent) Marshal() ([]byte, error) {
-	// TODO: optimize it
-	return json.Marshal(e)
+	return false
 }
 
 func (e SyncPointEvent) GetSeq() uint64 {
-	// It's a fake seq.
-	return 0
+	return e.Seq
 }
 
-func (e *SyncPointEvent) Unmarshal(data []byte) error {
-	// TODO: optimize it
-	return json.Unmarshal(data, e)
+func (e SyncPointEvent) GetEpoch() uint64 {
+	return e.Epoch
 }
 
 func (e *SyncPointEvent) GetBlockedTables() *InfluencedTables {
@@ -104,5 +119,92 @@ func (e *SyncPointEvent) ClearPostFlushFunc() {
 }
 
 func (e *SyncPointEvent) Len() int32 {
-	return 0
+	return 1
+}
+
+func (e SyncPointEvent) Marshal() ([]byte, error) {
+	// 1. Encode payload based on version
+	var payload []byte
+	var err error
+	switch e.Version {
+	case SyncPointEventVersion1:
+		payload, err = e.encodeV1()
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unsupported SyncPointEvent version: %d", e.Version)
+	}
+
+	// 2. Use unified header format
+	return MarshalEventWithHeader(TypeSyncPointEvent, int(e.Version), payload)
+}
+
+func (e *SyncPointEvent) Unmarshal(data []byte) error {
+	// 1. Validate header and extract payload
+	payload, version, err := ValidateAndExtractPayload(data, TypeSyncPointEvent)
+	if err != nil {
+		return err
+	}
+
+	// 2. Store version
+	e.Version = byte(version)
+
+	// 3. Decode based on version
+	switch version {
+	case SyncPointEventVersion1:
+		return e.decodeV1(payload)
+	default:
+		return fmt.Errorf("unsupported SyncPointEvent version: %d", version)
+	}
+}
+
+func (e SyncPointEvent) encodeV1() ([]byte, error) {
+	// Note: version is now handled in the header by Marshal(), not here
+	// payload: Seq + Epoch + CommitTs + DispatcherID
+	payloadSize := 8 + 8 + 8 + e.DispatcherID.GetSize()
+	data := make([]byte, payloadSize)
+	offset := 0
+
+	// Seq
+	binary.BigEndian.PutUint64(data[offset:], uint64(e.Seq))
+	offset += 8
+
+	// Epoch
+	binary.BigEndian.PutUint64(data[offset:], e.Epoch)
+	offset += 8
+
+	// CommitTs
+	binary.BigEndian.PutUint64(data[offset:], e.CommitTs)
+	offset += 8
+
+	// DispatcherID
+	copy(data[offset:], e.DispatcherID.Marshal())
+
+	return data, nil
+}
+
+func (e *SyncPointEvent) decodeV1(data []byte) error {
+	// Note: header (magic + event type + version + length) has already been read and removed from data
+	offset := 0
+
+	// Seq
+	e.Seq = binary.BigEndian.Uint64(data[offset:])
+	offset += 8
+
+	// Epoch
+	e.Epoch = binary.BigEndian.Uint64(data[offset:])
+	offset += 8
+
+	// CommitTs
+	e.CommitTs = binary.BigEndian.Uint64(data[offset:])
+	offset += 8
+
+	// DispatcherID
+	err := e.DispatcherID.Unmarshal(data[offset:])
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

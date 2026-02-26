@@ -16,16 +16,14 @@ package replica
 import (
 	"bytes"
 	"encoding/hex"
+	"sync"
 
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/messaging"
 	"github.com/pingcap/ticdc/pkg/node"
-	"github.com/pingcap/ticdc/pkg/pdutil"
 	"github.com/pingcap/ticdc/pkg/scheduler/replica"
-	"github.com/pingcap/ticdc/pkg/spanz"
-	"github.com/pingcap/tiflow/cdc/processor/tablepb"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
@@ -38,34 +36,40 @@ type SpanReplication struct {
 	ID           common.DispatcherID
 	Span         *heartbeatpb.TableSpan
 	ChangefeedID common.ChangeFeedID
+	// whether the span is enabled to split.
+	// if the sink is mysql-sink and the table have only one primary key and no uk, the span is enabled to split.
+	// if the sink is other sink, the span is enabled to split.
+	enabledSplit bool
 
-	schemaID   int64
-	nodeID     node.ID
-	groupID    replica.GroupID
-	status     *atomic.Pointer[heartbeatpb.TableSpanStatus]
-	blockState *atomic.Pointer[heartbeatpb.State]
-
-	pdClock pdutil.Clock
+	schemaID    int64
+	nodeIDMutex sync.Mutex // mutex for nodeID
+	nodeID      node.ID
+	groupID     replica.GroupID
+	status      *atomic.Pointer[heartbeatpb.TableSpanStatus]
+	blockState  *atomic.Pointer[heartbeatpb.State]
 }
 
 func NewSpanReplication(cfID common.ChangeFeedID,
 	id common.DispatcherID,
-	pdClock pdutil.Clock,
 	SchemaID int64,
 	span *heartbeatpb.TableSpan,
 	checkpointTs uint64,
+	mode int64,
+	enabledSplit bool,
 ) *SpanReplication {
-	r := newSpanReplication(cfID, id, pdClock, SchemaID, span, checkpointTs)
+	r := newSpanReplication(cfID, id, SchemaID, span, enabledSplit)
 	r.initStatus(&heartbeatpb.TableSpanStatus{
 		ID:           id.ToPB(),
 		CheckpointTs: checkpointTs,
+		Mode:         mode,
 	})
 	log.Info("new span replication created",
-		zap.String("changefeedID", cfID.Name()),
+		zap.Stringer("changefeedID", cfID),
 		zap.String("id", id.String()),
 		zap.Int64("schemaID", SchemaID),
 		zap.Int64("tableID", span.TableID),
 		zap.String("groupID", replica.GetGroupName(r.groupID)),
+		zap.Uint64("checkpointTs", checkpointTs),
 		zap.String("start", hex.EncodeToString(span.StartKey)),
 		zap.String("end", hex.EncodeToString(span.EndKey)))
 	return r
@@ -74,37 +78,37 @@ func NewSpanReplication(cfID common.ChangeFeedID,
 func NewWorkingSpanReplication(
 	cfID common.ChangeFeedID,
 	id common.DispatcherID,
-	pdClock pdutil.Clock,
 	SchemaID int64,
 	span *heartbeatpb.TableSpan,
 	status *heartbeatpb.TableSpanStatus,
 	nodeID node.ID,
+	enabledSplit bool,
 ) *SpanReplication {
-	r := newSpanReplication(cfID, id, pdClock, SchemaID, span, status.CheckpointTs)
+	r := newSpanReplication(cfID, id, SchemaID, span, enabledSplit)
 	// Must set Node ID when creating a working span replication
 	r.SetNodeID(nodeID)
 	r.initStatus(status)
 	log.Info("new working span replication created",
-		zap.String("changefeedID", cfID.Name()),
-		zap.String("id", id.String()),
+		zap.Stringer("changefeedID", cfID),
+		zap.String("dispatcherID", id.String()),
 		zap.String("nodeID", nodeID.String()),
 		zap.Uint64("checkpointTs", status.CheckpointTs),
 		zap.String("componentStatus", status.ComponentStatus.String()),
 		zap.Int64("schemaID", SchemaID),
 		zap.Int64("tableID", span.TableID),
-		zap.String("groupID", replica.GetGroupName(r.groupID)),
+		zap.Int64("groupID", r.groupID),
 		zap.String("start", hex.EncodeToString(span.StartKey)),
 		zap.String("end", hex.EncodeToString(span.EndKey)))
 	return r
 }
 
-func newSpanReplication(cfID common.ChangeFeedID, id common.DispatcherID, pdClock pdutil.Clock, SchemaID int64, span *heartbeatpb.TableSpan, checkpointTs uint64) *SpanReplication {
+func newSpanReplication(cfID common.ChangeFeedID, id common.DispatcherID, SchemaID int64, span *heartbeatpb.TableSpan, enabledSplit bool) *SpanReplication {
 	r := &SpanReplication{
 		ID:           id,
-		pdClock:      pdClock,
 		schemaID:     SchemaID,
 		Span:         span,
 		ChangefeedID: cfID,
+		enabledSplit: enabledSplit,
 		status:       atomic.NewPointer[heartbeatpb.TableSpanStatus](nil),
 		blockState:   atomic.NewPointer[heartbeatpb.State](nil),
 	}
@@ -112,11 +116,16 @@ func newSpanReplication(cfID common.ChangeFeedID, id common.DispatcherID, pdCloc
 	return r
 }
 
+// IsSplitEnabled reports if split operations are allowed on this replica.
+func (r *SpanReplication) IsSplitEnabled() bool {
+	return r.enabledSplit
+}
+
 func (r *SpanReplication) initStatus(status *heartbeatpb.TableSpanStatus) {
 	if status == nil || status.CheckpointTs == 0 {
 		log.Panic("add replica with invalid checkpoint ts",
-			zap.String("changefeedID", r.ChangefeedID.Name()),
-			zap.String("id", r.ID.String()),
+			zap.Stringer("changefeedID", r.ChangefeedID),
+			zap.String("dispatcherID", r.ID.String()),
 			zap.Uint64("checkpointTs", status.CheckpointTs),
 		)
 	}
@@ -125,12 +134,18 @@ func (r *SpanReplication) initStatus(status *heartbeatpb.TableSpanStatus) {
 
 func (r *SpanReplication) initGroupID() {
 	r.groupID = replica.DefaultGroupID
-	span := tablepb.Span{TableID: r.Span.TableID, StartKey: r.Span.StartKey, EndKey: r.Span.EndKey}
+	span := heartbeatpb.TableSpan{
+		TableID:    r.Span.TableID,
+		StartKey:   r.Span.StartKey,
+		EndKey:     r.Span.EndKey,
+		KeyspaceID: r.Span.KeyspaceID,
+	}
 	// check if the table is split
-	totalSpan := spanz.TableIDToComparableSpan(span.TableID)
-	if !spanz.IsSubSpan(span, totalSpan) {
-		log.Warn("invalid span range", zap.String("changefeedID", r.ChangefeedID.Name()),
-			zap.String("id", r.ID.String()), zap.Int64("tableID", span.TableID),
+	totalSpan := common.TableIDToComparableSpan(span.KeyspaceID, span.TableID)
+	if !common.IsSubSpan(span, totalSpan) {
+		log.Warn("invalid span range",
+			zap.Stringer("changefeedID", r.ChangefeedID),
+			zap.String("dispatcherID", r.ID.String()), zap.Int64("tableID", span.TableID),
 			zap.String("totalSpan", totalSpan.String()),
 			zap.String("start", hex.EncodeToString(span.StartKey)),
 			zap.String("end", hex.EncodeToString(span.EndKey)))
@@ -138,24 +153,25 @@ func (r *SpanReplication) initGroupID() {
 	if !bytes.Equal(span.StartKey, totalSpan.StartKey) || !bytes.Equal(span.EndKey, totalSpan.EndKey) {
 		r.groupID = replica.GenGroupID(replica.GroupTable, span.TableID)
 	}
+	log.Info("init groupID",
+		zap.Stringer("changefeedID", r.ChangefeedID), zap.Any("groupID", r.groupID),
+		zap.Any("span", common.FormatTableSpan(&span)), zap.Any("totalSpan", common.FormatTableSpan(&totalSpan)))
 }
 
 func (r *SpanReplication) GetStatus() *heartbeatpb.TableSpanStatus {
 	return r.status.Load()
 }
 
+func (r *SpanReplication) GetMode() int64 {
+	return r.status.Load().Mode
+}
+
 // UpdateStatus updates the replication status with the following rules:
-//  1. If there is a block state in WAITING stage and its blockTs is less than or equal to
-//     the new status's checkpointTs, the update is **skipped** to prevent checkpoint advancement
-//     during an ongoing block event.
-//  2. The new status is only stored if its checkpointTs is greater than or equal to
-//     the current status's checkpointTs.
+//
+//	The new status is only stored if its checkpointTs is greater than or equal to
+//	the current status's checkpointTs.
 func (r *SpanReplication) UpdateStatus(newStatus *heartbeatpb.TableSpanStatus) {
 	if newStatus != nil {
-		blockState := r.blockState.Load()
-		if blockState != nil && blockState.Stage == heartbeatpb.BlockStage_WAITING && blockState.BlockTs <= newStatus.CheckpointTs {
-			return
-		}
 		oldStatus := r.status.Load()
 		if newStatus.CheckpointTs >= oldStatus.CheckpointTs {
 			r.status.Store(newStatus)
@@ -177,12 +193,14 @@ func (r *SpanReplication) UpdateBlockState(newState heartbeatpb.State) {
 	r.blockState.Store(&newState)
 }
 
-func (r *SpanReplication) GetSchemaID() int64 {
-	return r.schemaID
+// GetBlockState returns the current block state (DDL / syncpoint barrier) tracked for this span.
+// It can be nil if the span is not participating in any in-flight barrier.
+func (r *SpanReplication) GetBlockState() *heartbeatpb.State {
+	return r.blockState.Load()
 }
 
-func (r *SpanReplication) GetPDClock() pdutil.Clock {
-	return r.pdClock
+func (r *SpanReplication) GetSchemaID() int64 {
+	return r.schemaID
 }
 
 func (r *SpanReplication) SetSchemaID(schemaID int64) {
@@ -190,6 +208,8 @@ func (r *SpanReplication) SetSchemaID(schemaID int64) {
 }
 
 func (r *SpanReplication) SetNodeID(n node.ID) {
+	r.nodeIDMutex.Lock()
+	defer r.nodeIDMutex.Unlock()
 	r.nodeID = n
 }
 
@@ -198,11 +218,15 @@ func (r *SpanReplication) GetID() common.DispatcherID {
 }
 
 func (r *SpanReplication) GetNodeID() node.ID {
+	r.nodeIDMutex.Lock()
+	defer r.nodeIDMutex.Unlock()
 	return r.nodeID
 }
 
 // IsScheduled returns true if the span is scheduled to a node
 func (r *SpanReplication) IsScheduled() bool {
+	r.nodeIDMutex.Lock()
+	defer r.nodeIDMutex.Unlock()
 	return r.nodeID != ""
 }
 
@@ -210,36 +234,78 @@ func (r *SpanReplication) GetGroupID() replica.GroupID {
 	return r.groupID
 }
 
-func (r *SpanReplication) NewAddDispatcherMessage(server node.ID) (*messaging.TargetMessage, error) {
-	ts := r.pdClock.CurrentTS()
-
+// NewAddDispatcherMessage creates a ScheduleDispatcherRequest(Create) for this span.
+//
+// The StartTs in the request is usually the span checkpoint. However, when a dispatcher is being
+// moved/recreated during an in-flight barrier (DDL or syncpoint), starting from the raw checkpoint can
+// violate barrier semantics (e.g. replaying events that have already been acknowledged by the barrier),
+// so we adjust StartTs and (for DDL) optionally skip DML at StartTs+1.
+func (r *SpanReplication) NewAddDispatcherMessage(server node.ID, operatorType heartbeatpb.OperatorType) *messaging.TargetMessage {
+	startTs := r.status.Load().CheckpointTs
+	skipDMLAsStartTs := false
+	if state := r.blockState.Load(); state != nil && state.IsBlocked &&
+		(state.Stage == heartbeatpb.BlockStage_WAITING || state.Stage == heartbeatpb.BlockStage_WRITING) && state.BlockTs > 0 {
+		if state.IsSyncPoint {
+			// When a syncpoint is in-flight (WAITING/WRITING), the maintainer will force the span checkpoint to BlockTs-1
+			// when handling block status. If we start a moved/recreated dispatcher from that forced checkpoint, it may re-scan
+			// and re-apply events with commitTs <= BlockTs, which can race with the syncpoint write and corrupt the snapshot
+			// semantics of that syncpoint. Starting from BlockTs avoids replaying those events, and is safe because the
+			// dispatcher can only enter the syncpoint barrier after all events with commitTs <= BlockTs have been pushed
+			// downstream.
+			if state.BlockTs > startTs {
+				startTs = state.BlockTs
+			}
+		} else {
+			// For an in-flight DDL barrier, a recreated dispatcher must start from (blockTs-1) so that it can
+			// replay the DDL at blockTs. At the same time, it should skip DML events at blockTs to avoid potential
+			// duplicate DML writes when the dispatcher is moved/recreated during the barrier.
+			blockTsMinusOne := state.BlockTs - 1
+			if blockTsMinusOne > startTs {
+				startTs = blockTsMinusOne
+			}
+			if startTs+1 == state.BlockTs {
+				skipDMLAsStartTs = true
+			}
+		}
+	}
 	return messaging.NewSingleTargetMessage(server,
 		messaging.HeartbeatCollectorTopic,
 		&heartbeatpb.ScheduleDispatcherRequest{
 			ChangefeedID: r.ChangefeedID.ToPB(),
 			Config: &heartbeatpb.DispatcherConfig{
-				DispatcherID: r.ID.ToPB(),
-				SchemaID:     r.schemaID,
-				Span:         r.Span,
-				StartTs:      r.status.Load().CheckpointTs,
-				CurrentPdTs:  ts,
+				DispatcherID:     r.ID.ToPB(),
+				SchemaID:         r.schemaID,
+				Span:             r.Span,
+				StartTs:          startTs,
+				SkipDMLAsStartTs: skipDMLAsStartTs,
+				Mode:             r.GetMode(),
 			},
 			ScheduleAction: heartbeatpb.ScheduleAction_Create,
-		}), nil
+			OperatorType:   operatorType,
+		})
 }
 
-func (r *SpanReplication) NewRemoveDispatcherMessage(server node.ID) *messaging.TargetMessage {
-	return NewRemoveDispatcherMessage(server, r.ChangefeedID, r.ID.ToPB())
+// NewRemoveDispatcherMessage creates a ScheduleDispatcherRequest(Remove) for this span.
+// Span and OperatorType are included so a new maintainer can reconstruct intent during bootstrap/failover,
+// even if the dispatcher has already disappeared from the node span snapshot.
+func (r *SpanReplication) NewRemoveDispatcherMessage(server node.ID, operatorType heartbeatpb.OperatorType) *messaging.TargetMessage {
+	return NewRemoveDispatcherMessage(server, r.ChangefeedID, r.ID.ToPB(), r.Span, r.GetMode(), operatorType)
 }
 
-func NewRemoveDispatcherMessage(server node.ID, cfID common.ChangeFeedID, dispatcherID *heartbeatpb.DispatcherID) *messaging.TargetMessage {
+// NewRemoveDispatcherMessage creates a ScheduleDispatcherRequest(Remove) for a dispatcherID.
+// The span is optional for the dispatcher manager, but is useful for maintainer bootstrap to correlate
+// in-flight remove requests with table spans when the dispatcher no longer exists.
+func NewRemoveDispatcherMessage(server node.ID, cfID common.ChangeFeedID, dispatcherID *heartbeatpb.DispatcherID, span *heartbeatpb.TableSpan, mode int64, operatorType heartbeatpb.OperatorType) *messaging.TargetMessage {
 	return messaging.NewSingleTargetMessage(server,
 		messaging.HeartbeatCollectorTopic,
 		&heartbeatpb.ScheduleDispatcherRequest{
 			ChangefeedID: cfID.ToPB(),
 			Config: &heartbeatpb.DispatcherConfig{
 				DispatcherID: dispatcherID,
+				Span:         span,
+				Mode:         mode,
 			},
 			ScheduleAction: heartbeatpb.ScheduleAction_Remove,
+			OperatorType:   operatorType,
 		})
 }

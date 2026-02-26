@@ -26,15 +26,16 @@ PD_ADDR = "http://127.0.0.1:2379"
 # MTIzNDU2
 # Use this value here to test redo apply function works well
 # when use base64 encoded password
-ENPASSWORD="MTIzNDU2"
-SINK_URI="mysql://normal:%s@127.0.0.1:3306/" % ENPASSWORD
+ENPASSWORD = "MTIzNDU2"
+SINK_URI = "mysql://normal:%s@127.0.0.1:3306/" % ENPASSWORD
 
 physicalShiftBits = 18
+
 
 def assert_status_code(resp, expected_code, url):
     """
     Assert response status code matches expected code with detailed error message
-    
+
     Args:
         resp: Response object
         expected_code: Expected status code
@@ -56,6 +57,7 @@ def assert_status_code(resp, expected_code, url):
     URL: {url}
     """
 
+
 def requests_get_with_retry(url, max_retries=RETRY_TIME, delay_seconds=1):
     """
     requests get with retry
@@ -71,13 +73,16 @@ def requests_get_with_retry(url, max_retries=RETRY_TIME, delay_seconds=1):
             if response.status_code == 200 or response.status_code == 202:
                 return response
         except RequestException as e:
-            logging.info(f"request fails {retry + 1}/{max_retries} time retry...")
+            logging.info(
+                f"request fails {retry + 1}/{max_retries} time retry...")
             time.sleep(delay_seconds)
     return None
 
 # we write some SQLs in the run.sh after call create_changefeed
+
+
 def create_changefeed(sink_uri):
-    url = BASE_URL1_V2+"/changefeeds"
+    url = BASE_URL1_V2+"/changefeeds?keyspace=keyspace1"
     # create changefeed
     for i in range(1, 4):
         data = {
@@ -110,11 +115,76 @@ def create_changefeed(sink_uri):
     logging.info(f"response body: {resp.json()}")
     assert_status_code(resp, rq.codes.bad_request, url)
 
+    # create changefeed fail because dispatcher is invalid
+    url = BASE_URL1_V2+"/changefeeds?keyspace=keyspace1"
+    data = json.dumps({
+        "changefeed_id": "changefeed-test-v2",
+        "sink_uri": "kafka://127.0.0.1:9092/http_api?protocol=simple",
+        "replica_config": {
+            "sink": {
+                "dispatchers": [
+                    {
+                        "matcher": ["*.*"],
+                        "partition": "columns",
+                        "columns": ["a.b"]
+                    }
+                ]
+            }
+        }
+    })
+    headers = {"Content-Type": "application/json"}
+    resp = rq.post(url, data=data, headers=headers)
+    assert "ErrDispatcherFailed" in resp.text, f"{resp.text}"
+
+    url = BASE_URL1_V2+"/changefeeds?keyspace=keyspace1"
+    data = json.dumps({
+        "changefeed_id": "changefeed-test-v2",
+        "sink_uri": "pulsar://127.0.0.1:6650/http_api_?protocol=canal-json",
+        "replica_config": {
+            "sink": {
+                "dispatchers": [
+                    {
+                        "matcher": ["*.*"],
+                        "partition": "columns",
+                        "columns": ["a.b"],
+                        "topic": "persistent://public/default/http_api_{schema}_{table}",
+                    }
+                ]
+            }
+        }
+    })
+    headers = {"Content-Type": "application/json"}
+    resp = rq.post(url, data=data, headers=headers)
+    assert "ErrDispatcherFailed" in resp.text, f"{resp.text}"
+
+    # create changefeed fail because glue schema config is invalid
+    url = BASE_URL1_V2+"/changefeeds?keyspace=keyspace1"
+    data = json.dumps({
+        "changefeed_id": "changefeed-test-v2",
+        "sink_uri": "kafka://127.0.0.1:9092/http_api?protocol=avro",
+        "replica_config": {
+            "sink": {
+                "kafka_config": {
+                    "glue_schema_registry_config": {
+                        "region": "us-west-1",
+                        "registry_name": "ticdc-test"
+                    }
+                }
+            }
+        }
+    })
+    headers = {"Content-Type": "application/json"}
+    resp = rq.post(url, data=data, headers=headers)
+    assert "CDC:ErrKafkaNewProducer" in resp.text, f"{resp.text}"
+    assert "not found, ResolveEndpointV2" not in resp.text, f"{resp.text}"
+
+    print("pass test: create changefeed")
+
 
 def list_changefeed():
     # test state: all
-    url = BASE_URL0_V2+"/changefeeds?state=all"
-    
+    url = BASE_URL0_V2+"/changefeeds?state=all&keyspace=keyspace1"
+
     # Add retry logic to wait for changefeeds
     # We need to retry because the coordinator need some time to sync the changefeed infos from etcd
     for _ in range(RETRY_TIME):
@@ -125,11 +195,11 @@ def list_changefeed():
             break
         logging.info("No changefeeds found, retrying...")
         time.sleep(1)
-    
+
     assert len(changefeeds) > 0, "No changefeeds found after retries"
-    
+
     # test state: normal
-    url = BASE_URL0_V2+"/changefeeds?state=normal"
+    url = BASE_URL0_V2+"/changefeeds?state=normal&keyspace=keyspace1"
     resp = rq.get(url)
     assert_status_code(resp, rq.codes.ok, url)
     data = resp.json()
@@ -138,7 +208,7 @@ def list_changefeed():
         assert cf["state"] == "normal"
 
     # test state: stopped
-    url = BASE_URL0_V2+"/changefeeds?state=stopped"
+    url = BASE_URL0_V2+"/changefeeds?state=stopped&keyspace=keyspace1"
     resp = rq.get(url)
     assert_status_code(resp, rq.codes.ok, url)
     data = resp.json()
@@ -149,26 +219,25 @@ def list_changefeed():
 
 def get_changefeed():
     # test get changefeed success
-    url = BASE_URL0_V2+"/changefeeds/changefeed-test1"
+    url = BASE_URL0_V2+"/changefeeds/changefeed-test1?keyspace=keyspace1"
     resp = rq.get(url)
     assert_status_code(resp, rq.codes.ok, url)
 
-    url = BASE_URL0_V2+"/changefeeds/changefeed-test2"
+    url = BASE_URL0_V2+"/changefeeds/changefeed-test2?keyspace=keyspace1"
     resp = rq.get(url)
     assert_status_code(resp, rq.codes.ok, url)
 
     # test get changefeed failed
-    url = BASE_URL0_V2+"/changefeeds/changefeed-not-exists"
+    url = BASE_URL0_V2+"/changefeeds/changefeed-not-exists?keyspace=keyspace1"
     resp = rq.get(url)
     assert_status_code(resp, rq.codes.bad_request, url)
     data = resp.json()
     assert data["error_code"] == "CDC:ErrChangeFeedNotExists"
 
 
-
 def pause_changefeed():
     # pause changefeed
-    url = BASE_URL0_V2+"/changefeeds/changefeed-test2/pause"
+    url = BASE_URL0_V2+"/changefeeds/changefeed-test2/pause?keyspace=keyspace1"
     for i in range(RETRY_TIME):
         resp = rq.post(url)
         if resp.status_code == rq.codes.ok:
@@ -176,7 +245,7 @@ def pause_changefeed():
         time.sleep(1)
     assert_status_code(resp, rq.codes.ok, url)
     # check if pause changefeed success
-    url = BASE_URL0_V2+"/changefeeds/changefeed-test2"
+    url = BASE_URL0_V2+"/changefeeds/changefeed-test2?keyspace=keyspace1"
     for i in range(RETRY_TIME):
         resp = rq.get(url)
         assert_status_code(resp, rq.codes.ok, url)
@@ -186,49 +255,82 @@ def pause_changefeed():
         time.sleep(1)
     assert data["state"] == "stopped"
     # test pause changefeed failed
-    url = BASE_URL0_V2+"/changefeeds/changefeed-not-exists/pause"
+    url = BASE_URL0_V2+"/changefeeds/changefeed-not-exists/pause?keyspace=keyspace1"
     resp = rq.post(url)
     assert_status_code(resp, rq.codes.bad_request, url)
     data = resp.json()
     assert data["error_code"] == "CDC:ErrChangeFeedNotExists"
 
 
-
-
 def update_changefeed():
     # update fail
     # can only update a stopped changefeed
-    url = BASE_URL0_V2+"/changefeeds/changefeed-test1"
-    data = json.dumps({"mounter_worker_num": 32})
+    url = BASE_URL0_V2+"/changefeeds/changefeed-test1?keyspace=keyspace1"
+    data = json.dumps({
+        "replica_config": {
+            "mounter": {
+                "worker_num": 32
+            }
+        }
+    })
     headers = {"Content-Type": "application/json"}
     resp = rq.put(url, data=data, headers=headers)
     assert_status_code(resp, rq.codes.bad_request, url)
 
     # update success
-    url = BASE_URL0_V2+"/changefeeds/changefeed-test2"
-    data = json.dumps({"mounter_worker_num": 32})
+    url = BASE_URL0_V2+"/changefeeds/changefeed-test2?keyspace=keyspace1"
+    data = json.dumps({
+        "replica_config": {
+            "mounter": {
+                "worker_num": 32
+            }
+        }
+    })
     headers = {"Content-Type": "application/json"}
     resp = rq.put(url, data=data, headers=headers)
     assert_status_code(resp, rq.codes.ok, url)
 
     # update fail
     # can't update start_ts
-    url = BASE_URL0_V2+"/changefeeds/changefeed-test2"
+    url = BASE_URL0_V2+"/changefeeds/changefeed-test2?keyspace=keyspace1"
     data = json.dumps({"start_ts": 1})
     headers = {"Content-Type": "application/json"}
     resp = rq.put(url, data=data, headers=headers)
     assert_status_code(resp, rq.codes.bad_request, url)
 
+    # can't update dispatchers
+    url = BASE_URL0_V2+"/changefeeds/changefeed-test2?keyspace=keyspace1"
+    data = json.dumps({
+        "sink_uri": "kafka://127.0.0.1:9092/http_api?protocol=simple",
+        "replica_config": {
+            "sink": {
+                "dispatchers": [
+                    {
+                        "matcher": ["*.*"],
+                        "partition": "columns",
+                        "columns": ["a.b"]
+                    }
+                ]
+            }
+        }
+    })
+    headers = {"Content-Type": "application/json"}
+    resp = rq.put(url, data=data, headers=headers)
+    assert "ErrDispatcherFailed" in resp.text, f"{resp.text}"
+
+    print("pass test: update changefeed")
 
 
 def resume_changefeed():
     # resume changefeed
-    url = BASE_URL1_V2+"/changefeeds/changefeed-test2/resume"
-    resp = rq.post(url)
+    url = BASE_URL1_V2+"/changefeeds/changefeed-test2/resume?keyspace=keyspace1"
+    data = json.dumps({})
+    headers = {"Content-Type": "application/json"}
+    resp = rq.post(url, data=data, headers=headers)
     assert_status_code(resp, rq.codes.ok, url)
 
     # check if resume changefeed success
-    url = BASE_URL1_V2+"/changefeeds/changefeed-test2"
+    url = BASE_URL1_V2+"/changefeeds/changefeed-test2?keyspace=keyspace1"
     for i in range(RETRY_TIME):
         resp = rq.get(url)
         assert_status_code(resp, rq.codes.ok, url)
@@ -239,42 +341,40 @@ def resume_changefeed():
     assert data["state"] == "normal"
 
     # test resume changefeed failed
-    url = BASE_URL0_V2+"/changefeeds/changefeed-not-exists/resume"
+    url = BASE_URL0_V2+"/changefeeds/changefeed-not-exists/resume?keyspace=keyspace1"
     resp = rq.post(url)
     assert_status_code(resp, rq.codes.bad_request, url)
     data = resp.json()
     assert data["error_code"] == "CDC:ErrChangeFeedNotExists"
 
 
-
-def remove_changefeed(cfID = "changefeed-test3"):
+def remove_changefeed(cfID="changefeed-test3"):
     # remove changefeed
-    url = BASE_URL0_V2+"/changefeeds/" + cfID
+    url = BASE_URL0_V2+"/changefeeds/" + cfID + "?keyspace=keyspace1"
     resp = rq.delete(url)
     assert_status_code(resp, rq.codes.ok, url)
 
-
     # test remove non-exists changefeed, it should return 200 and do nothing
-    url = BASE_URL0_V2+"/changefeeds/changefeed-not-exists"
+    url = BASE_URL0_V2+"/changefeeds/changefeed-not-exists?keyspace=keyspace1"
     resp = rq.delete(url)
     assert_status_code(resp, rq.codes.ok, url)
 
 
 # FIXME: Enable this test case after we fully support move table API
-def move_table(cfID = "changefeed-test1"):
-    return 
+def move_table(cfID="changefeed-test1"):
+    return
     # sleep 5 seconds to make sure all tables is scheduled
     time.sleep(5)
-    
+
     # find the node id
     url = BASE_URL0_V2 + "/captures"
     resp = requests_get_with_retry(url)
     data = resp.json()
     capture_id = data["items"][0]["id"]
     logging.info(f"Find target capture_id: {capture_id}")
-    
+
     # find the table id
-    url = BASE_URL0_V2 + "/changefeeds/" + cfID + "/tables"
+    url = BASE_URL0_V2 + "/changefeeds/" + cfID + "/tables?keyspace=keyspace1"
     resp = requests_get_with_retry(url)
     data = resp.json()
     table_ids = data[0]["table_ids"]
@@ -283,28 +383,29 @@ def move_table(cfID = "changefeed-test1"):
         if id > 0:
             table_id = id
             break
-    
-    
+
     logging.info(f"Find target table_id: {table_id}")
 
     # move table
-    url = BASE_URL0_V2 + "/changefeeds/" + cfID + "/move_table?targetNodeID=" + capture_id + "&tableID=" + str(table_id)
+    url = BASE_URL0_V2 + "/changefeeds/" + cfID + \
+        "/move_table?targetNodeID=" + capture_id + \
+        "&tableID=" + str(table_id) + "&keyspace=keyspace1"
     resp = rq.post(url)
     assert_status_code(resp, rq.codes.ok, url)
     logging.info(f"Move table success")
     # move table fail
     # The target node is not found
-    url = BASE_URL0_V2 + "/changefeeds/" + cfID + "/move_table?targetNodeID=&tableID=" + str(table_id)
+    url = BASE_URL0_V2 + "/changefeeds/" + cfID + \
+        "/move_table?targetNodeID=&tableID=" + \
+        str(table_id) + "&keyspace=keyspace1"
     resp = rq.post(url)
     assert_status_code(resp, rq.codes.internal_server_error, url)
-
 
 
 def resign_owner():
     url = BASE_URL1_V2 + "/owner/resign"
     resp = rq.post(url)
     assert_status_code(resp, rq.codes.ok, url)
-
 
 
 def list_capture():
@@ -324,7 +425,6 @@ def get_status():
     resp = requests_get_with_retry(url)
     assert_status_code(resp, rq.codes.ok, url)
     assert resp.json()["is_owner"]
-
 
 
 def set_log_level():
@@ -366,6 +466,7 @@ def get_tso():
 def compose_tso(ps, ls):
     return (ps << physicalShiftBits) + ls
 
+
 # arg1: test case name
 # arg2: certificates dir
 # arg3: sink uri
@@ -394,7 +495,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         logging.error("Please provide a test case name")
         sys.exit(1)
-    
+
     # get the test case name
     test_case_name = sys.argv[1]
     arg = sys.argv[2:]
@@ -402,12 +503,10 @@ if __name__ == "__main__":
     if test_case_name not in FUNC_MAP:
         logging.error(f"Test case {test_case_name} not found")
         sys.exit(1)
-    
+
     # get the test case function
     test_case_func = FUNC_MAP[test_case_name]
     # run the test case
     logging.info(f"Start to run test case: {test_case_name}")
     test_case_func(*arg)
     logging.info(f"Test case {test_case_name} finished")
-
-

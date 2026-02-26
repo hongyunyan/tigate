@@ -18,11 +18,10 @@ import (
 	"strings"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/common"
+	"github.com/pingcap/ticdc/pkg/util"
 	"github.com/pingcap/tidb/pkg/sessionctx"
-	"github.com/pingcap/tiflow/dm/pkg/log"
-	"github.com/pingcap/tiflow/dm/pkg/utils"
-	"github.com/pingcap/tiflow/pkg/quotes"
 	"go.uber.org/zap"
 )
 
@@ -136,7 +135,7 @@ func NewRowChange(
 	if tiCtx != nil {
 		ret.tiSessionCtx = tiCtx
 	} else {
-		ret.tiSessionCtx = utils.ZeroSessionCtx
+		ret.tiSessionCtx = util.ZeroSessionCtx
 	}
 
 	ret.calculateType()
@@ -231,8 +230,12 @@ func (r *RowChange) whereColumnsAndValues() ([]string, []interface{}) {
 	}
 
 	columnNames := make([]string, 0, len(columns))
-	for _, column := range columns {
-		columnNames = append(columnNames, column.Name.O)
+	columnValues := make([]any, 0, len(columns))
+	for i, column := range columns {
+		if !column.IsVirtualGenerated() {
+			columnNames = append(columnNames, column.Name.O)
+			columnValues = append(columnValues, values[i])
+		}
 	}
 
 	failpoint.Inject("DownstreamTrackerWhereCheck", func() {
@@ -244,8 +247,11 @@ func (r *RowChange) whereColumnsAndValues() ([]string, []interface{}) {
 				zap.String("Columns", fmt.Sprintf("%v", columnNames)))
 		}
 	})
-
-	return columnNames, values
+	if len(columnNames) != len(columnValues) {
+		log.Panic("columnNames are not equal columnValues", zap.Int("len(columnNames)", len(columnNames)), zap.Int("len(values)", len(columnValues)),
+			zap.Any("columnNames", columnNames), zap.Any("columnValues", columnValues), zap.Any("table", r.targetTable))
+	}
+	return columnNames, columnValues
 }
 
 // genWhere generates WHERE clause for UPDATE and DELETE to identify the row.
@@ -257,7 +263,7 @@ func (r *RowChange) genWhere(buf *strings.Builder) []interface{} {
 		if i != 0 {
 			buf.WriteString(" AND ")
 		}
-		buf.WriteString(quotes.QuoteName(col))
+		buf.WriteString(common.QuoteName(col))
 		if whereValues[i] == nil {
 			buf.WriteString(" IS ?")
 		} else {
@@ -313,7 +319,7 @@ func (r *RowChange) genUpdateSQL() (string, []interface{}) {
 			buf.WriteString(", ")
 		}
 		writtenFirstCol = true
-		fmt.Fprintf(&buf, "%s = ?", quotes.QuoteName(col.Name.O))
+		fmt.Fprintf(&buf, "%s = ?", common.QuoteName(col.Name.O))
 		args = append(args, r.postValues[i])
 	}
 

@@ -11,7 +11,6 @@ SINK_TYPE=$1
 function run() {
 	rm -rf $WORK_DIR && mkdir -p $WORK_DIR
 	start_tidb_cluster --workdir $WORK_DIR
-	cd $WORK_DIR
 
 	export GO_FAILPOINTS=''
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --addr "127.0.0.1:8300" --pd "http://${UP_PD_HOST_1}:${UP_PD_PORT_1}"
@@ -28,7 +27,7 @@ function run() {
 	esac
 
 	# create changefeed
-	run_cdc_cli changefeed create --sink-uri="$SINK_URI" --server="127.0.0.1:8300" --config=$CUR/conf/cf.toml
+	cdc_cli_changefeed create --sink-uri="$SINK_URI" --server="127.0.0.1:8300" --config=$CUR/conf/cf.toml
 
 	case $SINK_TYPE in
 	kafka) run_kafka_consumer $WORK_DIR "kafka://127.0.0.1:9092/$TOPIC_NAME?protocol=open-protocol&partition-num=4&version=${KAFKA_VERSION}&max-message-bytes=10485760" ;;
@@ -44,6 +43,12 @@ function run() {
 	check_table_exists "event_filter.t_normal" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 	check_table_exists "event_filter.t_truncate" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 	check_table_exists "event_filter.t_alter" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_table_exists "event_filter.t_name" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_table_exists "event_filter.t_name1" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_table_exists "event_filter.t_name2" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_table_exists "event_filter.t_name3" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_table_exists "event_filter.t_virtual" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	sleep 20
 
 	# check those rows that are not filtered are synced to downstream
 	run_sql "select count(1) from event_filter.t1;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
@@ -57,20 +62,80 @@ function run() {
 	run_sql "select count(5) from event_filter.t1 where id=4;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 	check_contains "count(5): 1"
 
+	# Add these checks after the existing checks for t_virtual
+	# check virtual column table filtering with virtual column condition
+	run_sql "select count(1) from event_filter.t_virtual;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_contains "count(1): 3" # Only 3 rows should pass the filter
+
+	run_sql "select count(1) from event_filter.t_virtual where id=1;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_contains "count(1): 1"
+
+	run_sql "select count(1) from event_filter.t_virtual where id=2;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_contains "count(1): 0" # filtered by id=2
+
+	run_sql "select count(1) from event_filter.t_virtual where id=3;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_contains "count(1): 0" # filtered by category and is_discounted
+
+	run_sql "select count(1) from event_filter.t_virtual where id=4;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_contains "count(1): 1"
+
+	run_sql "select count(1) from event_filter.t_virtual where id=5;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_contains "count(1): 0" # filtered by is_discounted
+
+	run_sql "select count(1) from event_filter.t_virtual where id=6;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_contains "count(1): 0" # filtered by is_discounted
+
+	run_sql "select count(1) from event_filter.t_virtual where id=7;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_contains "count(1): 1"
+
+	# Verify that rows with is_discounted=true are filtered
+	run_sql "select count(1) from event_filter.t_virtual where quantity > 10;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_contains "count(1): 0" # All discounted items should be filtered
+
 	run_sql "TRUNCATE TABLE event_filter.t_truncate;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 	run_sql_file $CUR/data/test_truncate.sql ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 	run_sql "ALTER TABLE event_filter.t_alter MODIFY t_bigint BIGINT;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 	run_sql_file $CUR/data/test_alter.sql ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+	run_sql "RENAME TABLE event_filter.t_name TO event_filter.t_rename;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	run_sql "RENAME TABLE event_filter.t_name1 TO event_filter.t_rename1;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	run_sql "RENAME TABLE event_filter.t_name2 TO event_filter.t_rename2;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	run_sql "RENAME TABLE event_filter.t_name3 TO event_filter.t_rename3;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	run_sql "RENAME TABLE event_filter.t_rename4 TO event_filter.t_rename5;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_table_exists "event_filter.t_rename" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_table_exists "event_filter.t_rename1" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_table_exists "event_filter.t_rename2" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_table_exists "event_filter.t_rename3" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_table_exists "event_filter.t_rename5" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	run_sql_file $CUR/data/test_rename.sql ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+	run_sql_file $CUR/data/test_create.sql ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+	run_sql "CREATE TABLE event_filter.t_create (id INT PRIMARY KEY, val INT);" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_table_exists "event_filter.t_create" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 	run_sql "create table event_filter.finish_mark(id int primary key);" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 	check_table_exists "event_filter.finish_mark" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 
 	# check table t_normal is replicated
+	sleep 10
 	check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml
+
+	run_sql "create database foo;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+	check_db_exists "foo" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+	sleep 10
+	check_db_not_exists "foo" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+
+	# only capture table filter.t1, so filter.t2 should not be replicated
+	run_sql "create database if not exists filter;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+	run_sql "create database if not exists filter;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	run_sql "create table filter.t1 (id int primary key);" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+	check_table_exists "filter.t1" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	run_sql "create table filter.t2 (id int primary key);" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+	check_table_exists "filter.t2" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+	sleep 10
+	check_table_not_exists "filter.t2" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 
 	cleanup_process $CDC_BINARY
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 run $*
 check_logs $WORK_DIR
 echo "[$(date)] <<<<<< run test case $TEST_NAME success! >>>>>>"

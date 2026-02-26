@@ -9,6 +9,11 @@ CDC_BINARY=cdc.test
 SINK_TYPE=$1
 
 function run() {
+	# TODO tenfyzhong 2025-10-27 15:36:10 need to support next-gen
+	if [ "$NEXT_GEN" = 1 ]; then
+		exit 0
+	fi
+
 	# TODO(dongmen): enable pulsar in the future.
 	if [ "$SINK_TYPE" == "pulsar" ]; then
 		exit 0
@@ -16,8 +21,6 @@ function run() {
 	rm -rf $WORK_DIR && mkdir -p $WORK_DIR
 
 	start_tidb_cluster --workdir $WORK_DIR --tikv-config $CUR/conf/tikv_config.toml
-
-	cd $WORK_DIR
 
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY
 
@@ -31,7 +34,7 @@ function run() {
 		;;
 	*) SINK_URI="mysql://normal:123456@127.0.0.1:3306/" ;;
 	esac
-	run_cdc_cli changefeed create --sink-uri="$SINK_URI"
+	cdc_cli_changefeed create --sink-uri="$SINK_URI"
 	case $SINK_TYPE in
 	kafka) run_kafka_consumer $WORK_DIR "kafka://127.0.0.1:9092/$TOPIC_NAME?protocol=open-protocol&partition-num=4&version=${KAFKA_VERSION}&max-message-bytes=10485760" ;;
 	storage) run_storage_consumer $WORK_DIR $SINK_URI "" "" ;;
@@ -50,13 +53,13 @@ function run() {
 	run_sql "drop table multi_rocks.a4;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 	run_sql "drop table multi_rocks.a5;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 	run_sql "create table multi_rocks.finish_mark (id int primary key); " ${UP_TIDB_HOST} ${UP_TIDB_PORT}
-	check_table_exists multi_rocks.finish_mark ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	check_table_exists multi_rocks.finish_mark ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} 200
 	check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml
 
 	cleanup_process $CDC_BINARY
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 run $*
 check_logs $WORK_DIR
 echo "[$(date)] <<<<<< run test case $TEST_NAME success! >>>>>>"

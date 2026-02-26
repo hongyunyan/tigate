@@ -26,12 +26,10 @@ function run() {
 
 	start_tidb_cluster --workdir $WORK_DIR --multiple-upstream-pd true
 
-	cd $WORK_DIR
-
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix 1
 	# wait for cdc run
-	ensure $MAX_RETRIES "$CDC_BINARY cli capture list 2>&1 | grep '\"is_owner\": true'"
-	owner_pid=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	ensure $MAX_RETRIES "$CDC_BINARY cli capture list 2>&1 | grep '\"is-owner\": true'"
+	owner_pid=$(get_cdc_pid "$CDC_HOST" "$CDC_PORT")
 	owner_id=$($CDC_BINARY cli capture list 2>&1 | awk -F '"' '/id/{print $4}')
 	echo "owner pid:" $owner_pid
 	echo "owner id" $owner_id
@@ -45,6 +43,8 @@ function run() {
 	python3 $CUR/util/test_case.py get_status
 
 	SINK_URI="mysql://normal:123456@127.0.0.1:3306/"
+	run_sql "CREATE table test.t1(id int primary key, val int);"
+	sleep 3
 	python3 $CUR/util/test_case.py create_changefeed "$SINK_URI"
 
 	run_sql "CREATE table test.simple(id int primary key, val int);"
@@ -72,7 +72,7 @@ function run() {
 	# kill the cdc owner server
 	kill_cdc_pid $owner_pid
 	# check that the new owner is elected
-	ensure $MAX_RETRIES "$CDC_BINARY cli capture list --server http://127.0.0.1:8301 2>&1 |grep $capture_id -A1 | grep '\"is_owner\": true'"
+	ensure $MAX_RETRIES "$CDC_BINARY cli capture list --server http://127.0.0.1:8301 2>&1 |grep $capture_id -A1 | grep '\"is-owner\": true'"
 	# restart the old owner capture
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY
 	ensure $MAX_RETRIES "$CDC_BINARY cli capture list 2>&1 | grep '\"address\": \"127.0.0.1:8300\"'"
@@ -97,7 +97,7 @@ function run() {
 	cleanup_process $CDC_BINARY
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 run $*
 check_logs $WORK_DIR
 echo "[$(date)] <<<<<< run test case $TEST_NAME success! >>>>>>"

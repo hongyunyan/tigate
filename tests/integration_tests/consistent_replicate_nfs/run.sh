@@ -11,7 +11,7 @@ SINK_TYPE=$1
 stop() {
 	# to distinguish whether the test failed in the DML synchronization phase or the DDL synchronization phase
 	echo $(mysql -h${DOWN_TIDB_HOST} -P${DOWN_TIDB_PORT} -uroot -e "select count(*) from consistent_replicate_nfs.usertable;")
-	stop_tidb_cluster
+	stop_test $WORK_DIR
 }
 
 function run() {
@@ -24,12 +24,10 @@ function run() {
 
 	start_tidb_cluster --workdir $WORK_DIR
 
-	cd $WORK_DIR
-
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY
 
 	SINK_URI="mysql://normal:123456@127.0.0.1:3306/"
-	changefeed_id=$(cdc cli changefeed create --sink-uri="$SINK_URI" --config="$CUR/conf/changefeed.toml" 2>&1 | tail -n2 | head -n1 | awk '{print $2}')
+	changefeed_id=$(cdc_cli_changefeed create --sink-uri="$SINK_URI" --config="$CUR/conf/changefeed.toml" | grep '^ID:' | head -n1 | awk '{print $2}')
 
 	run_sql "CREATE DATABASE consistent_replicate_nfs;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 	go-ycsb load mysql -P $CUR/conf/workload -p mysql.host=${UP_TIDB_HOST} -p mysql.port=${UP_TIDB_PORT} -p mysql.user=root -p mysql.db=consistent_replicate_nfs
@@ -37,7 +35,7 @@ function run() {
 
 	cleanup_process $CDC_BINARY
 	# to ensure row changed events have been replicated to TiCDC
-	sleep 10
+	sleep 60
 
 	storage_path="nfs://$WORK_DIR/nfs/redo"
 	tmp_download_path=$WORK_DIR/cdc_data/redo/$changefeed_id
@@ -46,8 +44,8 @@ function run() {
 	sed "s/<placeholder>/$rts/g" $CUR/conf/diff_config.toml >$WORK_DIR/diff_config.toml
 
 	cat $WORK_DIR/diff_config.toml
-	cdc redo apply --tmp-dir="$tmp_download_path/apply" --storage="$storage_path" --sink-uri="mysql://normal:123456@127.0.0.1:3306/"
-	check_sync_diff $WORK_DIR $WORK_DIR/diff_config.toml
+	cdc redo apply --log-level debug --tmp-dir="$tmp_download_path/apply" --storage="$storage_path" --sink-uri="mysql://normal:123456@127.0.0.1:3306/" >$WORK_DIR/cdc_redo.log
+	check_sync_diff $WORK_DIR $WORK_DIR/diff_config.toml 100
 }
 
 trap stop EXIT

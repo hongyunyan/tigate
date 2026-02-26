@@ -16,17 +16,9 @@ package eventservice
 import (
 	"testing"
 
-	"github.com/pingcap/tiflow/pkg/leakutil"
-	"go.uber.org/goleak"
+	"github.com/pingcap/ticdc/pkg/leakutil"
 )
 
 func TestMain(m *testing.M) {
-	opts := []goleak.Option{
-		goleak.IgnoreTopFunction("github.com/pingcap/tiflow/pkg/workerpool.(*worker).run"),
-		goleak.IgnoreTopFunction("sync.runtime_Semacquire"),
-		goleak.IgnoreAnyFunction("github.com/godbus/dbus.(*Conn).Auth"),
-		goleak.IgnoreCurrent(),
-	}
-
-	leakutil.SetUpLeakTest(m, opts...)
+	leakutil.SetUpLeakTest(m)
 }

@@ -18,8 +18,6 @@ function run() {
 
 	start_tidb_cluster --workdir $WORK_DIR
 
-	cd $WORK_DIR
-
 	# cdc server 1
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY
 	# cdc server 2
@@ -30,9 +28,9 @@ function run() {
 	SINK_URI_2="mysql://root@127.0.0.1:4000"
 
 	# up -> down
-	run_cdc_cli changefeed create --sink-uri="$SINK_URI_1" -c "test-1" --config="$CUR/conf/up.toml"
+	cdc_cli_changefeed create --sink-uri="$SINK_URI_1" -c "test-1" --config="$CUR/conf/up.toml"
 	# down -> up
-	run_cdc_cli changefeed create --sink-uri="$SINK_URI_2" -c "test-2" --server "http://127.0.0.1:8400" --config="$CUR/conf/down.toml"
+	cdc_cli_changefeed create --sink-uri="$SINK_URI_2" -c "test-2" --server "http://127.0.0.1:8400" --config="$CUR/conf/down.toml"
 
 	run_sql_file $CUR/data/up.sql ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 	run_sql_file $CUR/data/down.sql ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
@@ -51,7 +49,7 @@ function run() {
 	cleanup_process $CDC_BINARY
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 run $*
 check_logs $WORK_DIR
 echo "[$(date)] <<<<<< run test case $TEST_NAME success! >>>>>>"

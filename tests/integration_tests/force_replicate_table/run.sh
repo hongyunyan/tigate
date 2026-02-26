@@ -15,8 +15,8 @@ function check_data_subset() {
 	down_host=$4
 	down_port=$5
 	for i in $(seq 0 100); do
-		stmt="select * from $tbl order by id limit $i,1\G"
-		query=$(mysql -h${up_host} -P${up_port} -uroot -e "${stmt}")
+		stmt="select * from $tbl order by id limit $i,1"
+		query=$(mysql -h${up_host} -P${up_port} -uroot -E -e "${stmt}")
 		clean_query="${query//\*/}"
 		if [ -n "$clean_query" ]; then
 			data_id=$(echo $clean_query | awk '{print $(NF-2)}')
@@ -50,8 +50,6 @@ function run() {
 
 	start_tidb_cluster --workdir $WORK_DIR --tidb-config $CUR/conf/tidb_config.toml
 
-	cd $WORK_DIR
-
 	# record tso before we create tables to skip the system table DDLs
 	start_ts=$(run_cdc_cli_tso_query $UP_PD_HOST_1 $UP_PD_PORT_1)
 
@@ -68,7 +66,7 @@ function run() {
 	*) SINK_URI="mysql://normal:123456@127.0.0.1:3306/?safe-mode=true" ;;
 	esac
 
-	cdc cli changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI" --config $CUR/conf/changefeed.toml
+	cdc_cli_changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI" --config $CUR/conf/changefeed.toml
 
 	case $SINK_TYPE in
 	kafka) run_kafka_consumer $WORK_DIR $SINK_URI $CUR/conf/changefeed.toml ;;
@@ -90,7 +88,7 @@ function run() {
 	cleanup_process $CDC_BINARY
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 run $*
 check_logs $WORK_DIR
 echo "[$(date)] <<<<<< run test case $TEST_NAME success! >>>>>>"

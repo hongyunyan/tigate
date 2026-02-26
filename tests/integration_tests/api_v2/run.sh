@@ -13,18 +13,17 @@ function prepare() {
 
 	start_tidb_cluster --workdir $WORK_DIR
 
-	cd $WORK_DIR
-
 	# create table to upstream.
 	run_sql "CREATE DATABASE api_v2" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 	run_sql "CREATE DATABASE api_v2" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+	run_sql "CREATE table test.t1(id int primary key, val int);" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY
-	cdc cli changefeed create -c="cf-blackhole" --sink-uri="blackhole://"
+	cdc_cli_changefeed create -c="cf-blackhole" --sink-uri="blackhole://"
 	check_changefeed_state "http://${UP_PD_HOST_1}:${UP_PD_PORT_1}" "cf-blackhole" "normal" "null" ""
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 # kafka and storage is not supported yet.
 if [ "$SINK_TYPE" == "mysql" ]; then
 	prepare $*

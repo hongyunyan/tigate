@@ -78,7 +78,7 @@ var (
 			Buckets:   prometheus.ExponentialBuckets(1, 2, 20),
 		},
 		// actions: wait, run.
-		[]string{"namespace", "changefeed"})
+		[]string{getKeyspaceLabel(), "changefeed"})
 
 	RegionWorkerProcessDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -103,7 +103,7 @@ func GetGlobalGrpcMetrics() *grpc_prometheus.ClientMetrics {
 	return grpcMetrics
 }
 
-func InitPullerMetrics(registry *prometheus.Registry) {
+func initPullerMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(grpcMetrics)
 	registry.MustRegister(RegionWorkerProcessDuration)
 	registry.MustRegister(RegionWorkerTotalDuration)

@@ -17,10 +17,9 @@ import (
 	"context"
 
 	"github.com/pingcap/ticdc/maintainer"
+	"github.com/pingcap/ticdc/pkg/api"
 	"github.com/pingcap/ticdc/pkg/etcd"
 	"github.com/pingcap/ticdc/pkg/node"
-	"github.com/pingcap/tidb/pkg/kv"
-	"github.com/pingcap/tiflow/cdc/model"
 	pd "github.com/tikv/pd/client"
 )
 
@@ -31,17 +30,16 @@ type Server interface {
 	Close(ctx context.Context)
 
 	SelfInfo() (*node.Info, error)
-	Liveness() model.Liveness
+	Liveness() api.Liveness
 
 	GetCoordinator() (Coordinator, error)
 	IsCoordinator() bool
 
-	// GetCoordinatorInfo returns the coordinator server， it will be used when forward api request
+	// GetCoordinatorInfo returns the coordinator server, it will be used when forward api request
 	GetCoordinatorInfo(ctx context.Context) (*node.Info, error)
 
 	GetPdClient() pd.Client
 	GetEtcdClient() etcd.CDCEtcdClient
-	GetKVStorage() kv.Storage
 
 	GetMaintainerManager() *maintainer.Manager
 }

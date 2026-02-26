@@ -77,7 +77,7 @@ func (e *Encoder) AppendRowChangedEvent(ctx context.Context, _ string, event *co
 			zap.Int("maxMessageBytes", e.config.MaxMessageBytes),
 			zap.Int("length", length),
 			zap.Any("table", event.TableInfo.TableName))
-		return errors.ErrMessageTooLarge.GenWithStackByArgs()
+		return errors.ErrMessageTooLarge.GenWithStackByArgs(event.TableInfo.GetTableName(), length, e.config.MaxMessageBytes)
 	}
 
 	var claimCheckLocation string
@@ -113,7 +113,7 @@ func (e *Encoder) AppendRowChangedEvent(ctx context.Context, _ string, event *co
 		zap.Int("maxMessageBytes", e.config.MaxMessageBytes),
 		zap.Int("length", result.Length()),
 		zap.Any("table", event.TableInfo.TableName))
-	return errors.ErrMessageTooLarge.GenWithStackByArgs()
+	return errors.ErrMessageTooLarge.GenWithStackByArgs(event.TableInfo.GetTableName(), result.Length(), e.config.MaxMessageBytes)
 }
 
 // Build implement the RowEventEncoder interface
@@ -140,27 +140,26 @@ func (e *Encoder) EncodeCheckpointEvent(ts uint64) (*common.Message, error) {
 
 // EncodeDDLEvent implement the DDLEventBatchEncoder interface
 func (e *Encoder) EncodeDDLEvent(event *commonEvent.DDLEvent) (*common.Message, error) {
-	// value, err := e.marshaller.MarshalDDLEvent(event)
-	// if err != nil {
-	// 	return nil, err
-	// }
+	value, err := e.marshaller.MarshalDDLEvent(event)
+	if err != nil {
+		return nil, err
+	}
 
-	// value, err = ticommon.Compress(e.config.ChangefeedID,
-	// 	e.config.LargeMessageHandle.LargeMessageHandleCompression, value)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// result := ticommon.NewDDLMsg(config.ProtocolSimple, nil, value, event)
+	value, err = common.Compress(e.config.ChangefeedID,
+		e.config.LargeMessageHandle.LargeMessageHandleCompression, value)
+	if err != nil {
+		return nil, err
+	}
+	result := common.NewMsg(nil, value)
 
-	// if result.Length() > e.config.MaxMessageBytes {
-	// 	log.Error("DDL message is too large for simple",
-	// 		zap.Int("maxMessageBytes", e.config.MaxMessageBytes),
-	// 		zap.Int("length", result.Length()),
-	// 		zap.Any("table", event.TableInfo.TableName))
-	// 	return nil, cerror.ErrMessageTooLarge.GenWithStackByArgs()
-	// }
-	// return result, nil
-	return nil, nil
+	if result.Length() > e.config.MaxMessageBytes {
+		log.Error("DDL message is too large for simple",
+			zap.Int("maxMessageBytes", e.config.MaxMessageBytes),
+			zap.Int("length", result.Length()),
+			zap.Any("table", event.TableInfo.TableName))
+		return nil, errors.ErrMessageTooLarge.GenWithStackByArgs(event.TableInfo.GetTableName(), result.Length(), e.config.MaxMessageBytes)
+	}
+	return result, nil
 }
 
 // CleanMetrics implement the RowEventEncoderBuilder interface

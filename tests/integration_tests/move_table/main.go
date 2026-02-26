@@ -31,9 +31,10 @@ import (
 	"github.com/pingcap/log"
 	v2 "github.com/pingcap/ticdc/api/v2"
 	clientv2 "github.com/pingcap/ticdc/pkg/api/v2"
+	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/errors"
-	"github.com/pingcap/tiflow/pkg/httputil"
-	"github.com/pingcap/tiflow/pkg/security"
+	"github.com/pingcap/ticdc/pkg/httputil"
+	"github.com/pingcap/ticdc/pkg/security"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -60,7 +61,7 @@ func main() {
 
 	sourceNode, targetNode := getSourceAndTargetNode(cluster)
 
-	err = cluster.moveAllTables(sourceNode, targetNode)
+	err = cluster.moveAllTables(sourceNode, targetNode, common.DefaultMode)
 	if err != nil {
 		log.Fatal("failed to move tables", zap.Error(err))
 	}
@@ -71,8 +72,8 @@ func main() {
 }
 
 type tableInfo struct {
-	changefeedNameSpace string
-	changefeedName      string
+	changefeedKeySpace string
+	changefeedName     string
 
 	// table id
 	id int64
@@ -129,9 +130,9 @@ func newCluster() (*cluster, error) {
 		for _, nodeTableInfo := range nodeTableInfos {
 			for _, tableID := range nodeTableInfo.TableIDs {
 				serversMap[nodeTableInfo.NodeID] = append(serversMap[nodeTableInfo.NodeID], tableInfo{
-					changefeedNameSpace: changefeed.Namespace,
-					changefeedName:      changefeed.ID,
-					id:                  tableID,
+					changefeedKeySpace: changefeed.Keyspace,
+					changefeedName:     changefeed.ID,
+					id:                 tableID,
 				})
 			}
 		}
@@ -149,14 +150,17 @@ func newCluster() (*cluster, error) {
 }
 
 // moveAllTables moves all tables from source node to target node
-func (c *cluster) moveAllTables(sourceNode, targetNode string) error {
+func (c *cluster) moveAllTables(sourceNode, targetNode string, mode int64) error {
 	for _, table := range c.servers[sourceNode] {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+		if table.id == 0 {
+			// table trigger dispatcher is not support to move, except the maintainer is crashed
+			continue
+		}
+		ctx := context.Background()
 		err := c.
 			client.
 			Changefeeds().
-			MoveTable(ctx, table.changefeedNameSpace, table.changefeedName, table.id, targetNode)
+			MoveTable(ctx, table.changefeedKeySpace, table.changefeedName, table.id, targetNode, mode, true)
 
 		log.Info("move table",
 			zap.String("sourceNode", sourceNode),
@@ -231,6 +235,10 @@ func (c *cluster) checkSourceEmpty(sourceNode string) {
 		case <-ticker.C:
 			sourceTables := clusterForCheck.servers[sourceNode]
 			if len(sourceTables) != 0 {
+				if len(sourceTables) == 1 && sourceTables[0].id == 0 {
+					log.Info("source capture is empty, done")
+					return
+				}
 				log.Info("source capture is not empty, retrying", zap.Any("sourceTables", sourceTables))
 			} else {
 				log.Info("source capture is empty, done")

@@ -87,11 +87,15 @@ func (m mockOperator) AffectedNodes() []node.ID {
 }
 
 func (m mockOperator) OnTaskRemoved() {
-	// 测试用空实现
+	// Empty implementation for testing
 }
 
 func (m mockOperator) String() string {
 	return m.id.String()
+}
+
+func (m mockOperator) BlockTsForward() bool {
+	return false
 }
 
 func TestOperatorQueue(t *testing.T) {
@@ -99,7 +103,7 @@ func TestOperatorQueue(t *testing.T) {
 
 	// Create test operators with different execution times
 	now := time.Now()
-	op1 := NewOperatorWithTime[mockReplicationID, mockReplicationStatus](
+	op1 := NewOperatorWithTime(
 		mockOperator{
 			id:       mockReplicationID{"op1"},
 			status:   mockReplicationStatus{"status1"},

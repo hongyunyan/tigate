@@ -14,6 +14,7 @@ set -eu
 CUR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source $CUR/../_utils/test_prepare
 WORK_DIR=$OUT_DIR/$TEST_NAME
+LOG_FILE="$WORK_DIR/sql_res.$TEST_NAME.log"
 CDC_BINARY=cdc.test
 SINK_TYPE=$1
 
@@ -118,8 +119,8 @@ function checkValidSyncPointTs() {
 }
 
 function checkDiff() {
-	primaryArr=($(grep primary_ts $OUT_DIR/sql_res.$TEST_NAME.txt | awk -F ": " '{print $2}'))
-	secondaryArr=($(grep secondary_ts $OUT_DIR/sql_res.$TEST_NAME.txt | awk -F ": " '{print $2}'))
+	primaryArr=($(grep primary_ts $LOG_FILE | awk -F ": " '{print $2}'))
+	secondaryArr=($(grep secondary_ts $LOG_FILE | awk -F ": " '{print $2}'))
 	tsos=($(curl -s http://$UP_TIDB_HOST:$UP_TIDB_STATUS/ddl/history | grep -E "real_start_ts|FinishedTS" | grep -oE "[0-9]*"))
 	firstDDLTs=($(curl -s http://$UP_TIDB_HOST:$UP_TIDB_STATUS/ddl/history | grep -B 3 "CREATE table testSync" | grep "real_start_ts" | grep -oE "[0-9]*"))
 	num=${#primaryArr[*]}
@@ -135,15 +136,16 @@ function checkDiff() {
 				"is recorded in a DDL event(${check_in_ddl[0]}), skip the check of it"
 			continue
 		fi
+		echo "check syncpoint primary_ts: ${primaryArr[$i]}, secondary_ts: ${secondaryArr[$i]}"
 		deployConfig ${primaryArr[$i]} ${secondaryArr[$i]}
 		check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml
 	done
-	rm $CUR/conf/diff_config.toml
+	rm -f $CUR/conf/diff_config.toml
 }
 
 function run() {
 	if [ "$SINK_TYPE" != "mysql" ]; then
-		echo "kafka downstream isn't support syncpoint record"
+		echo "kafka downstream doesn't support syncpoint record"
 		return
 	fi
 
@@ -151,18 +153,18 @@ function run() {
 
 	start_tidb_cluster --workdir $WORK_DIR
 
-	cd $WORK_DIR
 	run_sql "SET GLOBAL tidb_enable_external_ts_read = on;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 	run_sql "CREATE DATABASE testSync;"
 	run_sql "CREATE DATABASE testSync;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 
+	export GO_FAILPOINTS='github.com/pingcap/ticdc/utils/dynstream/InjectDeadlock=10%return(true)'
 	start_ts=$(run_cdc_cli_tso_query ${UP_PD_HOST_1} ${UP_PD_PORT_1})
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY
 
 	# this test contains `set global tidb_external_ts = ?` , which requires super privilege, so we
 	# can't use the normal user
 	SINK_URI="mysql://root@127.0.0.1:3306/?max-txn-row=1"
-	run_cdc_cli changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/changefeed.toml"
+	cdc_cli_changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/changefeed.toml"
 
 	goSql
 
@@ -171,18 +173,18 @@ function run() {
 	check_table_exists "testSync.simple2" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 
 	run_sql "SET GLOBAL tidb_enable_external_ts_read = off;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
-	sleep 60
+	sleep 90
 
 	run_sql "SELECT primary_ts, secondary_ts FROM tidb_cdc.syncpoint_v1;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 	echo "____________________________________"
-	cat "$OUT_DIR/sql_res.$TEST_NAME.txt"
+	cat "$LOG_FILE"
 	checkDiff
 	check_sync_diff $WORK_DIR $CUR/conf/diff_config_final.toml
 
 	cleanup_process $CDC_BINARY
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 run $*
 check_logs $WORK_DIR
 echo "[$(date)] <<<<<< run test case $TEST_NAME success! >>>>>>"

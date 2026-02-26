@@ -14,30 +14,33 @@
 package schemastore
 
 import (
+	"context"
 	"math"
 	"sync"
 
-	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/logservice/logpuller"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/common/event"
-	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/utils/heap"
-	"github.com/pingcap/tidb/pkg/ddl"
 	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/meta"
+	"github.com/pingcap/tidb/pkg/meta/metadef"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"go.uber.org/zap"
 )
 
-var (
-	once         sync.Once
-	ddlTableInfo *event.DDLTableInfo
-)
+// ddl puller should never filter any DDL jobs even if
+// the changefeed is in BDR mode, because the DDL jobs should
+// be filtered before they are sent to the sink
+const ddlPullerFilterLoop = false
 
 type ddlJobFetcher struct {
+	ctx               context.Context
+	subClient         logpuller.SubscriptionClient
 	resolvedTsTracker struct {
 		sync.Mutex
 		resolvedTsItemMap map[logpuller.SubscriptionID]*resolvedTsItem
@@ -45,42 +48,58 @@ type ddlJobFetcher struct {
 	}
 
 	// cacheDDLEvent and advanceResolvedTs may be called concurrently
-	// the only gurantee is that when call advanceResolvedTs with ts, all ddl job with commit ts <= ts has been passed to cacheDDLEvent
+	// the only guarantee is that when call advanceResolvedTs with ts, all ddl job with commit ts <= ts has been passed to cacheDDLEvent
 	cacheDDLEvent     func(ddlEvent DDLJobWithCommitTs)
 	advanceResolvedTs func(resolvedTS uint64)
 
 	kvStorage kv.Storage
+
+	keyspaceID uint32
+
+	ddlTableInfo         *event.DDLTableInfo
+	onceInitDDLTableInfo sync.Once
 }
 
 func newDDLJobFetcher(
-	subClient *logpuller.SubscriptionClient,
+	ctx context.Context,
+	subClient logpuller.SubscriptionClient,
 	kvStorage kv.Storage,
-	startTs uint64,
+	keyspaceID uint32,
 	cacheDDLEvent func(ddlEvent DDLJobWithCommitTs),
 	advanceResolvedTs func(resolvedTS uint64),
 ) *ddlJobFetcher {
-	ddlJobFetcher := &ddlJobFetcher{
+	fetcher := &ddlJobFetcher{
+		ctx:               ctx,
+		subClient:         subClient,
 		cacheDDLEvent:     cacheDDLEvent,
 		advanceResolvedTs: advanceResolvedTs,
 		kvStorage:         kvStorage,
+		keyspaceID:        keyspaceID,
 	}
-	ddlJobFetcher.resolvedTsTracker.resolvedTsItemMap = make(map[logpuller.SubscriptionID]*resolvedTsItem)
-	ddlJobFetcher.resolvedTsTracker.resolvedTsHeap = heap.NewHeap[*resolvedTsItem]()
+	fetcher.resolvedTsTracker.resolvedTsItemMap = make(map[logpuller.SubscriptionID]*resolvedTsItem)
+	fetcher.resolvedTsTracker.resolvedTsHeap = heap.NewHeap[*resolvedTsItem]()
 
-	for _, span := range getAllDDLSpan() {
-		subID := subClient.AllocSubscriptionID()
+	return fetcher
+}
+
+func (p *ddlJobFetcher) run(startTs uint64) error {
+	spans, err := getAllDDLSpan(p.keyspaceID)
+	if err != nil {
+		return err
+	}
+	for _, span := range spans {
+		subID := p.subClient.AllocSubscriptionID()
 		item := &resolvedTsItem{
 			resolvedTs: 0,
 		}
-		ddlJobFetcher.resolvedTsTracker.resolvedTsItemMap[subID] = item
-		ddlJobFetcher.resolvedTsTracker.resolvedTsHeap.AddOrUpdate(item)
+		p.resolvedTsTracker.resolvedTsItemMap[subID] = item
+		p.resolvedTsTracker.resolvedTsHeap.AddOrUpdate(item)
 		advanceSubSpanResolvedTs := func(ts uint64) {
-			ddlJobFetcher.tryAdvanceResolvedTs(subID, ts)
+			p.tryAdvanceResolvedTs(subID, ts)
 		}
-		subClient.Subscribe(subID, span, startTs, ddlJobFetcher.input, advanceSubSpanResolvedTs, 0)
+		p.subClient.Subscribe(subID, span, startTs, p.input, advanceSubSpanResolvedTs, 0, ddlPullerFilterLoop)
 	}
-
-	return ddlJobFetcher
+	return nil
 }
 
 func (p *ddlJobFetcher) tryAdvanceResolvedTs(subID logpuller.SubscriptionID, newResolvedTs uint64) {
@@ -88,8 +107,8 @@ func (p *ddlJobFetcher) tryAdvanceResolvedTs(subID logpuller.SubscriptionID, new
 	defer p.resolvedTsTracker.Unlock()
 	item, ok := p.resolvedTsTracker.resolvedTsItemMap[subID]
 	if !ok {
-		log.Panic("unknown zubscriptionID, should not happen",
-			zap.Uint64("subID", uint64(subID)))
+		log.Panic("unknown subscriptionID, should not happen",
+			zap.Uint64("subscriptionID", uint64(subID)))
 	}
 	if newResolvedTs < item.resolvedTs {
 		log.Panic("resolved ts should not fallback",
@@ -103,16 +122,16 @@ func (p *ddlJobFetcher) tryAdvanceResolvedTs(subID logpuller.SubscriptionID, new
 	if !ok || minResolvedTsItem.resolvedTs == math.MaxUint64 {
 		log.Panic("should not happen")
 	}
-	// minResolvedTsItem may be 0, it it ok to send it because it will be filtered later.
+	// minResolvedTsItem may be 0, it's ok to send it because it will be filtered later.
 	// it is ok to send redundant resolved ts to advanceResolvedTs.
 	p.advanceResolvedTs(minResolvedTsItem.resolvedTs)
 }
 
 func (p *ddlJobFetcher) input(kvs []common.RawKVEntry, _ func()) bool {
-	for _, kv := range kvs {
-		job, err := p.unmarshalDDL(&kv)
+	for _, entry := range kvs {
+		job, err := p.unmarshalDDL(&entry)
 		if err != nil {
-			log.Fatal("unmarshal ddl failed", zap.Any("kv", kv), zap.Error(err))
+			log.Fatal("unmarshal ddl failed", zap.Any("entry", entry), zap.Error(err))
 		}
 
 		if job == nil {
@@ -122,38 +141,44 @@ func (p *ddlJobFetcher) input(kvs []common.RawKVEntry, _ func()) bool {
 		// cache ddl job in memory until the resolve ts pass its commit ts
 		p.cacheDDLEvent(DDLJobWithCommitTs{
 			Job:      job,
-			CommitTs: kv.CRTs,
+			CommitTs: entry.CRTs,
 		})
 	}
 	return false
 }
 
-// unmarshalDDL unmarshals a ddl job from a raw kv entry.
+// unmarshalDDL unmarshal a ddl job from a raw kv entry.
 func (p *ddlJobFetcher) unmarshalDDL(rawKV *common.RawKVEntry) (*model.Job, error) {
 	if rawKV.OpType != common.OpTypePut {
 		return nil, nil
 	}
 	if !event.IsLegacyFormatJob(rawKV) {
-		once.Do(func() {
-			if err := initDDLTableInfo(p.kvStorage); err != nil {
+		p.onceInitDDLTableInfo.Do(func() {
+			if err := p.initDDLTableInfo(p.ctx, p.kvStorage); err != nil {
 				log.Fatal("init ddl table info failed", zap.Error(err))
 			}
 		})
 	}
 
-	return event.ParseDDLJob(rawKV, ddlTableInfo)
+	return event.ParseDDLJob(rawKV, p.ddlTableInfo)
 }
 
-func initDDLTableInfo(kvStorage kv.Storage) error {
+// getSnapshotMeta returns tidb meta information
+func getSnapshotMeta(tiStore kv.Storage, ts uint64) meta.Reader {
+	snapshot := tiStore.GetSnapshot(kv.NewVersion(ts))
+	return meta.NewReader(snapshot)
+}
+
+func (p *ddlJobFetcher) initDDLTableInfo(ctx context.Context, kvStorage kv.Storage) error {
 	version, err := kvStorage.CurrentVersion(kv.GlobalTxnScope)
 	if err != nil {
 		return errors.Trace(err)
 	}
-	snap := logpuller.GetSnapshotMeta(kvStorage, version.Ver)
+	snap := getSnapshotMeta(kvStorage, version.Ver)
 
 	dbInfos, err := snap.ListDatabases()
 	if err != nil {
-		return cerror.WrapError(cerror.ErrMetaListDatabases, err)
+		return errors.WrapError(errors.ErrMetaListDatabases, err)
 	}
 
 	db, err := findDBByName(dbInfos, mysql.SystemDB)
@@ -161,7 +186,7 @@ func initDDLTableInfo(kvStorage kv.Storage) error {
 		return errors.Trace(err)
 	}
 
-	tbls, err := snap.ListTables(db.ID)
+	tbls, err := snap.ListTables(ctx, db.ID)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -177,9 +202,9 @@ func initDDLTableInfo(kvStorage kv.Storage) error {
 		return errors.Trace(err)
 	}
 
-	ddlTableInfo = &event.DDLTableInfo{}
-	ddlTableInfo.DDLJobTable = common.WrapTableInfo(db.ID, db.Name.L, tableInfo)
-	ddlTableInfo.JobMetaColumnIDinJobTable = col.ID
+	p.ddlTableInfo = &event.DDLTableInfo{}
+	p.ddlTableInfo.DDLJobTable = common.WrapTableInfo(db.Name.L, tableInfo)
+	p.ddlTableInfo.JobMetaColumnIDinJobTable = col.ID
 
 	// for tidb_ddl_history
 	historyTableInfo, err := findTableByName(tbls, "tidb_ddl_history")
@@ -192,8 +217,8 @@ func initDDLTableInfo(kvStorage kv.Storage) error {
 		return errors.Trace(err)
 	}
 
-	ddlTableInfo.DDLHistoryTable = common.WrapTableInfo(db.ID, db.Name.L, historyTableInfo)
-	ddlTableInfo.JobMetaColumnIDinHistoryTable = historyTableCol.ID
+	p.ddlTableInfo.DDLHistoryTable = common.WrapTableInfo(db.Name.L, historyTableInfo)
+	p.ddlTableInfo.JobMetaColumnIDinHistoryTable = historyTableCol.ID
 
 	return nil
 }
@@ -205,8 +230,8 @@ func findDBByName(dbs []*model.DBInfo, name string) (*model.DBInfo, error) {
 			return db, nil
 		}
 	}
-	return nil, cerror.WrapError(
-		cerror.ErrDDLSchemaNotFound,
+	return nil, errors.WrapError(
+		errors.ErrDDLSchemaNotFound,
 		errors.Errorf("can't find schema %s", name))
 }
 
@@ -216,8 +241,8 @@ func findTableByName(tbls []*model.TableInfo, name string) (*model.TableInfo, er
 			return t, nil
 		}
 	}
-	return nil, cerror.WrapError(
-		cerror.ErrDDLSchemaNotFound,
+	return nil, errors.WrapError(
+		errors.ErrDDLSchemaNotFound,
 		errors.Errorf("can't find table %s", name))
 }
 
@@ -227,33 +252,44 @@ func findColumnByName(cols []*model.ColumnInfo, name string) (*model.ColumnInfo,
 			return c, nil
 		}
 	}
-	return nil, cerror.WrapError(
-		cerror.ErrDDLSchemaNotFound,
+	return nil, errors.WrapError(
+		errors.ErrDDLSchemaNotFound,
 		errors.Errorf("can't find column %s", name))
 }
 
 const (
 	// JobTableID is the id of `tidb_ddl_job`.
-	JobTableID = ddl.JobTableID
+	JobTableID = metadef.TiDBDDLJobTableID
 	// JobHistoryID is the id of `tidb_ddl_history`
-	JobHistoryID = ddl.HistoryTableID
+	JobHistoryID = metadef.TiDBDDLHistoryTableID
 )
 
-func getAllDDLSpan() []heartbeatpb.TableSpan {
+func getAllDDLSpan(keyspaceID uint32) ([]heartbeatpb.TableSpan, error) {
 	spans := make([]heartbeatpb.TableSpan, 0, 2)
-	start, end := common.GetTableRange(JobTableID)
+
+	start, end, err := common.GetKeyspaceTableRange(keyspaceID, JobTableID)
+	if err != nil {
+		return nil, err
+	}
+
 	spans = append(spans, heartbeatpb.TableSpan{
-		TableID:  JobTableID,
-		StartKey: common.ToComparableKey(start),
-		EndKey:   common.ToComparableKey(end),
+		TableID:    JobTableID,
+		StartKey:   common.ToComparableKey(start),
+		EndKey:     common.ToComparableKey(end),
+		KeyspaceID: keyspaceID,
 	})
-	start, end = common.GetTableRange(JobHistoryID)
+
+	start, end, err = common.GetKeyspaceTableRange(keyspaceID, JobHistoryID)
+	if err != nil {
+		return nil, err
+	}
 	spans = append(spans, heartbeatpb.TableSpan{
-		TableID:  JobHistoryID,
-		StartKey: common.ToComparableKey(start),
-		EndKey:   common.ToComparableKey(end),
+		TableID:    JobHistoryID,
+		StartKey:   common.ToComparableKey(start),
+		EndKey:     common.ToComparableKey(end),
+		KeyspaceID: keyspaceID,
 	})
-	return spans
+	return spans, nil
 }
 
 type resolvedTsItem struct {

@@ -23,11 +23,13 @@ import (
 	"github.com/pingcap/kvproto/pkg/cdcpb"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/logservice/logpuller/regionlock"
-	"github.com/pingcap/ticdc/logservice/txnutil"
 	"github.com/pingcap/ticdc/pkg/common"
+	appcontext "github.com/pingcap/ticdc/pkg/common/context"
+	"github.com/pingcap/ticdc/pkg/metrics"
 	"github.com/pingcap/ticdc/pkg/pdutil"
+	"github.com/pingcap/ticdc/pkg/security"
 	"github.com/pingcap/tidb/pkg/store/mockstore/mockcopr"
-	"github.com/pingcap/tiflow/pkg/security"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/testutils"
@@ -35,9 +37,10 @@ import (
 )
 
 func TestGenerateResolveLockTask(t *testing.T) {
-	client := &SubscriptionClient{
+	client := &subscriptionClient{
 		resolveLockTaskCh: make(chan resolveLockTask, 10),
 	}
+	client.ctx, client.cancel = context.WithCancel(context.Background())
 	rawSpan := heartbeatpb.TableSpan{
 		TableID:  1,
 		StartKey: []byte{'a'},
@@ -45,7 +48,7 @@ func TestGenerateResolveLockTask(t *testing.T) {
 	}
 	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
 	advanceResolvedTs := func(ts uint64) {}
-	span := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0)
+	span := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
 	client.totalSpans.spanMap = make(map[SubscriptionID]*subscribedSpan)
 	client.totalSpans.spanMap[SubscriptionID(1)] = span
 	client.pdClock = pdutil.NewClock4Test()
@@ -63,10 +66,13 @@ func TestGenerateResolveLockTask(t *testing.T) {
 		require.True(t, false, "must get a resolve lock task")
 	}
 
+	worker := &regionRequestWorker{
+		requestCache: &requestCache{},
+	}
 	// Lock another range, no task will be triggered before initialized.
 	res = span.rangeLock.LockRange(context.Background(), []byte{'c'}, []byte{'d'}, 2, 100)
 	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
-	state := newRegionFeedState(regionInfo{lockedRangeState: res.LockedRangeState, subscribedSpan: span}, 1)
+	state := newRegionFeedState(regionInfo{lockedRangeState: res.LockedRangeState, subscribedSpan: span}, 1, worker)
 	span.resolveStaleLocks(200)
 	select {
 	case task := <-client.resolveLockTaskCh:
@@ -97,8 +103,88 @@ func TestGenerateResolveLockTask(t *testing.T) {
 	close(client.resolveLockTaskCh)
 }
 
+func TestResolveLockTaskDroppedWhenChannelFull(t *testing.T) {
+	client := &subscriptionClient{
+		resolveLockTaskCh: make(chan resolveLockTask, 1),
+	}
+	client.ctx, client.cancel = context.WithCancel(context.Background())
+	defer client.cancel()
+
+	rawSpan := heartbeatpb.TableSpan{
+		TableID:  1,
+		StartKey: []byte{'a'},
+		EndKey:   []byte{'z'},
+	}
+	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
+	advanceResolvedTs := func(ts uint64) {}
+	span := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+
+	res := span.rangeLock.LockRange(context.Background(), []byte{'b'}, []byte{'c'}, 1, 100)
+	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
+	res.LockedRangeState.Initialized.Store(true)
+
+	// Fill the channel to simulate the resolver goroutine being blocked.
+	client.resolveLockTaskCh <- resolveLockTask{}
+
+	before := testutil.ToFloat64(metrics.SubscriptionClientResolveLockTaskDropCounter)
+	done := make(chan struct{})
+	go func() {
+		span.resolveStaleLocks(200)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("resolveStaleLocks should not block even if resolveLockTaskCh is full")
+	}
+
+	// No new task is added because the channel is still full.
+	require.Equal(t, 1, len(client.resolveLockTaskCh))
+
+	after := testutil.ToFloat64(metrics.SubscriptionClientResolveLockTaskDropCounter)
+	require.Equal(t, before+1, after)
+
+	<-client.resolveLockTaskCh
+	close(client.resolveLockTaskCh)
+}
+
+func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
+	client := &subscriptionClient{
+		resolveLockTaskCh: make(chan resolveLockTask, 1),
+		regionTaskQueue:   NewPriorityQueue(),
+	}
+	client.ctx, client.cancel = context.WithCancel(context.Background())
+	defer client.cancel()
+	client.pdClock = pdutil.NewClock4Test()
+
+	rawSpan := heartbeatpb.TableSpan{
+		TableID:  1,
+		StartKey: []byte{'a'},
+		EndKey:   []byte{'z'},
+	}
+	consumeKVEvents := func(_ []common.RawKVEntry, _ func()) bool { return false }
+	advanceResolvedTs := func(ts uint64) {}
+	span := client.newSubscribedSpan(SubscriptionID(1), rawSpan, 100, consumeKVEvents, advanceResolvedTs, 0, true)
+
+	res := span.rangeLock.LockRange(context.Background(), rawSpan.StartKey, rawSpan.EndKey, 1, 1)
+	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
+
+	client.setTableStopped(span)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	task, err := client.regionTaskQueue.Pop(ctx)
+	require.NoError(t, err)
+	region := task.GetRegionInfo()
+	require.True(t, region.isStopped())
+	require.True(t, region.filterLoop)
+}
+
 func TestSubscriptionWithFailedTiKV(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	mockPDClock := pdutil.NewClock4Test()
+	appcontext.SetService(appcontext.DefaultPDClock, mockPDClock)
 	wg := &sync.WaitGroup{}
 
 	eventsCh1 := make(chan *cdcpb.ChangeDataEvent, 10)
@@ -112,10 +198,10 @@ func TestSubscriptionWithFailedTiKV(t *testing.T) {
 
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	regionCache := tikv.NewRegionCache(pdClient)
+	appcontext.SetService(appcontext.RegionCache, regionCache)
 	pdClock := pdutil.NewClock4Test()
 	kvStorage, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
 	require.Nil(t, err)
-	lockResolver := txnutil.NewLockerResolver(kvStorage)
 
 	invalidStore := "localhost:1"
 	cluster.AddStore(1, addr1)
@@ -130,9 +216,7 @@ func TestSubscriptionWithFailedTiKV(t *testing.T) {
 	client := NewSubscriptionClient(
 		clientConfig,
 		pdClient,
-		regionCache,
-		pdClock,
-		lockResolver,
+		nil, // we don't need it in this unittest, so we can pass nil
 		&security.Credential{},
 	)
 
@@ -170,7 +254,7 @@ func TestSubscriptionWithFailedTiKV(t *testing.T) {
 		case tsCh <- ts:
 		}
 	}
-	client.Subscribe(subID, span, 1, consumeKVEvents, advanceResolvedTs, 0)
+	client.Subscribe(subID, span, 1, consumeKVEvents, advanceResolvedTs, 0, false)
 
 	eventsCh1 <- mockInitializedEvent(11, uint64(subID))
 	targetTs := oracle.GoTimeToTS(pdClock.CurrentTime())
@@ -197,5 +281,82 @@ func TestSubscriptionWithFailedTiKV(t *testing.T) {
 		require.Equal(t, targetTs, resolvedTs)
 	case <-time.After(30 * time.Second):
 		require.True(t, false, "reconnection not succeed in 5 second")
+	}
+}
+
+// TestErrCacheDispatchWithFullChannelAndCanceledContext tests that when errCh is full
+// and context is canceled, the dispatch method doesn't get stuck.
+func TestErrCacheDispatchWithFullChannelAndCanceledContext(t *testing.T) {
+	// Create errCache with a small errCh to easily fill it up
+	errCache := &errCache{
+		cache:  make([]regionErrorInfo, 0, 10),
+		errCh:  make(chan regionErrorInfo, 2), // Small buffer to easily fill
+		notify: make(chan struct{}, 10),
+	}
+
+	// Create a mock regionErrorInfo
+	mockErrInfo := regionErrorInfo{
+		regionInfo: regionInfo{
+			verID: tikv.NewRegionVerID(1, 1, 1),
+			span:  heartbeatpb.TableSpan{TableID: 1, StartKey: []byte("a"), EndKey: []byte("b")},
+		},
+		err: errors.New("test error"),
+	}
+
+	// Fill up the errCh channel to make it full
+	errCache.errCh <- mockErrInfo
+	errCache.errCh <- mockErrInfo
+
+	// Add some errors to the cache
+	for i := 0; i < 5; i++ {
+		errCache.add(mockErrInfo)
+	}
+
+	// Create a context that will be canceled
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Channel to signal when dispatch returns
+	dispatchDone := make(chan error, 1)
+
+	// Start dispatch in a goroutine
+	go func() {
+		err := errCache.dispatch(ctx)
+		dispatchDone <- err
+	}()
+
+	// Give dispatch some time to start and potentially get stuck
+	time.Sleep(50 * time.Millisecond)
+
+	// Cancel the context
+	cancel()
+
+	// Wait for dispatch to return with a timeout
+	select {
+	case err := <-dispatchDone:
+		// Verify that dispatch returned with context.Canceled error
+		require.Equal(t, context.Canceled, err)
+	case <-time.After(5 * time.Second):
+		// If we timeout here, it means dispatch is stuck
+		t.Fatal("dispatch method is stuck and didn't return after context cancellation")
+	}
+}
+
+func TestGCResolveLastRunMap(t *testing.T) {
+	now := time.Now()
+	resolveLastRun := make(map[uint64]time.Time, resolveLastRunGCThreshold+1)
+	const keep = 10
+	for i := 0; i < resolveLastRunGCThreshold+1; i++ {
+		lastRunTime := now.Add(-2 * resolveLockMinInterval)
+		if i < keep {
+			lastRunTime = now.Add(-resolveLockMinInterval / 2)
+		}
+		resolveLastRun[uint64(i)] = lastRunTime
+	}
+
+	resolveLastRun = gcResolveLastRunMap(resolveLastRun, now)
+	require.Len(t, resolveLastRun, keep)
+	for i := 0; i < keep; i++ {
+		_, ok := resolveLastRun[uint64(i)]
+		require.True(t, ok)
 	}
 }

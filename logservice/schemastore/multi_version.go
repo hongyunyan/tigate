@@ -98,7 +98,8 @@ func (e *TableDeletedError) Error() string {
 	return "table deleted"
 }
 
-// return the table info with the largest version <= ts
+// if ts < deleteVersion, return the table info with the largest version <= ts
+// if ts >= deleteVersion, return nil table info and TableDeletedError
 func (v *versionedTableInfoStore) getTableInfo(ts uint64) (*common.TableInfo, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -111,8 +112,8 @@ func (v *versionedTableInfoStore) getTableInfo(ts uint64) (*common.TableInfo, er
 		log.Warn("table info deleted",
 			zap.Any("ts", ts),
 			zap.Any("tableID", v.tableID),
-			zap.Any("infos", v.infos),
-			zap.Any("deleteVersion", v.deleteVersion))
+			zap.Any("deleteVersion", v.deleteVersion),
+			zap.Any("infos", v.infos))
 		return nil, &TableDeletedError{}
 	}
 
@@ -123,8 +124,8 @@ func (v *versionedTableInfoStore) getTableInfo(ts uint64) (*common.TableInfo, er
 		log.Error("no version found",
 			zap.Any("ts", ts),
 			zap.Any("tableID", v.tableID),
-			zap.Any("infos", v.infos),
-			zap.Any("deleteVersion", v.deleteVersion))
+			zap.Any("deleteVersion", v.deleteVersion),
+			zap.Any("infos", v.infos))
 		return nil, errors.New("no version found")
 	}
 	return v.infos[target-1].Info, nil
@@ -152,6 +153,7 @@ func (v *versionedTableInfoStore) gc(gcTs uint64) bool {
 		return false
 	}
 
+	clear(v.infos[:target-1])
 	v.infos = v.infos[target-1:]
 	if len(v.infos) == 0 {
 		log.Panic("should not happen")

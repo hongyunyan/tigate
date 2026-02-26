@@ -21,14 +21,13 @@ import (
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/common"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
+	"github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/hash"
 	timodel "github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/charset"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/parser/types"
-	"github.com/pingcap/tiflow/cdc/model"
-	"github.com/pingcap/tiflow/pkg/errors"
-	"github.com/pingcap/tiflow/pkg/hash"
 	"go.uber.org/zap"
 )
 
@@ -48,6 +47,7 @@ type TableCol struct {
 	Scale     string      `json:"ColumnScale,omitempty"`
 	Nullable  string      `json:"ColumnNullable,omitempty"`
 	IsPK      string      `json:"ColumnIsPk,omitempty"`
+	Elems     []string    `json:"ColumnElems,omitempty"`
 }
 
 // FromTiColumnInfo converts from TiDB ColumnInfo to TableCol.
@@ -79,7 +79,7 @@ func (t *TableCol) FromTiColumnInfo(col *timodel.ColumnInfo, outputColumnID bool
 	if mysql.HasNotNullFlag(col.GetFlag()) {
 		t.Nullable = "false"
 	}
-	t.Default = model.GetColumnDefaultValue(col)
+	t.Default = col.GetDefaultValue()
 
 	switch col.GetType() {
 	case mysql.TypeTimestamp, mysql.TypeDatetime, mysql.TypeDuration:
@@ -100,6 +100,8 @@ func (t *TableCol) FromTiColumnInfo(col *timodel.ColumnInfo, outputColumnID bool
 		t.Precision = strconv.Itoa(displayFlen)
 	case mysql.TypeYear:
 		t.Precision = strconv.Itoa(displayFlen)
+	case mysql.TypeEnum, mysql.TypeSet:
+		t.Elems = col.GetElems()
 	}
 }
 
@@ -116,7 +118,7 @@ func (t *TableCol) ToTiColumnInfo(colID int64) (*timodel.ColumnInfo, error) {
 	}
 
 	col.ID = colID
-	col.Name = pmodel.NewCIStr(t.Name)
+	col.Name = ast.NewCIStr(t.Name)
 	tp := types.StrToType(strings.ToLower(strings.TrimSuffix(t.Tp, " UNSIGNED")))
 	col.FieldType = *types.NewFieldType(tp)
 	if strings.Contains(t.Tp, "UNSIGNED") {
@@ -176,6 +178,8 @@ func (t *TableCol) ToTiColumnInfo(colID int64) (*timodel.ColumnInfo, error) {
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
+	case mysql.TypeEnum, mysql.TypeSet:
+		col.SetElems(t.Elems)
 	}
 
 	return col, nil
@@ -206,14 +210,7 @@ type tableDefWithoutQuery struct {
 
 // FromDDLEvent converts from DDLEvent to TableDefinition.
 func (t *TableDefinition) FromDDLEvent(event *commonEvent.DDLEvent, outputColumnID bool) {
-	// if event.GetCommitTs() != event.TableInfo.UpdateTS() {
-	// 	log.Warn("commit ts and table info version should be equal",
-	// 		zap.Uint64("tableInfoVersion", event.TableInfo.UpdateTS()),
-	// 		zap.Any("commitTs", event.GetCommitTs()),
-	// 		zap.Any("tableInfo", event.TableInfo),
-	// 	)
-	// }
-	t.FromTableInfo(event.SchemaName, event.TableName, event.TableInfo, event.GetCommitTs(), outputColumnID)
+	t.FromTableInfo(event.SchemaName, event.TableName, event.TableInfo, event.FinishedTs, outputColumnID)
 	t.Query = event.Query
 	t.Type = event.Type
 }
@@ -225,10 +222,13 @@ func (t *TableDefinition) ToDDLEvent() (*commonEvent.DDLEvent, error) {
 		return nil, err
 	}
 	return &commonEvent.DDLEvent{
-		TableInfo:  tableInfo,
-		FinishedTs: t.TableVersion,
-		Type:       t.Type,
-		Query:      t.Query,
+		TableInfo:     tableInfo,
+		FinishedTs:    t.TableVersion,
+		Type:          t.Type,
+		Query:         t.Query,
+		SchemaName:    t.Schema,
+		TableName:     t.Table,
+		BlockedTables: &commonEvent.InfluencedTables{InfluenceType: commonEvent.InfluenceTypeAll},
 	}, nil
 }
 
@@ -255,7 +255,7 @@ func (t *TableDefinition) FromTableInfo(
 // ToTableInfo converts from TableDefinition to DDLEvent.
 func (t *TableDefinition) ToTableInfo() (*common.TableInfo, error) {
 	tidbTableInfo := &timodel.TableInfo{
-		Name: pmodel.NewCIStr(t.Table),
+		Name: ast.NewCIStr(t.Table),
 	}
 	nextMockID := int64(100) // 100 is an arbitrary number
 	for _, col := range t.Columns {
@@ -264,14 +264,13 @@ func (t *TableDefinition) ToTableInfo() (*common.TableInfo, error) {
 			return nil, err
 		}
 		if mysql.HasPriKeyFlag(tiCol.GetFlag()) {
-			// use PKIsHandle to make sure that the primary keys can be detected by `WrapTableInfo`
+			// use PKIsHandle to make sure that the primary keys can be detected
 			tidbTableInfo.PKIsHandle = true
 		}
 		tidbTableInfo.Columns = append(tidbTableInfo.Columns, tiCol)
 		nextMockID += 1
 	}
-	info := common.WrapTableInfo(100, t.Schema, tidbTableInfo)
-
+	info := common.NewTableInfo4Decoder(t.Schema, tidbTableInfo)
 	return info, nil
 }
 

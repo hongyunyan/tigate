@@ -91,22 +91,23 @@ func (m *SubscriptionState) GetResolvedTs() uint64 {
 	return 0
 }
 
-type SubscriptionStates struct {
+// TableState stores all subscription states for the same table
+type TableState struct {
 	Subscriptions []*SubscriptionState `protobuf:"bytes,1,rep,name=Subscriptions,proto3" json:"Subscriptions,omitempty"`
 }
 
-func (m *SubscriptionStates) Reset()         { *m = SubscriptionStates{} }
-func (m *SubscriptionStates) String() string { return proto.CompactTextString(m) }
-func (*SubscriptionStates) ProtoMessage()    {}
-func (*SubscriptionStates) Descriptor() ([]byte, []int) {
+func (m *TableState) Reset()         { *m = TableState{} }
+func (m *TableState) String() string { return proto.CompactTextString(m) }
+func (*TableState) ProtoMessage()    {}
+func (*TableState) Descriptor() ([]byte, []int) {
 	return fileDescriptor_a1db670929506a40, []int{1}
 }
-func (m *SubscriptionStates) XXX_Unmarshal(b []byte) error {
+func (m *TableState) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *SubscriptionStates) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *TableState) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	if deterministic {
-		return xxx_messageInfo_SubscriptionStates.Marshal(b, m, deterministic)
+		return xxx_messageInfo_TableState.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
 		n, err := m.MarshalToSizedBuffer(b)
@@ -116,27 +117,29 @@ func (m *SubscriptionStates) XXX_Marshal(b []byte, deterministic bool) ([]byte, 
 		return b[:n], nil
 	}
 }
-func (m *SubscriptionStates) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_SubscriptionStates.Merge(m, src)
+func (m *TableState) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TableState.Merge(m, src)
 }
-func (m *SubscriptionStates) XXX_Size() int {
+func (m *TableState) XXX_Size() int {
 	return m.Size()
 }
-func (m *SubscriptionStates) XXX_DiscardUnknown() {
-	xxx_messageInfo_SubscriptionStates.DiscardUnknown(m)
+func (m *TableState) XXX_DiscardUnknown() {
+	xxx_messageInfo_TableState.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_SubscriptionStates proto.InternalMessageInfo
+var xxx_messageInfo_TableState proto.InternalMessageInfo
 
-func (m *SubscriptionStates) GetSubscriptions() []*SubscriptionState {
+func (m *TableState) GetSubscriptions() []*SubscriptionState {
 	if m != nil {
 		return m.Subscriptions
 	}
 	return nil
 }
 
+// EventStoreState stores a single node's event store state
 type EventStoreState struct {
-	Subscriptions map[int64]*SubscriptionStates `protobuf:"bytes,1,rep,name=Subscriptions,proto3" json:"Subscriptions,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	// tableID -> TableState
+	TableStates map[int64]*TableState `protobuf:"bytes,1,rep,name=TableStates,proto3" json:"TableStates,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 }
 
 func (m *EventStoreState) Reset()         { *m = EventStoreState{} }
@@ -172,9 +175,106 @@ func (m *EventStoreState) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_EventStoreState proto.InternalMessageInfo
 
-func (m *EventStoreState) GetSubscriptions() map[int64]*SubscriptionStates {
+func (m *EventStoreState) GetTableStates() map[int64]*TableState {
 	if m != nil {
-		return m.Subscriptions
+		return m.TableStates
+	}
+	return nil
+}
+
+type ChangefeedStateEntry struct {
+	ChangefeedID *heartbeatpb.ChangefeedID `protobuf:"bytes,1,opt,name=ChangefeedID,proto3" json:"ChangefeedID,omitempty"`
+	ResolvedTs   uint64                    `protobuf:"varint,2,opt,name=ResolvedTs,proto3" json:"ResolvedTs,omitempty"`
+}
+
+func (m *ChangefeedStateEntry) Reset()         { *m = ChangefeedStateEntry{} }
+func (m *ChangefeedStateEntry) String() string { return proto.CompactTextString(m) }
+func (*ChangefeedStateEntry) ProtoMessage()    {}
+func (*ChangefeedStateEntry) Descriptor() ([]byte, []int) {
+	return fileDescriptor_a1db670929506a40, []int{3}
+}
+func (m *ChangefeedStateEntry) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *ChangefeedStateEntry) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_ChangefeedStateEntry.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *ChangefeedStateEntry) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_ChangefeedStateEntry.Merge(m, src)
+}
+func (m *ChangefeedStateEntry) XXX_Size() int {
+	return m.Size()
+}
+func (m *ChangefeedStateEntry) XXX_DiscardUnknown() {
+	xxx_messageInfo_ChangefeedStateEntry.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_ChangefeedStateEntry proto.InternalMessageInfo
+
+func (m *ChangefeedStateEntry) GetChangefeedID() *heartbeatpb.ChangefeedID {
+	if m != nil {
+		return m.ChangefeedID
+	}
+	return nil
+}
+
+func (m *ChangefeedStateEntry) GetResolvedTs() uint64 {
+	if m != nil {
+		return m.ResolvedTs
+	}
+	return 0
+}
+
+type ChangefeedStates struct {
+	// A list of changefeed states.
+	States []*ChangefeedStateEntry `protobuf:"bytes,1,rep,name=States,proto3" json:"States,omitempty"`
+}
+
+func (m *ChangefeedStates) Reset()         { *m = ChangefeedStates{} }
+func (m *ChangefeedStates) String() string { return proto.CompactTextString(m) }
+func (*ChangefeedStates) ProtoMessage()    {}
+func (*ChangefeedStates) Descriptor() ([]byte, []int) {
+	return fileDescriptor_a1db670929506a40, []int{4}
+}
+func (m *ChangefeedStates) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *ChangefeedStates) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_ChangefeedStates.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *ChangefeedStates) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_ChangefeedStates.Merge(m, src)
+}
+func (m *ChangefeedStates) XXX_Size() int {
+	return m.Size()
+}
+func (m *ChangefeedStates) XXX_DiscardUnknown() {
+	xxx_messageInfo_ChangefeedStates.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_ChangefeedStates proto.InternalMessageInfo
+
+func (m *ChangefeedStates) GetStates() []*ChangefeedStateEntry {
+	if m != nil {
+		return m.States
 	}
 	return nil
 }
@@ -189,7 +289,7 @@ func (m *ReusableEventServiceRequest) Reset()         { *m = ReusableEventServic
 func (m *ReusableEventServiceRequest) String() string { return proto.CompactTextString(m) }
 func (*ReusableEventServiceRequest) ProtoMessage()    {}
 func (*ReusableEventServiceRequest) Descriptor() ([]byte, []int) {
-	return fileDescriptor_a1db670929506a40, []int{3}
+	return fileDescriptor_a1db670929506a40, []int{5}
 }
 func (m *ReusableEventServiceRequest) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -248,7 +348,7 @@ func (m *ReusableEventServiceResponse) Reset()         { *m = ReusableEventServi
 func (m *ReusableEventServiceResponse) String() string { return proto.CompactTextString(m) }
 func (*ReusableEventServiceResponse) ProtoMessage()    {}
 func (*ReusableEventServiceResponse) Descriptor() ([]byte, []int) {
-	return fileDescriptor_a1db670929506a40, []int{4}
+	return fileDescriptor_a1db670929506a40, []int{6}
 }
 func (m *ReusableEventServiceResponse) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -293,9 +393,11 @@ func (m *ReusableEventServiceResponse) GetNodes() []string {
 
 func init() {
 	proto.RegisterType((*SubscriptionState)(nil), "logservicepb.SubscriptionState")
-	proto.RegisterType((*SubscriptionStates)(nil), "logservicepb.SubscriptionStates")
+	proto.RegisterType((*TableState)(nil), "logservicepb.TableState")
 	proto.RegisterType((*EventStoreState)(nil), "logservicepb.EventStoreState")
-	proto.RegisterMapType((map[int64]*SubscriptionStates)(nil), "logservicepb.EventStoreState.SubscriptionsEntry")
+	proto.RegisterMapType((map[int64]*TableState)(nil), "logservicepb.EventStoreState.TableStatesEntry")
+	proto.RegisterType((*ChangefeedStateEntry)(nil), "logservicepb.ChangefeedStateEntry")
+	proto.RegisterType((*ChangefeedStates)(nil), "logservicepb.ChangefeedStates")
 	proto.RegisterType((*ReusableEventServiceRequest)(nil), "logservicepb.ReusableEventServiceRequest")
 	proto.RegisterType((*ReusableEventServiceResponse)(nil), "logservicepb.ReusableEventServiceResponse")
 }
@@ -305,34 +407,38 @@ func init() {
 }
 
 var fileDescriptor_a1db670929506a40 = []byte{
-	// 432 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x94, 0x53, 0x41, 0x8b, 0x13, 0x31,
-	0x14, 0x6e, 0x66, 0x5a, 0xc5, 0xd7, 0x15, 0x35, 0x2c, 0x32, 0xee, 0xca, 0x38, 0x0c, 0x08, 0xa3,
-	0x87, 0xa9, 0x54, 0x10, 0xf1, 0x22, 0x68, 0x7b, 0xd8, 0x8b, 0x87, 0x4c, 0xf1, 0xa0, 0x07, 0x49,
-	0xa6, 0x8f, 0x36, 0x6c, 0x9d, 0xc4, 0x24, 0x53, 0xd8, 0x3f, 0x21, 0x5e, 0xfd, 0x47, 0x5e, 0x84,
-	0x3d, 0x7a, 0x94, 0xf6, 0x8f, 0x48, 0x27, 0xab, 0x3b, 0xb3, 0xbb, 0x20, 0x7b, 0x7b, 0xef, 0xe5,
-	0x7b, 0x5f, 0xbe, 0x2f, 0x1f, 0x81, 0x6c, 0xa5, 0x16, 0x16, 0xcd, 0x5a, 0x96, 0x38, 0x3a, 0x2f,
-	0xb5, 0x68, 0x35, 0xb9, 0x36, 0xca, 0x29, 0xba, 0xd7, 0x3e, 0x3e, 0x38, 0x5c, 0x22, 0x37, 0x4e,
-	0x20, 0x77, 0x5a, 0x8c, 0xfe, 0xd5, 0x1e, 0x9a, 0x7e, 0x27, 0x70, 0xaf, 0xa8, 0x85, 0x2d, 0x8d,
-	0xd4, 0x4e, 0xaa, 0xaa, 0x70, 0xdc, 0x21, 0xdd, 0x87, 0x41, 0x51, 0x8b, 0xa3, 0x49, 0x44, 0x12,
-	0x92, 0xf5, 0x99, 0x6f, 0xe8, 0x53, 0xe8, 0x17, 0x9a, 0x57, 0x51, 0x90, 0x90, 0x6c, 0x38, 0xbe,
-	0x9f, 0xb7, 0x78, 0xf3, 0x19, 0x17, 0x2b, 0xdc, 0x9d, 0xb2, 0x06, 0x43, 0x53, 0xd8, 0x7b, 0xbb,
-	0xc4, 0xf2, 0x58, 0x2b, 0x59, 0xb9, 0x99, 0x8d, 0xc2, 0x86, 0xa8, 0x33, 0xa3, 0x31, 0x00, 0x43,
-	0xab, 0x56, 0x6b, 0x9c, 0xcf, 0x6c, 0xd4, 0x6f, 0x10, 0xad, 0x49, 0xfa, 0x11, 0xe8, 0x25, 0x69,
-	0x96, 0x4e, 0xe1, 0x76, 0x7b, 0x6a, 0x23, 0x92, 0x84, 0xd9, 0x70, 0xfc, 0x28, 0x6f, 0x9b, 0xce,
-	0x2f, 0x2d, 0xb2, 0xee, 0x56, 0xfa, 0x93, 0xc0, 0x9d, 0xe9, 0x1a, 0x2b, 0x57, 0x38, 0x65, 0xd0,
-	0xdb, 0x7e, 0x7f, 0x35, 0xf5, 0xb3, 0x2e, 0xf5, 0x85, 0xad, 0xce, 0x55, 0x76, 0x5a, 0x39, 0x73,
-	0x72, 0xe1, 0xae, 0x03, 0xd1, 0x35, 0xe2, 0x41, 0xf4, 0x2e, 0x84, 0xc7, 0x78, 0xd2, 0x3c, 0x71,
-	0xc8, 0x76, 0x25, 0x7d, 0x01, 0x83, 0x35, 0x5f, 0xd5, 0x78, 0xf6, 0xc2, 0xc9, 0x7f, 0x2c, 0x59,
-	0xe6, 0xe1, 0xaf, 0x82, 0x97, 0x24, 0xfd, 0x4a, 0xe0, 0x90, 0x61, 0x6d, 0x77, 0x39, 0x78, 0x85,
-	0x7e, 0x91, 0xe1, 0x97, 0x1a, 0xad, 0xa3, 0x4f, 0x20, 0x38, 0xcb, 0x73, 0x38, 0x7e, 0xd0, 0x89,
-	0x6e, 0x22, 0xad, 0xe6, 0xae, 0x5c, 0xa2, 0x39, 0x9a, 0xb0, 0xe0, 0x9a, 0x39, 0x47, 0x70, 0xb3,
-	0x70, 0xdc, 0x9c, 0x47, 0xfc, 0xb7, 0x4d, 0x3f, 0xc1, 0xc3, 0xab, 0xf5, 0x58, 0xad, 0x2a, 0x8b,
-	0xd7, 0x11, 0xb4, 0x0f, 0x83, 0x77, 0x6a, 0x8e, 0x36, 0x0a, 0x92, 0x30, 0xbb, 0xc5, 0x7c, 0xf3,
-	0xe6, 0xf5, 0x8f, 0x4d, 0x4c, 0x4e, 0x37, 0x31, 0xf9, 0xbd, 0x89, 0xc9, 0xb7, 0x6d, 0xdc, 0x3b,
-	0xdd, 0xc6, 0xbd, 0x5f, 0xdb, 0xb8, 0xf7, 0xe1, 0xf1, 0x42, 0xba, 0x65, 0x2d, 0xf2, 0x52, 0x7d,
-	0x1e, 0x69, 0x59, 0x2d, 0x4a, 0xae, 0x47, 0x4e, 0x96, 0xf3, 0xb2, 0xf3, 0x6f, 0xc4, 0x8d, 0xe6,
-	0x0b, 0x3c, 0xff, 0x13, 0x00, 0x00, 0xff, 0xff, 0xf6, 0x53, 0xc3, 0x3e, 0x59, 0x03, 0x00, 0x00,
+	// 485 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x94, 0x53, 0x41, 0x8b, 0xd3, 0x40,
+	0x14, 0xee, 0x24, 0xed, 0x8a, 0xaf, 0x2b, 0xd6, 0x50, 0x24, 0xee, 0x4a, 0x2c, 0x01, 0x21, 0x7a,
+	0x48, 0xa1, 0x5e, 0x64, 0x41, 0x04, 0xb7, 0x3d, 0xec, 0x65, 0x91, 0x49, 0x0f, 0xe2, 0x45, 0x26,
+	0xe9, 0xb3, 0x09, 0x5b, 0x33, 0x63, 0x66, 0x52, 0xd8, 0x3f, 0x21, 0x5e, 0xfd, 0x31, 0xde, 0x3d,
+	0xee, 0xd1, 0xa3, 0xb4, 0x7f, 0x44, 0x92, 0xb4, 0x76, 0xa6, 0xbb, 0x1e, 0x7a, 0x9b, 0x37, 0xef,
+	0x7b, 0xdf, 0xfb, 0xde, 0xf7, 0x66, 0x20, 0x58, 0xf0, 0xb9, 0xc4, 0x62, 0x99, 0x25, 0x38, 0xdc,
+	0x1d, 0x45, 0xac, 0x05, 0xa1, 0x28, 0xb8, 0xe2, 0xce, 0xb1, 0x9e, 0x3e, 0x39, 0x4d, 0x91, 0x15,
+	0x2a, 0x46, 0xa6, 0x44, 0x3c, 0xfc, 0x77, 0x6e, 0xa0, 0xfe, 0x0f, 0x02, 0x8f, 0xa2, 0x32, 0x96,
+	0x49, 0x91, 0x09, 0x95, 0xf1, 0x3c, 0x52, 0x4c, 0xa1, 0xd3, 0x87, 0x4e, 0x54, 0xc6, 0x17, 0x63,
+	0x97, 0x0c, 0x48, 0xd0, 0xa6, 0x4d, 0xe0, 0xbc, 0x84, 0x76, 0x24, 0x58, 0xee, 0x5a, 0x03, 0x12,
+	0x74, 0x47, 0x8f, 0x43, 0x8d, 0x37, 0x9c, 0xb2, 0x78, 0x81, 0x55, 0x96, 0xd6, 0x18, 0xc7, 0x87,
+	0xe3, 0xf3, 0x14, 0x93, 0x2b, 0xc1, 0xb3, 0x5c, 0x4d, 0xa5, 0x6b, 0xd7, 0x44, 0xc6, 0x9d, 0xe3,
+	0x01, 0x50, 0x94, 0x7c, 0xb1, 0xc4, 0xd9, 0x54, 0xba, 0xed, 0x1a, 0xa1, 0xdd, 0xf8, 0x11, 0x40,
+	0x43, 0x5b, 0x6b, 0x9a, 0xc0, 0x03, 0x5d, 0xa8, 0x74, 0xc9, 0xc0, 0x0e, 0xba, 0xa3, 0x67, 0xa1,
+	0x3e, 0x6c, 0x78, 0x6b, 0x16, 0x6a, 0x56, 0xf9, 0x3f, 0x09, 0x3c, 0x9c, 0x2c, 0x31, 0x57, 0x91,
+	0xe2, 0xc5, 0x86, 0xfa, 0x3d, 0x74, 0x77, 0x8d, 0xb6, 0xc4, 0xa1, 0x49, 0xbc, 0x57, 0x13, 0x6a,
+	0x05, 0x93, 0x5c, 0x15, 0xd7, 0x54, 0xa7, 0x38, 0xf9, 0x00, 0xbd, 0x7d, 0x80, 0xd3, 0x03, 0xfb,
+	0x0a, 0xaf, 0x6b, 0x4b, 0x6d, 0x5a, 0x1d, 0x9d, 0x10, 0x3a, 0x4b, 0xb6, 0x28, 0x71, 0xe3, 0xa8,
+	0x6b, 0x76, 0xdc, 0x11, 0xd0, 0x06, 0x76, 0x66, 0xbd, 0x26, 0x7e, 0x09, 0xfd, 0xf3, 0x94, 0xe5,
+	0x73, 0xfc, 0x8c, 0x38, 0xab, 0xb3, 0x0d, 0xfb, 0x9b, 0xca, 0xf0, 0xed, 0xfd, 0x66, 0x73, 0xdd,
+	0xd1, 0x13, 0x63, 0x49, 0x3a, 0x80, 0x1a, 0xf0, 0xbd, 0x5d, 0x58, 0xb7, 0x76, 0x71, 0x09, 0xbd,
+	0xbd, 0xb6, 0xd2, 0x39, 0x83, 0x23, 0xc3, 0x31, 0xdf, 0xd4, 0x7f, 0x97, 0x4c, 0xba, 0xa9, 0xf0,
+	0xbf, 0x11, 0x38, 0xa5, 0x58, 0xca, 0x6a, 0xc6, 0xc6, 0xda, 0xa6, 0x8e, 0xe2, 0xd7, 0x12, 0xa5,
+	0x72, 0x5e, 0x80, 0xf5, 0x9f, 0x21, 0xc6, 0x99, 0x14, 0x4c, 0x25, 0x29, 0x16, 0x17, 0x63, 0x6a,
+	0x1d, 0xf8, 0x2c, 0x5d, 0xb8, 0x17, 0x29, 0x56, 0xec, 0x5e, 0xe4, 0x36, 0xf4, 0x3f, 0xc1, 0xd3,
+	0xbb, 0xf5, 0x48, 0xc1, 0x73, 0x89, 0x87, 0x08, 0xea, 0x43, 0xe7, 0x92, 0xcf, 0xb0, 0xb2, 0xd1,
+	0x0e, 0xee, 0xd3, 0x26, 0x78, 0xf7, 0xf6, 0xd7, 0xca, 0x23, 0x37, 0x2b, 0x8f, 0xfc, 0x59, 0x79,
+	0xe4, 0xfb, 0xda, 0x6b, 0xdd, 0xac, 0xbd, 0xd6, 0xef, 0xb5, 0xd7, 0xfa, 0xf8, 0x7c, 0x9e, 0xa9,
+	0xb4, 0x8c, 0xc3, 0x84, 0x7f, 0x19, 0x8a, 0x2c, 0x9f, 0x27, 0x4c, 0x0c, 0x55, 0x96, 0xcc, 0x12,
+	0xe3, 0x9b, 0xc7, 0x47, 0xf5, 0x8f, 0x7d, 0xf5, 0x37, 0x00, 0x00, 0xff, 0xff, 0x6b, 0xcb, 0x75,
+	0xd6, 0x08, 0x04, 0x00, 0x00,
 }
 
 func (m *SubscriptionState) Marshal() (dAtA []byte, err error) {
@@ -385,7 +491,7 @@ func (m *SubscriptionState) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	return len(dAtA) - i, nil
 }
 
-func (m *SubscriptionStates) Marshal() (dAtA []byte, err error) {
+func (m *TableState) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
@@ -395,12 +501,12 @@ func (m *SubscriptionStates) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *SubscriptionStates) MarshalTo(dAtA []byte) (int, error) {
+func (m *TableState) MarshalTo(dAtA []byte) (int, error) {
 	size := m.Size()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
-func (m *SubscriptionStates) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+func (m *TableState) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	i := len(dAtA)
 	_ = i
 	var l int
@@ -442,9 +548,9 @@ func (m *EventStoreState) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if len(m.Subscriptions) > 0 {
-		for k := range m.Subscriptions {
-			v := m.Subscriptions[k]
+	if len(m.TableStates) > 0 {
+		for k := range m.TableStates {
+			v := m.TableStates[k]
 			baseI := i
 			if v != nil {
 				{
@@ -462,6 +568,83 @@ func (m *EventStoreState) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 			i--
 			dAtA[i] = 0x8
 			i = encodeVarintLogservice(dAtA, i, uint64(baseI-i))
+			i--
+			dAtA[i] = 0xa
+		}
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *ChangefeedStateEntry) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *ChangefeedStateEntry) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *ChangefeedStateEntry) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.ResolvedTs != 0 {
+		i = encodeVarintLogservice(dAtA, i, uint64(m.ResolvedTs))
+		i--
+		dAtA[i] = 0x10
+	}
+	if m.ChangefeedID != nil {
+		{
+			size, err := m.ChangefeedID.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = encodeVarintLogservice(dAtA, i, uint64(size))
+		}
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *ChangefeedStates) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *ChangefeedStates) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *ChangefeedStates) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if len(m.States) > 0 {
+		for iNdEx := len(m.States) - 1; iNdEx >= 0; iNdEx-- {
+			{
+				size, err := m.States[iNdEx].MarshalToSizedBuffer(dAtA[:i])
+				if err != nil {
+					return 0, err
+				}
+				i -= size
+				i = encodeVarintLogservice(dAtA, i, uint64(size))
+			}
 			i--
 			dAtA[i] = 0xa
 		}
@@ -598,7 +781,7 @@ func (m *SubscriptionState) Size() (n int) {
 	return n
 }
 
-func (m *SubscriptionStates) Size() (n int) {
+func (m *TableState) Size() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -619,8 +802,8 @@ func (m *EventStoreState) Size() (n int) {
 	}
 	var l int
 	_ = l
-	if len(m.Subscriptions) > 0 {
-		for k, v := range m.Subscriptions {
+	if len(m.TableStates) > 0 {
+		for k, v := range m.TableStates {
 			_ = k
 			_ = v
 			l = 0
@@ -630,6 +813,37 @@ func (m *EventStoreState) Size() (n int) {
 			}
 			mapEntrySize := 1 + sovLogservice(uint64(k)) + l
 			n += mapEntrySize + 1 + sovLogservice(uint64(mapEntrySize))
+		}
+	}
+	return n
+}
+
+func (m *ChangefeedStateEntry) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.ChangefeedID != nil {
+		l = m.ChangefeedID.Size()
+		n += 1 + l + sovLogservice(uint64(l))
+	}
+	if m.ResolvedTs != 0 {
+		n += 1 + sovLogservice(uint64(m.ResolvedTs))
+	}
+	return n
+}
+
+func (m *ChangefeedStates) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.States) > 0 {
+		for _, e := range m.States {
+			l = e.Size()
+			n += 1 + l + sovLogservice(uint64(l))
 		}
 	}
 	return n
@@ -823,7 +1037,7 @@ func (m *SubscriptionState) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *SubscriptionStates) Unmarshal(dAtA []byte) error {
+func (m *TableState) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -846,10 +1060,10 @@ func (m *SubscriptionStates) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: SubscriptionStates: wiretype end group for non-group")
+			return fmt.Errorf("proto: TableState: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: SubscriptionStates: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: TableState: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
@@ -938,7 +1152,7 @@ func (m *EventStoreState) Unmarshal(dAtA []byte) error {
 		switch fieldNum {
 		case 1:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Subscriptions", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field TableStates", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -965,11 +1179,11 @@ func (m *EventStoreState) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.Subscriptions == nil {
-				m.Subscriptions = make(map[int64]*SubscriptionStates)
+			if m.TableStates == nil {
+				m.TableStates = make(map[int64]*TableState)
 			}
 			var mapkey int64
-			var mapvalue *SubscriptionStates
+			var mapvalue *TableState
 			for iNdEx < postIndex {
 				entryPreIndex := iNdEx
 				var wire uint64
@@ -1029,7 +1243,7 @@ func (m *EventStoreState) Unmarshal(dAtA []byte) error {
 					if postmsgIndex > l {
 						return io.ErrUnexpectedEOF
 					}
-					mapvalue = &SubscriptionStates{}
+					mapvalue = &TableState{}
 					if err := mapvalue.Unmarshal(dAtA[iNdEx:postmsgIndex]); err != nil {
 						return err
 					}
@@ -1049,7 +1263,196 @@ func (m *EventStoreState) Unmarshal(dAtA []byte) error {
 					iNdEx += skippy
 				}
 			}
-			m.Subscriptions[mapkey] = mapvalue
+			m.TableStates[mapkey] = mapvalue
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipLogservice(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthLogservice
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *ChangefeedStateEntry) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowLogservice
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: ChangefeedStateEntry: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: ChangefeedStateEntry: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ChangefeedID", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowLogservice
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthLogservice
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthLogservice
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.ChangefeedID == nil {
+				m.ChangefeedID = &heartbeatpb.ChangefeedID{}
+			}
+			if err := m.ChangefeedID.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ResolvedTs", wireType)
+			}
+			m.ResolvedTs = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowLogservice
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ResolvedTs |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipLogservice(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthLogservice
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *ChangefeedStates) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowLogservice
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: ChangefeedStates: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: ChangefeedStates: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field States", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowLogservice
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthLogservice
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthLogservice
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.States = append(m.States, &ChangefeedStateEntry{})
+			if err := m.States[len(m.States)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex

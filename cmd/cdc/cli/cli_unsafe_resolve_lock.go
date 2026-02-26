@@ -32,6 +32,7 @@ type unsafeResolveLockOptions struct {
 
 	regionID uint64
 	ts       uint64
+	keyspace string
 
 	upstreamPDAddrs  string
 	upstreamCaPath   string
@@ -46,8 +47,7 @@ func newUnsafeResolveLockOptions() *unsafeResolveLockOptions {
 }
 
 // complete adapts from the command line args to the data and client required.
-func (o *unsafeResolveLockOptions) complete(f factory.Factory) error {
-	ctx := context.Background()
+func (o *unsafeResolveLockOptions) complete(ctx context.Context, f factory.Factory) error {
 	apiClient, err := f.APIV2Client()
 	if err != nil {
 		return err
@@ -77,8 +77,7 @@ func (o *unsafeResolveLockOptions) complete(f factory.Factory) error {
 }
 
 // run runs the `cli unsafe show-metadata` command.
-func (o *unsafeResolveLockOptions) run() error {
-	ctx := context.Background()
+func (o *unsafeResolveLockOptions) run(ctx context.Context) error {
 	var pdAddrs []string
 	if o.upstreamPDAddrs != "" {
 		pdAddrs = strings.Split(o.upstreamPDAddrs, ",")
@@ -92,7 +91,7 @@ func (o *unsafeResolveLockOptions) run() error {
 			CertPath: o.upstreamCertPath,
 			KeyPath:  o.upstreamKeyPath,
 		},
-	})
+	}, o.keyspace)
 }
 
 // addFlags receives a *cobra.Command reference and binds
@@ -102,6 +101,7 @@ func (o *unsafeResolveLockOptions) addFlags(cmd *cobra.Command) {
 		return
 	}
 
+	cmd.PersistentFlags().StringVarP(&o.keyspace, "keyspace", "k", "", "Replication task (changefeed) Keyspace")
 	cmd.Flags().Uint64Var(&o.regionID, "region", 0, "Region ID")
 	cmd.Flags().Uint64Var(&o.ts, "ts", 0,
 		"resolve locks before the timestamp, default 1 minute ago from now")
@@ -129,9 +129,10 @@ func newCmdResolveLock(f factory.Factory) *cobra.Command {
 		Use:   "resolve-lock",
 		Short: "resolve locks in regions",
 		Args:  cobra.NoArgs,
-		Run: func(_ *cobra.Command, args []string) {
-			util.CheckErr(o.complete(f))
-			util.CheckErr(o.run())
+		Run: func(cmd *cobra.Command, args []string) {
+			ctx := cmd.Context()
+			util.CheckErr(o.complete(ctx, f))
+			util.CheckErr(o.run(ctx))
 		},
 	}
 

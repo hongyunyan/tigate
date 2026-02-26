@@ -16,32 +16,29 @@ package event
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
 
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/pkg/apperror"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"go.uber.org/zap"
 )
 
 const (
-	DDLEventVersion = 0
+	DDLEventVersion1 = 1
 )
+
+var _ Event = &DDLEvent{}
 
 type DDLEvent struct {
 	// Version is the version of the DDLEvent struct.
-	Version      byte                `json:"version"`
+	Version      int                 `json:"version"`
 	DispatcherID common.DispatcherID `json:"-"`
-	Type         byte                `json:"type"`
+	// Type is the type of the DDL.
+	Type byte `json:"type"`
 	// SchemaID is from upstream job.SchemaID
-	SchemaID int64 `json:"schema_id"`
-	// TableID is from upstream job.TableID
-	// TableID means different for different job types:
-	// - for most ddl types which just involve a single table id, it is the table id of the table
-	// - for ExchangeTablePartition, it is the table id of the normal table before exchange
-	//   and it is one of of the partition ids after exchange
-	// - for TruncateTable, it the table ID of the old table
-	TableID    int64  `json:"table_id"`
+	SchemaID   int64  `json:"schema_id"`
 	SchemaName string `json:"schema_name"`
 	TableName  string `json:"table_name"`
 	// the following two fields are just used for RenameTable,
@@ -50,14 +47,25 @@ type DDLEvent struct {
 	ExtraTableName  string            `json:"extra_table_name"`
 	Query           string            `json:"query"`
 	TableInfo       *common.TableInfo `json:"-"`
+	StartTs         uint64            `json:"start_ts"`
 	FinishedTs      uint64            `json:"finished_ts"`
 	// The seq of the event. It is set by event service.
 	Seq uint64 `json:"seq"`
-	// State is the state of sender when sending this event.
-	State              EventSenderState    `json:"state"`
+	// The epoch of the event. It is set by event service.
+	Epoch uint64 `json:"epoch"`
+	// MultipleTableInfos holds information for multiple versions of a table.
+	// The first entry always represents the current table information.
 	MultipleTableInfos []*common.TableInfo `json:"-"`
 
-	BlockedTables     *InfluencedTables `json:"blocked_tables"`
+	BlockedTables *InfluencedTables `json:"blocked_tables"`
+	// BlockedTableNames is used by downstream adapters to get the names of tables that should block this DDL.
+	// It is particularly used for querying the execution status of asynchronous DDLs (e.g., `ADD INDEX`)
+	// that may be running on the table before this DDL.
+	// This field will be set for most `InfluenceTypeNormal` DDLs, except for those creating new tables/schemas or dropping views.
+	// It will be empty for other DDLs.
+	// NOTE: For `RENAME TABLE` / `RENAME TABLES` DDLs, this will be set to the old table names.
+	// For partition DDLs, this will be the parent table name.
+	BlockedTableNames []SchemaTableName `json:"blocked_table_names"`
 	NeedDroppedTables *InfluencedTables `json:"need_dropped_tables"`
 	NeedAddedTables   []Table           `json:"need_added_tables"`
 
@@ -74,13 +82,34 @@ type DDLEvent struct {
 	//   Recover Table
 	TableNameChange *TableNameChange `json:"table_name_change"`
 
-	TiDBOnly bool `json:"tidb_only"`
+	TiDBOnly bool   `json:"tidb_only"`
+	BDRMode  string `json:"bdr_mode"`
+	Err      string `json:"err"`
+
 	// Call when event flush is completed
 	PostTxnFlushed []func() `json:"-"`
 	// eventSize is the size of the event in bytes. It is set when it's unmarshaled.
 	eventSize int64 `json:"-"`
 
-	Err error `json:"-"`
+	// for simple protocol
+	IsBootstrap bool `msg:"-"`
+	// NotSync is used to indicate whether the event should be synced to downstream.
+	// If it is true, sink should not sync this event to downstream.
+	// It is used for some special DDL events that do not need to be synced,
+	// but only need to be sent to dispatcher to update some metadata.
+	// For example, if a `TRUNCATE TABLE` DDL is filtered by event filter,
+	// we don't need to sync it to downstream, but the DML events of the new truncated table
+	// should be sent to downstream.
+	// So we should send the `TRUNCATE TABLE` DDL event to dispatcher,
+	// to ensure the new truncated table can be handled correctly.
+	// If the DDL involves multiple tables, this field is not effective.
+	// The multiple table DDL event will be handled by filtering querys and table infos.
+	NotSync bool `msg:"not_sync"`
+}
+
+func (d *DDLEvent) String() string {
+	return fmt.Sprintf("DDLEvent{Version: %d, DispatcherID: %s, Type: %d, SchemaID: %d, SchemaName: %s, TableName: %s, ExtraSchemaName: %s, ExtraTableName: %s, Query: %s, TableInfo: %v, StartTs: %d, FinishedTs: %d, Seq: %d, BlockedTables: %v, NeedDroppedTables: %v, NeedAddedTables: %v, UpdatedSchemas: %v, TableNameChange: %v, TiDBOnly: %t, BDRMode: %s, Err: %s, eventSize: %d}",
+		d.Version, d.DispatcherID.String(), d.Type, d.SchemaID, d.SchemaName, d.TableName, d.ExtraSchemaName, d.ExtraTableName, d.Query, d.TableInfo, d.StartTs, d.FinishedTs, d.Seq, d.BlockedTables, d.NeedDroppedTables, d.NeedAddedTables, d.UpdatedSchemas, d.TableNameChange, d.TiDBOnly, d.BDRMode, d.Err, d.eventSize)
 }
 
 func (d *DDLEvent) GetType() int {
@@ -92,11 +121,14 @@ func (d *DDLEvent) GetDispatcherID() common.DispatcherID {
 }
 
 func (d *DDLEvent) GetStartTs() common.Ts {
-	return 0
+	return d.StartTs
 }
 
 func (d *DDLEvent) GetError() error {
-	return d.Err
+	if len(d.Err) == 0 {
+		return nil
+	}
+	return errors.New(d.Err)
 }
 
 func (d *DDLEvent) GetCommitTs() common.Ts {
@@ -125,40 +157,19 @@ func (d *DDLEvent) GetExtraTableName() string {
 	return d.ExtraTableName
 }
 
+// GetTableID returns the logic table ID of the event.
+// it returns 0 when there is no tableinfo
+func (d *DDLEvent) GetTableID() int64 {
+	if d.TableInfo != nil {
+		return d.TableInfo.TableName.TableID
+	}
+	return 0
+}
+
 func (d *DDLEvent) GetEvents() []*DDLEvent {
 	// Some ddl event may be multi-events, we need to split it into multiple messages.
 	// Such as rename table test.table1 to test.table10, test.table2 to test.table20
 	switch model.ActionType(d.Type) {
-	case model.ActionExchangeTablePartition:
-		if len(d.MultipleTableInfos) != 2 {
-			log.Panic("multipleTableInfos length should be equal to 2", zap.Any("multipleTableInfos", d.MultipleTableInfos))
-		}
-		return []*DDLEvent{
-			// partition table before exchange
-			{
-				Version: d.Version,
-				Type:    d.Type,
-				// SchemaID:   d.SchemaID,
-				// TableID:    d.TableID,
-				SchemaName: d.SchemaName,
-				TableName:  d.TableName,
-				TableInfo:  d.MultipleTableInfos[0],
-				Query:      d.Query,
-				FinishedTs: d.FinishedTs,
-			},
-			// normal table before exchange(TODO: this may be wrong)
-			{
-				Version: d.Version,
-				Type:    d.Type,
-				// SchemaID:   d.TableInfo.SchemaID,
-				// TableID:    d.TableInfo.TableName.TableID,
-				TableInfo:  d.MultipleTableInfos[1],
-				SchemaName: d.ExtraSchemaName,
-				TableName:  d.ExtraTableName,
-				Query:      d.Query,
-				FinishedTs: d.FinishedTs,
-			},
-		}
 	case model.ActionCreateTables, model.ActionRenameTables:
 		events := make([]*DDLEvent, 0, len(d.MultipleTableInfos))
 		queries, err := SplitQueries(d.Query)
@@ -168,21 +179,27 @@ func (d *DDLEvent) GetEvents() []*DDLEvent {
 		if len(queries) != len(d.MultipleTableInfos) {
 			log.Panic("queries length should be equal to multipleTableInfos length", zap.String("query", d.Query), zap.Any("multipleTableInfos", d.MultipleTableInfos))
 		}
-		if len(d.TableNameChange.DropName) != len(d.MultipleTableInfos) {
-			log.Panic("drop name length should be equal to multipleTableInfos length", zap.Any("query", d.TableNameChange.DropName), zap.Any("multipleTableInfos", d.MultipleTableInfos))
+
+		t := model.ActionCreateTable
+		if model.ActionType(d.Type) == model.ActionRenameTables {
+			t = model.ActionRenameTable
 		}
 		for i, info := range d.MultipleTableInfos {
-			events = append(events, &DDLEvent{
-				Version:         d.Version,
-				Type:            d.Type,
-				SchemaName:      info.GetSchemaName(),
-				TableName:       info.GetTableName(),
-				ExtraSchemaName: d.TableNameChange.DropName[i].SchemaName,
-				ExtraTableName:  d.TableNameChange.DropName[i].TableName,
-				TableInfo:       info,
-				Query:           queries[i],
-				FinishedTs:      d.FinishedTs,
-			})
+			event := &DDLEvent{
+				Version:    d.Version,
+				Type:       byte(t),
+				SchemaName: info.GetSchemaName(),
+				TableName:  info.GetTableName(),
+				TableInfo:  info,
+				Query:      queries[i],
+				StartTs:    d.StartTs,
+				FinishedTs: d.FinishedTs,
+			}
+			if model.ActionType(d.Type) == model.ActionRenameTables {
+				event.ExtraSchemaName = d.TableNameChange.DropName[i].SchemaName
+				event.ExtraTableName = d.TableNameChange.DropName[i].TableName
+			}
+			events = append(events, event)
 		}
 		return events
 	default:
@@ -192,6 +209,10 @@ func (d *DDLEvent) GetEvents() []*DDLEvent {
 
 func (d *DDLEvent) GetSeq() uint64 {
 	return d.Seq
+}
+
+func (d *DDLEvent) GetEpoch() uint64 {
+	return d.Epoch
 }
 
 func (d *DDLEvent) ClearPostFlushFunc() {
@@ -208,6 +229,10 @@ func (d *DDLEvent) PushFrontFlushFunc(f func()) {
 
 func (e *DDLEvent) GetBlockedTables() *InfluencedTables {
 	return e.BlockedTables
+}
+
+func (e *DDLEvent) GetBlockedTableNames() []SchemaTableName {
+	return e.BlockedTableNames
 }
 
 func (e *DDLEvent) GetNeedDroppedTables() *InfluencedTables {
@@ -230,23 +255,55 @@ func (e *DDLEvent) GetDDLQuery() string {
 	return e.Query
 }
 
-func (e *DDLEvent) GetDDLSchemaName() string {
-	if e == nil {
-		return "" // 要报错的
-	}
-	return e.SchemaName
-}
-
 func (e *DDLEvent) GetDDLType() model.ActionType {
 	return model.ActionType(e.Type)
 }
 
-func (t DDLEvent) Marshal() ([]byte, error) {
-	// restData | dispatcherIDData | dispatcherIDDataSize | tableInfoData | tableInfoDataSize | multipleTableInfos | multipletableInfosDataSize |errorData | errorDataSize
+func (t *DDLEvent) Marshal() ([]byte, error) {
+	// 1. Encode payload based on version
+	var payload []byte
+	var err error
+	switch t.Version {
+	case DDLEventVersion1:
+		payload, err = t.encodeV1()
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unsupported DDLEvent version: %d", t.Version)
+	}
+
+	// 2. Use unified header format
+	return MarshalEventWithHeader(TypeDDLEvent, t.Version, payload)
+}
+
+func (t *DDLEvent) Unmarshal(data []byte) error {
+	// 1. Validate header and extract payload
+	payload, version, err := ValidateAndExtractPayload(data, TypeDDLEvent)
+	if err != nil {
+		return err
+	}
+
+	// 2. Store version
+	t.Version = version
+
+	// 3. Decode based on version
+	switch version {
+	case DDLEventVersion1:
+		return t.decodeV1(payload)
+	default:
+		return fmt.Errorf("unsupported DDLEvent version: %d", version)
+	}
+}
+
+func (t DDLEvent) encodeV1() ([]byte, error) {
+	// restData | dispatcherIDData | dispatcherIDDataSize | tableInfoData | tableInfoDataSize | multipleTableInfos | multipletableInfosDataSize
+	// Note: version is now handled in the header by Marshal(), not here
 	data, err := json.Marshal(t)
 	if err != nil {
 		return nil, err
 	}
+
 	dispatcherIDData := t.DispatcherID.Marshal()
 	dispatcherIDDataSize := make([]byte, 8)
 	binary.BigEndian.PutUint64(dispatcherIDDataSize, uint64(len(dispatcherIDData)))
@@ -278,36 +335,20 @@ func (t DDLEvent) Marshal() ([]byte, error) {
 		data = append(data, tableInfoData...)
 		data = append(data, tableInfoDataSize...)
 	}
-	multipletableInfosDataSize := make([]byte, 8)
-	binary.BigEndian.PutUint64(multipletableInfosDataSize, uint64(len(t.MultipleTableInfos)))
-	data = append(data, multipletableInfosDataSize...)
+	multipleTableInfosDataSize := make([]byte, 8)
+	binary.BigEndian.PutUint64(multipleTableInfosDataSize, uint64(len(t.MultipleTableInfos)))
+	data = append(data, multipleTableInfosDataSize...)
 
-	if t.Err != nil {
-		errData := []byte(t.Err.Error())
-		errDataSize := make([]byte, 8)
-		binary.BigEndian.PutUint64(errDataSize, uint64(len(errData)))
-		data = append(data, errData...)
-		data = append(data, errDataSize...)
-	} else {
-		errDataSize := make([]byte, 8)
-		binary.BigEndian.PutUint64(errDataSize, 0)
-		data = append(data, errDataSize...)
-	}
 	return data, nil
 }
 
-func (t *DDLEvent) Unmarshal(data []byte) error {
-	// restData | dispatcherIDData | dispatcherIDDataSize | tableInfoData | tableInfoDataSize | multipleTableInfos | multipletableInfosDataSize | errorData | errorDataSize
+func (t *DDLEvent) decodeV1(data []byte) error {
+	// restData | dispatcherIDData | dispatcherIDDataSize | tableInfoData | tableInfoDataSize | multipleTableInfos | multipleTableInfosDataSize
 	t.eventSize = int64(len(data))
-	errorDataSize := binary.BigEndian.Uint64(data[len(data)-8:])
-	if errorDataSize > 0 {
-		errorData := data[len(data)-8-int(errorDataSize) : len(data)-8]
-		log.Info("errorData", zap.String("errorData", string(errorData)))
-		t.Err = apperror.ErrDDLEventError.FastGen(string(errorData))
-	}
-	end := len(data) - 8 - int(errorDataSize)
-	multipletableInfosDataSize := binary.BigEndian.Uint64(data[end-8 : end])
-	for i := 0; i < int(multipletableInfosDataSize); i++ {
+
+	end := len(data)
+	multipleTableInfosDataSize := binary.BigEndian.Uint64(data[end-8 : end])
+	for i := 0; i < int(multipleTableInfosDataSize); i++ {
 		tableInfoDataSize := binary.BigEndian.Uint64(data[end-8 : end])
 		tableInfoData := data[end-8-int(tableInfoDataSize) : end-8]
 		info, err := common.UnmarshalJSONToTableInfo(tableInfoData)
@@ -317,7 +358,7 @@ func (t *DDLEvent) Unmarshal(data []byte) error {
 		t.MultipleTableInfos = append(t.MultipleTableInfos, info)
 		end -= 8 + int(tableInfoDataSize)
 	}
-	end -= 8 + int(multipletableInfosDataSize)
+	end -= 8 + int(multipleTableInfosDataSize)
 	tableInfoDataSize := binary.BigEndian.Uint64(data[end-8 : end])
 	var err error
 	if tableInfoDataSize > 0 {
@@ -338,6 +379,14 @@ func (t *DDLEvent) Unmarshal(data []byte) error {
 	if err != nil {
 		return err
 	}
+
+	for _, info := range t.MultipleTableInfos {
+		info.InitPrivateFields()
+	}
+	if t.TableInfo != nil {
+		t.TableInfo.InitPrivateFields()
+	}
+
 	return nil
 }
 
@@ -346,16 +395,11 @@ func (t *DDLEvent) GetSize() int64 {
 }
 
 func (t *DDLEvent) IsPaused() bool {
-	return t.State.IsPaused()
+	return false
 }
 
 func (t *DDLEvent) Len() int32 {
 	return 1
-}
-
-type SchemaTableName struct {
-	SchemaName string
-	TableName  string
 }
 
 type DB struct {

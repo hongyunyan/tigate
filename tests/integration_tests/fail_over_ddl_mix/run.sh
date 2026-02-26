@@ -14,6 +14,7 @@ set -eu
 
 CUR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source $CUR/../_utils/test_prepare
+source $CUR/../_utils/execute_mixed_dml
 WORK_DIR=$OUT_DIR/$TEST_NAME
 CDC_BINARY=cdc.test
 SINK_TYPE=$1
@@ -24,8 +25,6 @@ function prepare() {
 
 	start_tidb_cluster --workdir $WORK_DIR
 
-	cd $WORK_DIR
-
 	# record tso before we create tables to skip the system table DDLs
 	start_ts=$(run_cdc_cli_tso_query ${UP_PD_HOST_1} ${UP_PD_PORT_1})
 
@@ -34,17 +33,46 @@ function prepare() {
 
 	TOPIC_NAME="ticdc-failover-ddl-test-mix-$RANDOM"
 	SINK_URI="mysql://root@127.0.0.1:3306/"
-	run_cdc_cli changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI" -c "test"
+
+	case $SINK_TYPE in
+	kafka) SINK_URI="kafka://127.0.0.1:9092/$TOPIC_NAME?protocol=open-protocol&partition-num=3" ;;
+	storage) SINK_URI="file://$WORK_DIR/storage_test/$TOPIC_NAME?protocol=canal-json&enable-tidb-extension=true" ;;
+	pulsar)
+		run_pulsar_cluster $WORK_DIR normal
+		SINK_URI="pulsar://127.0.0.1:6650/$TOPIC_NAME?protocol=canal-json&enable-tidb-extension=true"
+		;;
+	*) SINK_URI="mysql://normal:123456@127.0.0.1:3306/" ;;
+	esac
+	do_retry 5 3 cdc_cli_changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI" -c "test" --config="$CUR/conf/$1.toml"
+	case $SINK_TYPE in
+	kafka) run_kafka_consumer $WORK_DIR $SINK_URI ;;
+	storage) run_storage_consumer $WORK_DIR $SINK_URI "" "" ;;
+	pulsar) run_pulsar_consumer --upstream-uri $SINK_URI ;;
+	esac
 }
 
 function create_tables() {
+	## normal tables
 	for i in {1..5}; do
 		echo "Creating table table_$i..."
 		run_sql "CREATE TABLE IF NOT EXISTS test.table_$i (id INT AUTO_INCREMENT PRIMARY KEY, data VARCHAR(255));" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 	done
+
+	## partition tables
+	# for i in {6..10}; do
+	# 	echo "Creating partition table_$i..."
+	# 	run_sql "CREATE TABLE IF NOT EXISTS test.table_$i (
+	# 		id INT AUTO_INCREMENT PRIMARY KEY,
+	# 		data VARCHAR(255)
+	# 	)
+	# 	PARTITION BY RANGE (id) (
+	# 		PARTITION p0 VALUES LESS THAN (200),
+	# 		PARTITION p1 VALUES LESS THAN (1000),
+	# 		PARTITION p2 VALUES LESS THAN MAXVALUE);" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+	# done
 }
 
-function execute_ddl() {
+function execute_ddl_for_normal_tables() {
 	while true; do
 		table_num=$((RANDOM % 5 + 1))
 		table_name="table_$table_num"
@@ -72,35 +100,78 @@ function execute_ddl() {
 	done
 }
 
+# TODO: support partition test after support
+function execute_ddl_for_partition_tables() {
+	while true; do
+		table_num=$((RANDOM % 5 + 6))
+		table_name="table_$table_num"
+
+		case $((RANDOM % 4)) in
+		0)
+			echo "DDL: Dropping And creating partition $table_name..."
+			run_sql "ALTER TABLE test.$table_name DROP PARTITION p2;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+			sleep 0.5
+			run_sql "ALTER TABLE test.$table_name ADD PARTITION (PARTITION p2 VALUES LESS THAN MAXVALUE);" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+			;;
+		1)
+			echo "DDL: Truncating partition $table_name..."
+			run_sql "ALTER TABLE test.$table_name TRUNCATE PARTITION p0;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+			run_sql "ALTER TABLE test.$table_name TRUNCATE PARTITION p1;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+			run_sql "ALTER TABLE test.$table_name TRUNCATE PARTITION p2;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+			;;
+		2)
+			echo "DDL: Removing and do partition $table_name..."
+			run_sql "ALTER TABLE test.$table_name REMOVE PARTITIONING;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+			sleep 0.5
+			run_sql "ALTER TABLE test.$table_name PARTITION BY RANGE (id) (
+				PARTITION p0 VALUES LESS THAN (200),
+				PARTITION p1 VALUES LESS THAN (500),
+				PARTITION p2 VALUES LESS THAN MAXVALUE);" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+			;;
+		3)
+			echo "DDL: Exchange Partition With normal Table $table_name..."
+			exchange_table=$((RANDOM % 5 + 1))
+			exchange_table_name="table_$exchange_table"
+			run_sql_ignore_error "ALTER TABLE test.$table_name EXCHANGE PARTITION p0 with table test.$exchange_table_name" ${UP_TIDB_HOST} ${UP_TIDB_PORT} || true
+			echo "Exchange Partition Finished"
+			;;
+		4)
+			echo "DDL: REORGANIZE partition $table_name..."
+			run_sql "ALTER TABLE test.$table_name REORGANIZE PARTITION p0 INTO (PARTITION p00 VALUES LESS THAN (50), PARTITION p01 VALUES LESS THAN (100), PARTITION p02 VALUES LESS THAN (200))" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+			sleep 0.5
+			run_sql "ALTER TABLE test.$table_name REORGANIZE PARTITION p00, p01, p02 INTO (PARTITION p0 VALUES LESS THAN (200))" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+			;;
+		esac
+		sleep 1
+	done
+}
+
 function execute_dml() {
 	table_name="table_$1"
-	echo "DML: Inserting data into $table_name..."
-	while true; do
-		run_sql_ignore_error "INSERT INTO test.$table_name (data) VALUES ('$(date +%s)');" ${UP_TIDB_HOST} ${UP_TIDB_PORT} || true
-	done
+	execute_mixed_dml "$table_name" "${UP_TIDB_HOST}" "${UP_TIDB_PORT}"
 }
 
 function kill_server() {
 	for count in {1..10}; do
 		case $((RANDOM % 2)) in
 		0)
-			cdc_pid_1=$(ps aux | grep cdc | grep 8300 | awk '{print $2}')
+			cdc_pid_1=$(get_cdc_pid 127.0.0.1 8300)
 			if [ -z "$cdc_pid_1" ]; then
 				continue
 			fi
-			kill -9 $cdc_pid_1
+			kill_cdc_pid $cdc_pid_1
 
-			sleep 5
+			sleep 15
 			run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "0-$count" --addr "127.0.0.1:8300"
 			;;
 		1)
-			cdc_pid_2=$(ps aux | grep cdc | grep 8301 | awk '{print $2}')
+			cdc_pid_2=$(get_cdc_pid 127.0.0.1 8301)
 			if [ -z "$cdc_pid_2" ]; then
 				continue
 			fi
-			kill -9 $cdc_pid_2
+			kill_cdc_pid $cdc_pid_2
 
-			sleep 5
+			sleep 15
 			run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "1-$count" --addr "127.0.0.1:8301"
 			;;
 		esac
@@ -109,13 +180,14 @@ function kill_server() {
 }
 
 main() {
-	prepare
+	prepare changefeed
 
 	create_tables
-	execute_ddl &
-	DDL_PID=$!
+	execute_ddl_for_normal_tables &
+	NORMAL_TABLE_DDL_PID=$!
+	# execute_ddl_for_partition_tables &
+	# PARTITION_TABLE_DDL_PID=$!
 
-	# 启动 DML 线程
 	execute_dml 1 &
 	DML_PID_1=$!
 	execute_dml 2 &
@@ -126,21 +198,114 @@ main() {
 	DML_PID_4=$!
 	execute_dml 5 &
 	DML_PID_5=$!
+	# execute_dml 6 &
+	# DML_PID_6=$!
+	# execute_dml 7 &
+	# DML_PID_7=$!
+	# execute_dml 8 &
+	# DML_PID_8=$!
+	# execute_dml 9 &
+	# DML_PID_9=$!
+	# execute_dml 10 &
+	# DML_PID_10=$!
 
 	kill_server
 
 	sleep 10
 
-	kill -9 $DDL_PID $DML_PID_1 $DML_PID_2 $DML_PID_3 $DML_PID_4 $DML_PID_5
+	# kill -9 $NORMAL_TABLE_DDL_PID $PARTITION_TABLE_DDL_PID $DML_PID_1 $DML_PID_2 $DML_PID_3 $DML_PID_4 $DML_PID_5 $DML_PID_6 $DML_PID_7 $DML_PID_8 $DML_PID_9 $DML_PID_10
+	kill -9 $NORMAL_TABLE_DDL_PID $DML_PID_1 $DML_PID_2 $DML_PID_3 $DML_PID_4 $DML_PID_5
 
-	sleep 10
+	sleep 30
 
 	check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml 500
+
+	checkpoint1=$(cdc_cli_changefeed query -c "test" 2>&1 | grep -v "Command to ticdc" | jq '.checkpoint_tso')
+	for _ in $(seq 1 6); do
+		sleep 10
+		checkpoint2=$(cdc_cli_changefeed query -c "test" 2>&1 | grep -v "Command to ticdc" | jq '.checkpoint_tso')
+		if [[ "$checkpoint1" -ne "$checkpoint2" ]]; then
+			break
+		fi
+	done
+
+	if [[ "$checkpoint1" -eq "$checkpoint2" ]]; then
+		echo "checkpoint is not changed"
+		exit 1
+	fi
 
 	cleanup_process $CDC_BINARY
 }
 
-trap stop_tidb_cluster EXIT
+main_with_consistent() {
+	if [ "$SINK_TYPE" != "mysql" ]; then
+		return
+	fi
+	prepare consistent_changefeed
+
+	create_tables
+	execute_ddl_for_normal_tables &
+	NORMAL_TABLE_DDL_PID=$!
+	# execute_ddl_for_partition_tables &
+	# PARTITION_TABLE_DDL_PID=$!
+
+	execute_dml 1 &
+	DML_PID_1=$!
+	execute_dml 2 &
+	DML_PID_2=$!
+	execute_dml 3 &
+	DML_PID_3=$!
+	execute_dml 4 &
+	DML_PID_4=$!
+	execute_dml 5 &
+	DML_PID_5=$!
+	# execute_dml 6 &
+	# DML_PID_6=$!
+	# execute_dml 7 &
+	# DML_PID_7=$!
+	# execute_dml 8 &
+	# DML_PID_8=$!
+	# execute_dml 9 &
+	# DML_PID_9=$!
+	# execute_dml 10 &
+	# DML_PID_10=$!
+
+	kill_server
+
+	sleep 10
+
+	# kill -9 $NORMAL_TABLE_DDL_PID $PARTITION_TABLE_DDL_PID $DML_PID_1 $DML_PID_2 $DML_PID_3 $DML_PID_4 $DML_PID_5 $DML_PID_6 $DML_PID_7 $DML_PID_8 $DML_PID_9 $DML_PID_10
+	kill -9 $NORMAL_TABLE_DDL_PID $DML_PID_1 $DML_PID_2 $DML_PID_3 $DML_PID_4 $DML_PID_5
+	# to ensure row changed events have been replicated to TiCDC
+	sleep 60
+
+	if ((RANDOM % 2)); then
+		# For rename table, modify column ddl, drop column, drop index and drop table ddl, the struct of table is wrong when appling snapshot.
+		# see https://github.com/pingcap/tidb/issues/63464.
+		# So we can't check sync_diff with snapshot.
+		changefeed_id="test"
+		storage_path="file://$WORK_DIR/redo"
+		tmp_download_path=$WORK_DIR/cdc_data/redo/$changefeed_id
+		current_tso=$(run_cdc_cli_tso_query $UP_PD_HOST_1 $UP_PD_PORT_1)
+		ensure 50 check_redo_resolved_ts $changefeed_id $current_tso $storage_path $tmp_download_path/meta
+		cleanup_process $CDC_BINARY
+
+		cdc redo apply --log-level debug --tmp-dir="$tmp_download_path/apply" \
+			--storage="$storage_path" \
+			--sink-uri="mysql://normal:123456@127.0.0.1:3306/" >$WORK_DIR/cdc_redo.log
+		check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml 300
+	else
+		sleep 30
+		check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml 1000
+		cleanup_process $CDC_BINARY
+	fi
+}
+
+trap 'stop_test $WORK_DIR' EXIT
 main
 check_logs $WORK_DIR
 echo "[$(date)] <<<<<< run test case $TEST_NAME success! >>>>>>"
+stop_tidb_cluster
+main_with_consistent
+check_logs $WORK_DIR
+echo "[$(date)] <<<<<< run consistent test case $TEST_NAME success! >>>>>>"

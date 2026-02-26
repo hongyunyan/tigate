@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"sync"
 
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/pkg/common"
@@ -25,8 +26,6 @@ import (
 	"github.com/pingcap/ticdc/pkg/messaging"
 	"github.com/pingcap/ticdc/pkg/node"
 	"github.com/pingcap/ticdc/pkg/scheduler/replica"
-	"github.com/pingcap/tiflow/cdc/model"
-	"github.com/pingcap/tiflow/pkg/sink"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
@@ -44,7 +43,8 @@ type Changefeed struct {
 
 	configBytes []byte
 	// it's saved to the backend db
-	lastSavedCheckpointTs *atomic.Uint64
+	lastSavedCheckpointTs    *atomic.Uint64
+	logCoordinatorResolvedTs *atomic.Uint64
 	// the heartbeatpb.MaintainerStatus is read only
 	status *atomic.Pointer[heartbeatpb.MaintainerStatus]
 
@@ -59,8 +59,8 @@ func NewChangefeed(cfID common.ChangeFeedID,
 ) *Changefeed {
 	uri, err := url.Parse(info.SinkURI)
 	if err != nil {
-		log.Panic("unable to marshal changefeed config",
-			zap.Error(err))
+		log.Panic("unable to parse sink-uri",
+			zap.String("url", info.SinkURI), zap.Error(err))
 	}
 	bytes, err := json.Marshal(info)
 	if err != nil {
@@ -69,12 +69,13 @@ func NewChangefeed(cfID common.ChangeFeedID,
 	}
 
 	res := &Changefeed{
-		ID:                    cfID,
-		info:                  atomic.NewPointer(info),
-		configBytes:           bytes,
-		lastSavedCheckpointTs: atomic.NewUint64(checkpointTs),
-		sinkType:              getSinkType(uri.Scheme),
-		isNew:                 isNew,
+		ID:                       cfID,
+		info:                     atomic.NewPointer(info),
+		configBytes:              bytes,
+		lastSavedCheckpointTs:    atomic.NewUint64(checkpointTs),
+		logCoordinatorResolvedTs: atomic.NewUint64(checkpointTs),
+		sinkType:                 getSinkType(uri.Scheme),
+		isNew:                    isNew,
 		// Initialize the status
 		status: atomic.NewPointer(
 			&heartbeatpb.MaintainerStatus{
@@ -85,7 +86,7 @@ func NewChangefeed(cfID common.ChangeFeedID,
 		backoff: NewBackoff(cfID, *info.Config.ChangefeedErrorStuckDuration, checkpointTs),
 	}
 	// Must set retrying to true when the changefeed is in warning state.
-	if info.State == model.StateWarning {
+	if info.State == config.StateWarning {
 		res.backoff.retrying.Store(true)
 	}
 
@@ -125,6 +126,13 @@ func (c *Changefeed) GetID() common.ChangeFeedID {
 	return c.ID
 }
 
+func (c *Changefeed) GetKeyspaceID() uint32 {
+	if c == nil {
+		return 0
+	}
+	return c.GetInfo().KeyspaceID
+}
+
 func (c *Changefeed) GetGroupID() replica.GroupID {
 	// currently we only have one scheduler group for changefeed
 	return replica.DefaultGroupID
@@ -138,8 +146,11 @@ func (c *Changefeed) ShouldRun() bool {
 // It returns true if the status is changed
 // It returns false if the status is not changed
 // It returns the new state and error if the status is changed
-func (c *Changefeed) UpdateStatus(newStatus *heartbeatpb.MaintainerStatus) (bool, model.FeedState, *heartbeatpb.RunningError) {
+func (c *Changefeed) UpdateStatus(newStatus *heartbeatpb.MaintainerStatus) (bool, config.FeedState, *heartbeatpb.RunningError) {
 	old := c.status.Load()
+	failpoint.Inject("CoordinatorDontUpdateChangefeedCheckpoint", func() {
+		newStatus.CheckpointTs = old.CheckpointTs
+	})
 
 	if newStatus != nil && newStatus.CheckpointTs >= old.CheckpointTs {
 		c.status.Store(newStatus)
@@ -147,28 +158,46 @@ func (c *Changefeed) UpdateStatus(newStatus *heartbeatpb.MaintainerStatus) (bool
 			log.Info("Received changefeed status with bootstrapDone",
 				zap.Stringer("changefeed", c.ID),
 				zap.Bool("bootstrapDone", newStatus.BootstrapDone))
-			return true, model.StateNormal, nil
+			return true, config.StateNormal, nil
 		}
 
 		info := c.GetInfo()
 		// the changefeed reaches the targetTs
 		if info.TargetTs != 0 && newStatus.CheckpointTs >= info.TargetTs {
-			return true, model.StateFinished, nil
+			return true, config.StateFinished, nil
 		}
 
 		return c.backoff.CheckStatus(newStatus)
 	}
 
-	return false, model.StateNormal, nil
+	return false, config.StateNormal, nil
 }
 
-func (c *Changefeed) ForceUpdateStatus(newStatus *heartbeatpb.MaintainerStatus) (bool, model.FeedState, *heartbeatpb.RunningError) {
+func (c *Changefeed) GetLogCoordinatorResolvedTs() uint64 {
+	return c.logCoordinatorResolvedTs.Load()
+}
+
+func (c *Changefeed) SetLogCoordinatorResolvedTs(logCoordinatorResolvedTs uint64) {
+	c.logCoordinatorResolvedTs.Store(logCoordinatorResolvedTs)
+}
+
+func (c *Changefeed) ForceUpdateStatus(newStatus *heartbeatpb.MaintainerStatus) (bool, config.FeedState, *heartbeatpb.RunningError) {
 	c.status.Store(newStatus)
 	return c.backoff.CheckStatus(newStatus)
 }
 
 func (c *Changefeed) NeedCheckpointTsMessage() bool {
-	return c.sinkType == common.KafkaSinkType || c.sinkType == common.CloudStorageSinkType
+	switch c.sinkType {
+	case common.KafkaSinkType, common.PulsarSinkType, common.CloudStorageSinkType, common.BlackHoleSinkType:
+		return true
+	case common.MysqlSinkType:
+		info := c.GetInfo()
+		if info == nil || info.Config == nil || info.Config.EnableActiveActive == nil {
+			return false
+		}
+		return *info.Config.EnableActiveActive
+	}
+	return false
 }
 
 func (c *Changefeed) SetIsNew(isNew bool) {
@@ -181,8 +210,8 @@ func (c *Changefeed) GetStatus() *heartbeatpb.MaintainerStatus {
 	return c.status.Load()
 }
 
-// GetClonedStatus returns a deep copy of the changefeed status
-func (c *Changefeed) GetClonedStatus() *heartbeatpb.MaintainerStatus {
+// GetStatusForResume returns a deep copy of the changefeed status without errors.
+func (c *Changefeed) GetStatusForResume() *heartbeatpb.MaintainerStatus {
 	status := c.status.Load()
 	if status == nil {
 		return nil
@@ -192,25 +221,17 @@ func (c *Changefeed) GetClonedStatus() *heartbeatpb.MaintainerStatus {
 		CheckpointTs: status.CheckpointTs,
 		FeedState:    status.FeedState,
 		State:        status.State,
-		Err:          make([]*heartbeatpb.RunningError, 0, len(status.Err)),
-	}
-	for _, err := range status.Err {
-		clonedErr := &heartbeatpb.RunningError{
-			Time:    err.Time,
-			Node:    err.Node,
-			Code:    err.Code,
-			Message: err.Message,
-		}
-		clone.Err = append(clone.Err, clonedErr)
+		// we don't clone the errors from status, because the old error is meaningless for the resume action, but only blocks.
+		Err: []*heartbeatpb.RunningError{},
 	}
 
 	cfID := status.ChangefeedID
 	if cfID != nil {
 		clone.ChangefeedID = &heartbeatpb.ChangefeedID{
-			High:      cfID.High,
-			Low:       cfID.Low,
-			Name:      cfID.Name,
-			Namespace: cfID.Namespace,
+			High:     cfID.High,
+			Low:      cfID.Low,
+			Name:     cfID.Name,
+			Keyspace: cfID.Keyspace,
 		}
 	}
 
@@ -233,15 +254,16 @@ func (c *Changefeed) NewAddMaintainerMessage(server node.ID) *messaging.TargetMe
 			CheckpointTs:    c.GetStatus().CheckpointTs,
 			Config:          c.configBytes,
 			IsNewChangefeed: c.isNew,
+			KeyspaceId:      c.GetKeyspaceID(),
 		})
 }
 
-func (c *Changefeed) NewRemoveMaintainerMessage(server node.ID, caseCade, removed bool) *messaging.TargetMessage {
-	return RemoveMaintainerMessage(c.ID, server, caseCade, removed)
+func (c *Changefeed) NewRemoveMaintainerMessage(server node.ID, casCade, removed bool) *messaging.TargetMessage {
+	return RemoveMaintainerMessage(c.GetKeyspaceID(), c.ID, server, casCade, removed)
 }
 
 func (c *Changefeed) NewCheckpointTsMessage(ts uint64) *messaging.TargetMessage {
-	return messaging.NewSingleTargetMessage(c.nodeID,
+	return messaging.NewSingleTargetMessage(c.GetNodeID(),
 		messaging.MaintainerManagerTopic,
 		&heartbeatpb.CheckpointTsMessage{
 			ChangefeedID: c.ID.ToPB(),
@@ -249,26 +271,27 @@ func (c *Changefeed) NewCheckpointTsMessage(ts uint64) *messaging.TargetMessage 
 		})
 }
 
-func RemoveMaintainerMessage(id common.ChangeFeedID, server node.ID, caseCade bool, removed bool) *messaging.TargetMessage {
-	caseCade = caseCade || removed
+func RemoveMaintainerMessage(keyspaceID uint32, id common.ChangeFeedID, server node.ID, casCade bool, removed bool) *messaging.TargetMessage {
+	casCade = casCade || removed
 	return messaging.NewSingleTargetMessage(server,
 		messaging.MaintainerManagerTopic,
 		&heartbeatpb.RemoveMaintainerRequest{
-			Id:      id.ToPB(),
-			Cascade: caseCade,
-			Removed: removed,
+			Id:         id.ToPB(),
+			Cascade:    casCade,
+			Removed:    removed,
+			KeyspaceId: keyspaceID,
 		})
 }
 
 // getSinkType returns the sink type of the url.
 func getSinkType(scheme string) common.SinkType {
-	if sink.IsMySQLCompatibleScheme(scheme) {
+	if config.IsMySQLCompatibleScheme(scheme) {
 		return common.MysqlSinkType
 	}
-	if sink.IsMQScheme(scheme) {
+	if config.IsMQScheme(scheme) {
 		return common.KafkaSinkType
 	}
-	if sink.IsStorageScheme(scheme) {
+	if config.IsStorageScheme(scheme) {
 		return common.CloudStorageSinkType
 	}
 	return common.BlackHoleSinkType

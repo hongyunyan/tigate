@@ -16,51 +16,81 @@ package operator
 import (
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/maintainer/replica"
+	"github.com/pingcap/ticdc/maintainer/span"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/messaging"
 	"github.com/pingcap/ticdc/pkg/node"
 	"go.uber.org/zap"
 )
 
-// SplitDispatcherOperator is an operator to remove a table span from a dispatcher
-// and then added some new spans to the replication db
+// SplitDispatcherOperator support two kinds of split operator:
+// 1. just split the span to some new spans. It does not determine in which node the new span will be stored.
+// 2. split the span to some new spans, and still store the span in the origin node.
+//
+// The first kind of split operator is used when splited span when it exceed the threshold and split table span when the changefeed created.
+// The second kind of split operator is used in the split balance scheduler, to split table for more balanced traffic.
+//
+// State transitions:
+//   - Start(): mark the origin span as scheduling.
+//   - Schedule(): keep sending remove requests to the origin node.
+//   - Check(origin, non-working): record a safe checkpointTs and mark finished.
+//   - OnNodeRemove(origin) / OnTaskRemoved(): abort the split and mark the original span absent in PostFinish.
+//   - PostFinish(): if not aborted, replace the original span with new spans and optionally invoke postFinish
+//     to schedule newly created spans.
 type SplitDispatcherOperator struct {
-	db            *replica.ReplicationDB
-	replicaSet    *replica.SpanReplication
-	originNode    node.ID
-	splitSpans    []*heartbeatpb.TableSpan
-	checkpointTs  uint64
-	splitSpanInfo string
+	spanController *span.Controller
+	replicaSet     *replica.SpanReplication
+	originNode     node.ID
 
-	finished atomic.Bool
+	splitSpans       []*heartbeatpb.TableSpan
+	splitSpanInfo    string
+	splitTargetNodes []node.ID
+	// postFinish is invoked for each newly created span after ReplaceReplicaSet. It is mainly used by
+	// the split-balance scheduler to schedule the new spans to specific nodes.
+	// Note: when postFinish is not nil, splitTargetNodes is expected to be aligned with splitSpans.
+	postFinish func(span *replica.SpanReplication, node node.ID) bool
+
+	checkpointTs uint64
+	finished     atomic.Bool
+	// removed indicates the split is aborted and PostFinish should not execute ReplaceReplicaSet.
+	// It can be set by OnNodeRemove(origin) or OnTaskRemoved().
+	removed atomic.Bool
 
 	lck sync.Mutex
+
+	sendThrottler sendThrottler
 }
 
 // NewSplitDispatcherOperator creates a new SplitDispatcherOperator
-func NewSplitDispatcherOperator(db *replica.ReplicationDB,
+func NewSplitDispatcherOperator(
+	spanController *span.Controller,
 	replicaSet *replica.SpanReplication,
-	originNode node.ID,
 	splitSpans []*heartbeatpb.TableSpan,
+	splitTargetNodes []node.ID,
+	postFinish func(span *replica.SpanReplication, node node.ID) bool,
 ) *SplitDispatcherOperator {
-	spansInfo := ""
+	var spansInfo strings.Builder
 	for _, span := range splitSpans {
-		spansInfo += fmt.Sprintf("[%s,%s]",
-			hex.EncodeToString(span.StartKey), hex.EncodeToString(span.EndKey))
+		spansInfo.WriteString(fmt.Sprintf("[%s,%s]",
+			hex.EncodeToString(span.StartKey), hex.EncodeToString(span.EndKey)))
 	}
 	op := &SplitDispatcherOperator{
-		replicaSet:    replicaSet,
-		originNode:    originNode,
-		splitSpans:    splitSpans,
-		checkpointTs:  replicaSet.GetStatus().GetCheckpointTs(),
-		db:            db,
-		splitSpanInfo: spansInfo,
+		replicaSet:       replicaSet,
+		originNode:       replicaSet.GetNodeID(),
+		splitSpans:       splitSpans,
+		checkpointTs:     replicaSet.GetStatus().GetCheckpointTs(),
+		spanController:   spanController,
+		splitSpanInfo:    spansInfo.String(),
+		splitTargetNodes: splitTargetNodes,
+		postFinish:       postFinish,
+		sendThrottler:    newSendThrottler(),
 	}
 	return op
 }
@@ -69,7 +99,7 @@ func (m *SplitDispatcherOperator) Start() {
 	m.lck.Lock()
 	defer m.lck.Unlock()
 
-	m.db.MarkSpanScheduling(m.replicaSet)
+	m.spanController.MarkSpanScheduling(m.replicaSet)
 }
 
 func (m *SplitDispatcherOperator) OnNodeRemove(n node.ID) {
@@ -80,6 +110,7 @@ func (m *SplitDispatcherOperator) OnNodeRemove(n node.ID) {
 		log.Info("origin node is removed",
 			zap.String("replicaSet", m.replicaSet.ID.String()))
 		m.finished.Store(true)
+		m.removed.Store(true)
 	}
 }
 
@@ -107,12 +138,16 @@ func (m *SplitDispatcherOperator) Check(from node.ID, status *heartbeatpb.TableS
 		log.Info("replica set removed from origin node",
 			zap.Uint64("checkpointTs", m.checkpointTs),
 			zap.String("replicaSet", m.replicaSet.ID.String()))
+
 		m.finished.Store(true)
 	}
 }
 
 func (m *SplitDispatcherOperator) Schedule() *messaging.TargetMessage {
-	return m.replicaSet.NewRemoveDispatcherMessage(m.originNode)
+	if !m.sendThrottler.shouldSend() {
+		return nil
+	}
+	return m.replicaSet.NewRemoveDispatcherMessage(m.originNode, heartbeatpb.OperatorType_O_Split)
 }
 
 // OnTaskRemoved is called when the task is removed by ddl
@@ -122,14 +157,50 @@ func (m *SplitDispatcherOperator) OnTaskRemoved() {
 
 	log.Info("task removed", zap.String("replicaSet", m.replicaSet.ID.String()))
 	m.finished.Store(true)
+	m.removed.Store(true)
 }
 
 func (m *SplitDispatcherOperator) PostFinish() {
 	m.lck.Lock()
 	defer m.lck.Unlock()
 
-	log.Info("split dispatcher operator finished", zap.String("id", m.replicaSet.ID.String()))
-	m.db.ReplaceReplicaSet([]*replica.SpanReplication{m.replicaSet}, m.splitSpans, m.checkpointTs)
+	log.Info("split dispatcher operator begin post finish", zap.String("id", m.replicaSet.ID.String()))
+
+	if m.removed.Load() {
+		m.spanController.MarkSpanAbsent(m.replicaSet)
+		return
+	}
+
+	newReplicaSets, replicasInScheduling := m.spanController.ReplaceReplicaSet(
+		[]*replica.SpanReplication{m.replicaSet},
+		m.splitSpans,
+		m.checkpointTs,
+		m.splitTargetNodes,
+	)
+
+	// Only invoke postFinish when ReplaceReplicaSet places the new replicas in scheduling state.
+	// If the target nodes are not aligned with the actual split result, ReplaceReplicaSet falls back
+	// to absent replicas so that the basic scheduler can schedule them, avoiding racing add operators.
+	if m.postFinish != nil && replicasInScheduling {
+		for idx, span := range newReplicaSets {
+			ret := m.postFinish(span, m.splitTargetNodes[idx])
+			if !ret {
+				log.Error("post finish in split dispatcher operator failed, set the span absent",
+					zap.String("id", m.replicaSet.ID.String()),
+					zap.String("span", span.ID.String()),
+					zap.String("targetNode", m.splitTargetNodes[idx].String()))
+				m.spanController.MarkSpanAbsent(span)
+			}
+		}
+	} else if m.postFinish != nil && !replicasInScheduling {
+		log.Warn("skip post finish because split target nodes are not aligned with actual split result",
+			zap.String("id", m.replicaSet.ID.String()),
+			zap.Int("targetNodeCount", len(m.splitTargetNodes)),
+			zap.Int("newReplicaCount", len(newReplicaSets)),
+			zap.String("splitSpans", m.splitSpanInfo))
+	}
+
+	log.Info("split dispatcher operator post finish finished", zap.String("dispatcherID", m.replicaSet.ID.String()))
 }
 
 func (m *SplitDispatcherOperator) String() string {
@@ -139,4 +210,8 @@ func (m *SplitDispatcherOperator) String() string {
 
 func (m *SplitDispatcherOperator) Type() string {
 	return "split"
+}
+
+func (m *SplitDispatcherOperator) BlockTsForward() bool {
+	return true
 }

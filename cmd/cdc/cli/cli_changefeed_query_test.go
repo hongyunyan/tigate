@@ -21,9 +21,9 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/pingcap/errors"
-	v2 "github.com/pingcap/tiflow/cdc/api/v2"
-	"github.com/pingcap/tiflow/cdc/model"
-	"github.com/pingcap/tiflow/pkg/api/v2/mock"
+	v2 "github.com/pingcap/ticdc/api/v2"
+	"github.com/pingcap/ticdc/pkg/api"
+	"github.com/pingcap/ticdc/pkg/api/v2/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -41,9 +41,9 @@ func TestChangefeedQueryCli(t *testing.T) {
 	cfV2.EXPECT().List(gomock.Any(), gomock.Any(), "all").Return([]v2.ChangefeedCommonInfo{
 		{
 			UpstreamID:     1,
-			Namespace:      "default",
+			Keyspace:       "default",
 			ID:             "abc",
-			CheckpointTime: model.JSONTime{},
+			CheckpointTime: api.JSONTime{},
 			RunningError:   nil,
 		},
 	}, nil)
@@ -54,9 +54,9 @@ func TestChangefeedQueryCli(t *testing.T) {
 	cfV2.EXPECT().List(gomock.Any(), gomock.Any(), "all").Return([]v2.ChangefeedCommonInfo{
 		{
 			UpstreamID:     1,
-			Namespace:      "default",
+			Keyspace:       "default",
 			ID:             "abc",
-			CheckpointTime: model.JSONTime{},
+			CheckpointTime: api.JSONTime{},
 			RunningError:   nil,
 		},
 	}, nil)

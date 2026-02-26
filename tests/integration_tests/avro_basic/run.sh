@@ -30,8 +30,6 @@ function run() {
 
 	start_tidb_cluster --workdir $WORK_DIR
 
-	cd $WORK_DIR
-
 	# adjust schema registry compatibility level to the none, to allow the schema evolution caused by the TiDB DDL execution.
 	curl -X PUT -H "Content-Type: application/vnd.schemaregistry.v1+json" --data '{"compatibility": "NONE"}' http://127.0.0.1:8088/config
 
@@ -46,8 +44,10 @@ function run() {
 
 	SINK_URI="kafka://127.0.0.1:9092/$TOPIC_NAME?protocol=avro&enable-tidb-extension=true&avro-enable-watermark=true&avro-decimal-handling-mode=string&avro-bigint-unsigned-handling-mode=string"
 
-	run_cdc_cli changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/changefeed.toml" --schema-registry=http://127.0.0.1:8088
-	cdc_kafka_consumer --upstream-uri $SINK_URI --downstream-uri="mysql://root@127.0.0.1:3306/?safe-mode=true&batch-dml-enable=false" --upstream-tidb-dsn="root@tcp(${UP_TIDB_HOST}:${UP_TIDB_PORT})/?" --schema-registry-uri=http://127.0.0.1:8088 --config="$CUR/conf/changefeed.toml" 2>&1 &
+	schema_registry_uri="http://127.0.0.1:8088"
+	cdc_cli_changefeed create --start-ts=$start_ts --sink-uri=$SINK_URI --config=$CUR/conf/changefeed.toml --schema-registry=$schema_registry_uri
+
+	run_kafka_consumer $WORK_DIR $SINK_URI $CUR/conf/changefeed.toml $schema_registry_uri
 
 	run_sql_file $CUR/data/data.sql ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 
@@ -58,9 +58,7 @@ function run() {
 	cleanup_process $CDC_BINARY
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 run $*
-
 check_logs $WORK_DIR
-
 echo "[$(date)] <<<<<< run test case $TEST_NAME success! >>>>>>"

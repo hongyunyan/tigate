@@ -19,6 +19,7 @@ import (
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/maintainer/replica"
+	"github.com/pingcap/ticdc/maintainer/span"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/messaging"
 	"github.com/pingcap/ticdc/pkg/node"
@@ -27,45 +28,74 @@ import (
 )
 
 // AddDispatcherOperator is an operator to schedule a table span to a dispatcher
+//
+// State transitions:
+//   - Start(): bind the span to dest and move it to scheduling.
+//   - Check(dest, Working): finish successfully and PostFinish marks the span replicating.
+//   - Check(dest, Removed) / OnNodeRemove(dest) / OnTaskRemoved(): finish as removed and PostFinish
+//     marks the span absent (if it still exists in spanController) for rescheduling.
 type AddDispatcherOperator struct {
 	replicaSet *replica.SpanReplication
 	dest       node.ID
 	finished   atomic.Bool
-	removed    atomic.Bool
-	db         *replica.ReplicationDB
+	// removed means the add operation should not be completed successfully. It can be set when:
+	//   - The dest dispatcher reports Removed.
+	//   - The dest node is removed.
+	//   - The task is removed (for example, due to DDL).
+	removed        atomic.Bool
+	spanController *span.Controller
+	// operatorType is copied into ScheduleDispatcherRequest.OperatorType when we send add requests to
+	// dispatcher managers.
+	//
+	// Why we need it:
+	// Dispatcher managers persist unfinished scheduling requests in their bootstrap responses, so a new
+	// maintainer can restore in-flight operators after failover. operatorType tells the maintainer which
+	// high-level operator this "create dispatcher" request belongs to (Add vs Split, etc.), even though the
+	// dispatcher manager itself only executes Create/Remove.
+	//
+	// Note: Not every maintainer operator needs this field. Operators that use dedicated message types
+	// (for example merge) don't go through ScheduleDispatcherRequest and therefore don't need operatorType here.
+	operatorType heartbeatpb.OperatorType
+
+	sendThrottler sendThrottler
 }
 
 func NewAddDispatcherOperator(
-	db *replica.ReplicationDB,
+	spanController *span.Controller,
 	replicaSet *replica.SpanReplication,
 	dest node.ID,
+	operatorType heartbeatpb.OperatorType,
 ) *AddDispatcherOperator {
 	return &AddDispatcherOperator{
-		replicaSet: replicaSet,
-		dest:       dest,
-		db:         db,
+		replicaSet:     replicaSet,
+		dest:           dest,
+		spanController: spanController,
+		operatorType:   operatorType,
+		sendThrottler:  newSendThrottler(),
 	}
 }
 
 func (m *AddDispatcherOperator) Check(from node.ID, status *heartbeatpb.TableSpanStatus) {
-	if !m.finished.Load() && from == m.dest {
-		switch status.ComponentStatus {
-		case heartbeatpb.ComponentState_Working:
-			log.Info("dispatcher report working status",
-				zap.String("changefeed", m.replicaSet.ChangefeedID.String()),
-				zap.String("replicaSet", m.replicaSet.ID.String()))
-			m.finished.Store(true)
-		case heartbeatpb.ComponentState_Removed:
-			log.Info("dispatcher report removed status",
-				zap.String("changefeed", m.replicaSet.ChangefeedID.String()),
-				zap.String("replicaSet", m.replicaSet.ID.String()))
-			m.finished.Store(true)
-			m.removed.Store(true)
-		case heartbeatpb.ComponentState_Stopped:
-			log.Warn("dispatcher report unexpected stopped status, ignore",
-				zap.String("changefeed", m.replicaSet.ChangefeedID.String()),
-				zap.String("replicaSet", m.replicaSet.ID.String()))
-		}
+	if m.finished.Load() || from != m.dest {
+		return
+	}
+
+	switch status.ComponentStatus {
+	case heartbeatpb.ComponentState_Working:
+		log.Info("dispatcher report working status",
+			zap.String("changefeed", m.replicaSet.ChangefeedID.String()),
+			zap.String("replicaSet", m.replicaSet.ID.String()))
+		m.finished.Store(true)
+	case heartbeatpb.ComponentState_Removed:
+		log.Info("dispatcher report removed status",
+			zap.String("changefeed", m.replicaSet.ChangefeedID.String()),
+			zap.String("replicaSet", m.replicaSet.ID.String()))
+		m.finished.Store(true)
+		m.removed.Store(true)
+	case heartbeatpb.ComponentState_Stopped:
+		log.Warn("dispatcher report unexpected stopped status, ignore",
+			zap.String("changefeed", m.replicaSet.ChangefeedID.String()),
+			zap.String("replicaSet", m.replicaSet.ID.String()))
 	}
 }
 
@@ -73,12 +103,11 @@ func (m *AddDispatcherOperator) Schedule() *messaging.TargetMessage {
 	if m.finished.Load() || m.removed.Load() {
 		return nil
 	}
-	msg, err := m.replicaSet.NewAddDispatcherMessage(m.dest)
-	if err != nil {
-		log.Warn("generate dispatcher message failed, retry later", zap.String("operator", m.String()), zap.Error(err))
+
+	if !m.sendThrottler.shouldSend() {
 		return nil
 	}
-	return msg
+	return m.replicaSet.NewAddDispatcherMessage(m.dest, m.operatorType)
 }
 
 // OnNodeRemove is called when node offline, and the replicaset must already move to absent status and will be scheduled again
@@ -107,15 +136,23 @@ func (m *AddDispatcherOperator) OnTaskRemoved() {
 }
 
 func (m *AddDispatcherOperator) Start() {
-	m.db.BindSpanToNode("", m.dest, m.replicaSet)
+	// Start can race with task cleanup (OnTaskRemoved / PostFinish) during DDL / failover.
+	// Avoid rebinding the span after the operator is already marked removed/finished.
+	if m.removed.Load() || m.finished.Load() {
+		return
+	}
+	m.spanController.BindSpanToNode("", m.dest, m.replicaSet)
 }
 
 func (m *AddDispatcherOperator) PostFinish() {
 	if !m.removed.Load() {
-		m.db.MarkSpanReplicating(m.replicaSet)
+		m.spanController.MarkSpanReplicating(m.replicaSet)
 	} else {
-		if m.db.GetTaskByID(m.replicaSet.ID) != nil { // TODO:what that is ?
-			m.db.MarkSpanAbsent(m.replicaSet)
+		// Only mark span absent if it still exists in spanController. When a DDL removes the task,
+		// spanController may have already deleted it. Marking an already removed span absent would
+		// reintroduce a ghost entry into the scheduling state.
+		if m.spanController.GetTaskByID(m.replicaSet.ID) != nil {
+			m.spanController.MarkSpanAbsent(m.replicaSet)
 		}
 	}
 }
@@ -127,4 +164,8 @@ func (m *AddDispatcherOperator) String() string {
 
 func (m *AddDispatcherOperator) Type() string {
 	return "add"
+}
+
+func (m *AddDispatcherOperator) BlockTsForward() bool {
+	return true
 }

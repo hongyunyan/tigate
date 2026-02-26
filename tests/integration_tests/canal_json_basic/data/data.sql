@@ -324,7 +324,8 @@ RENAME TABLE 表1 TO 表2;
 
 DROP TABLE 表2;
 
-create table finish_mark
-(
-    id int PRIMARY KEY
+CREATE TABLE t_null (
+    `id` bigint unsigned not null primary key,
+    `col` varchar(64) collate utf8mb4_bin not null default ''
 );
+INSERT INTO t_null VALUES (1, 'test'), (2, 'null'), (3, 'test2'), (4, 'Null'), (5, 'NULL'), (6, ''), (7, 'nüll');

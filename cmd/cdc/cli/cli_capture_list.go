@@ -14,8 +14,6 @@
 package cli
 
 import (
-	"context"
-
 	"github.com/pingcap/ticdc/cmd/cdc/factory"
 	"github.com/pingcap/ticdc/cmd/util"
 	apiv2client "github.com/pingcap/ticdc/pkg/api/v2"
@@ -42,14 +40,33 @@ func (o *listCaptureOptions) complete(f factory.Factory) error {
 	return nil
 }
 
+// capture holds capture information.
+type capture struct {
+	ID            string `json:"id"`
+	IsOwner       bool   `json:"is-owner"`
+	AdvertiseAddr string `json:"address"`
+	ClusterID     string `json:"cluster-id"`
+}
+
 // run runs the `cli capture list` command.
 func (o *listCaptureOptions) run(cmd *cobra.Command) error {
-	ctx := context.Background()
+	ctx := cmd.Context()
 	raw, err := o.apiv2Client.Captures().List(ctx)
 	if err != nil {
 		return err
 	}
-	return util.JSONPrint(cmd, raw)
+
+	captures := make([]*capture, 0, len(raw))
+	for _, c := range raw {
+		captures = append(captures,
+			&capture{
+				ID:            c.ID,
+				IsOwner:       c.IsCoordinator,
+				AdvertiseAddr: c.AdvertiseAddr,
+				ClusterID:     c.ClusterID,
+			})
+	}
+	return util.JSONPrint(cmd, captures)
 }
 
 // newCmdListCapture creates the `cli capture list` command.

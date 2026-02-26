@@ -15,20 +15,21 @@ package operator
 
 import (
 	"container/heap"
-	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/maintainer/replica"
+	"github.com/pingcap/ticdc/maintainer/span"
+	"github.com/pingcap/ticdc/maintainer/split"
 	"github.com/pingcap/ticdc/pkg/common"
+	appcontext "github.com/pingcap/ticdc/pkg/common/context"
 	"github.com/pingcap/ticdc/pkg/messaging"
 	"github.com/pingcap/ticdc/pkg/metrics"
 	"github.com/pingcap/ticdc/pkg/node"
 	"github.com/pingcap/ticdc/pkg/scheduler/operator"
 	"github.com/pingcap/ticdc/server/watcher"
-	"github.com/pingcap/tiflow/cdc/model"
 	"go.uber.org/zap"
 )
 
@@ -44,36 +45,41 @@ var _ operator.Controller[common.DispatcherID, *heartbeatpb.TableSpanStatus] = &
 // Controller is the operator controller, it manages all operators.
 // And the Controller is responsible for the execution of the operator.
 type Controller struct {
-	role          string
-	changefeedID  common.ChangeFeedID
-	batchSize     int
-	messageCenter messaging.MessageCenter
-	replicationDB *replica.ReplicationDB
-	nodeManager   *watcher.NodeManager
+	role           string
+	changefeedID   common.ChangeFeedID
+	batchSize      int
+	messageCenter  messaging.MessageCenter
+	spanController *span.Controller
+	nodeManager    *watcher.NodeManager
+	splitter       *split.Splitter
 
 	mu           sync.RWMutex // protect the following fields
 	operators    map[common.DispatcherID]*operator.OperatorWithTime[common.DispatcherID, *heartbeatpb.TableSpanStatus]
 	runningQueue operator.OperatorQueue[common.DispatcherID, *heartbeatpb.TableSpanStatus]
+	mode         int64
+	// lastWarnTime tracks the last warning time for each operator to avoid spam logs
+	lastWarnTime map[common.DispatcherID]time.Time
 }
 
+// NewOperatorController creates a new operator controller
 func NewOperatorController(
 	changefeedID common.ChangeFeedID,
-	mc messaging.MessageCenter,
-	db *replica.ReplicationDB,
-	nodeManager *watcher.NodeManager,
+	spanController *span.Controller,
 	batchSize int,
+	mode int64,
 ) *Controller {
-	oc := &Controller{
-		role:          "maintainer",
-		changefeedID:  changefeedID,
-		operators:     make(map[common.DispatcherID]*operator.OperatorWithTime[common.DispatcherID, *heartbeatpb.TableSpanStatus]),
-		runningQueue:  make(operator.OperatorQueue[common.DispatcherID, *heartbeatpb.TableSpanStatus], 0),
-		messageCenter: mc,
-		batchSize:     batchSize,
-		replicationDB: db,
-		nodeManager:   nodeManager,
+	return &Controller{
+		changefeedID:   changefeedID,
+		batchSize:      batchSize,
+		operators:      make(map[common.DispatcherID]*operator.OperatorWithTime[common.DispatcherID, *heartbeatpb.TableSpanStatus]),
+		runningQueue:   make(operator.OperatorQueue[common.DispatcherID, *heartbeatpb.TableSpanStatus], 0),
+		role:           "maintainer",
+		spanController: spanController,
+		nodeManager:    appcontext.GetService[*watcher.NodeManager](watcher.NodeManagerName),
+		messageCenter:  appcontext.GetService[messaging.MessageCenter](appcontext.MessageCenter),
+		mode:           mode,
+		lastWarnTime:   make(map[common.DispatcherID]time.Time),
 	}
-	return oc
 }
 
 // Execute poll the operator from the queue and execute it
@@ -93,10 +99,11 @@ func (oc *Controller) Execute() time.Time {
 
 		if msg != nil {
 			_ = oc.messageCenter.SendCommand(msg)
-			log.Info("send command to dispatcher",
+			log.Debug("send command to dispatcher",
 				zap.String("role", oc.role),
-				zap.String("changefeed", oc.changefeedID.Name()),
-				zap.String("operator", op.String()))
+				zap.Stringer("changefeedID", oc.changefeedID),
+				zap.String("operator", op.String()),
+				zap.Any("msg", msg.Message))
 		}
 		executedCounter++
 		if executedCounter >= oc.batchSize {
@@ -105,54 +112,52 @@ func (oc *Controller) Execute() time.Time {
 	}
 }
 
-// RemoveAllTasks remove all tasks, and notify all operators to stop.
-// it is only called by the barrier when the changefeed is stopped.
-func (oc *Controller) RemoveAllTasks() {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-
-	for _, replicaSet := range oc.replicationDB.RemoveAll() {
-		oc.removeReplicaSet(newRemoveDispatcherOperator(oc.replicationDB, replicaSet))
-	}
-}
-
 // RemoveTasksBySchemaID remove all tasks by schema id.
 // it is only by the barrier when the schema is dropped by ddl
 func (oc *Controller) RemoveTasksBySchemaID(schemaID int64) {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-	for _, replicaSet := range oc.replicationDB.RemoveBySchemaID(schemaID) {
-		oc.removeReplicaSet(newRemoveDispatcherOperator(oc.replicationDB, replicaSet))
+	tasks := oc.spanController.GetRemoveTasksBySchemaID(schemaID)
+	for _, task := range tasks {
+		oc.removeReplicaSet(newRemoveDispatcherOperator(oc.spanController, task, heartbeatpb.OperatorType_O_Remove))
 	}
+	oc.spanController.RemoveBySchemaID(schemaID)
 }
 
 // RemoveTasksByTableIDs remove all tasks by table ids.
 // it is only called by the barrier when the table is dropped by ddl
+//
+// When the split dispatcher operator is running, a TRUNCATE TABLE DDL can potentially drop the dispatcher.
+// This leads to the completion of the split dispatcher operator and the subsequent removal of the span.
+// However, the operator callback may erroneously mark the span as absent. To avoid this situation,
+// we should first remove the replicaSet and then remove the span to ensure it doesn't remain active.
+//
+// Note: removeReplicaSet creates operators and touches the operator controller lock hierarchy, so it must
+// NOT be executed while holding spanController's internal locks, otherwise deadlock may happen.
 func (oc *Controller) RemoveTasksByTableIDs(tables ...int64) {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-	for _, replicaSet := range oc.replicationDB.RemoveByTableIDs(tables...) {
-		oc.removeReplicaSet(newRemoveDispatcherOperator(oc.replicationDB, replicaSet))
+	tasks := oc.spanController.GetRemoveTasksByTableIDs(tables...)
+	for _, task := range tasks {
+		oc.removeReplicaSet(newRemoveDispatcherOperator(oc.spanController, task, heartbeatpb.OperatorType_O_Remove))
 	}
+	oc.spanController.RemoveByTableIDs(tables...)
 }
 
 // AddOperator adds an operator to the controller, if the operator already exists, return false.
 func (oc *Controller) AddOperator(op operator.Operator[common.DispatcherID, *heartbeatpb.TableSpanStatus]) bool {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-
-	if _, ok := oc.operators[op.ID()]; ok {
+	oc.mu.RLock()
+	if old, ok := oc.operators[op.ID()]; ok {
+		oc.mu.RUnlock()
 		log.Info("add operator failed, operator already exists",
 			zap.String("role", oc.role),
-			zap.String("changefeed", oc.changefeedID.Name()),
-			zap.String("operator", op.String()))
+			zap.Stringer("changefeedID", oc.changefeedID),
+			zap.String("operator", op.String()),
+			zap.String("oldOperator", old.OP.String()))
 		return false
 	}
-	span := oc.replicationDB.GetTaskByID(op.ID())
+	oc.mu.RUnlock()
+	span := oc.spanController.GetTaskByID(op.ID())
 	if span == nil {
 		log.Warn("add operator failed, span not found",
 			zap.String("role", oc.role),
-			zap.String("changefeed", oc.changefeedID.Name()),
+			zap.Stringer("changefeedID", oc.changefeedID),
 			zap.String("operator", op.String()))
 		return false
 	}
@@ -162,9 +167,9 @@ func (oc *Controller) AddOperator(op operator.Operator[common.DispatcherID, *hea
 
 func (oc *Controller) UpdateOperatorStatus(id common.DispatcherID, from node.ID, status *heartbeatpb.TableSpanStatus) {
 	oc.mu.RLock()
-	defer oc.mu.RUnlock()
-
 	op, ok := oc.operators[id]
+	oc.mu.RUnlock()
+
 	if ok {
 		op.OP.Check(from, status)
 	}
@@ -174,17 +179,17 @@ func (oc *Controller) UpdateOperatorStatus(id common.DispatcherID, from node.ID,
 // the controller will mark all spans on the node as absent if no operator is handling it,
 // then the controller will notify all operators.
 func (oc *Controller) OnNodeRemoved(n node.ID) {
-	oc.mu.RLock()
-	defer oc.mu.RUnlock()
-
-	for _, span := range oc.replicationDB.GetTaskByNodeID(n) {
+	for _, span := range oc.spanController.GetTaskByNodeID(n) {
+		oc.mu.RLock()
 		_, ok := oc.operators[span.ID]
+		oc.mu.RUnlock()
 		if !ok {
-			oc.replicationDB.MarkSpanAbsent(span)
+			oc.spanController.MarkSpanAbsent(span)
 		}
 	}
-	for _, op := range oc.operators {
-		op.OP.OnNodeRemove(n)
+	ops := oc.GetAllOperators()
+	for _, op := range ops {
+		op.OnNodeRemove(n)
 	}
 }
 
@@ -207,9 +212,22 @@ func (oc *Controller) OperatorSize() int {
 	return len(oc.operators)
 }
 
-// OperatorSize returns the number of operators in the controller.
-func (oc *Controller) OperatorSizeWithLock() int {
-	return len(oc.operators)
+func (oc *Controller) GetMinCheckpointTs(minCheckpointTs uint64) uint64 {
+	ops := oc.GetAllOperators()
+
+	for _, op := range ops {
+		if op.BlockTsForward() {
+			spanReplication := oc.spanController.GetTaskByID(op.ID())
+			if spanReplication == nil {
+				log.Info("span replication is nil", zap.String("operator", op.String()))
+				continue
+			}
+			if spanReplication.GetStatus().CheckpointTs < minCheckpointTs {
+				minCheckpointTs = spanReplication.GetStatus().CheckpointTs
+			}
+		}
+	}
+	return minCheckpointTs
 }
 
 // pollQueueingOperator returns the operator need to be executed,
@@ -220,31 +238,46 @@ func (oc *Controller) pollQueueingOperator() (
 	bool,
 ) {
 	oc.mu.Lock()
-	defer oc.mu.Unlock()
 	if oc.runningQueue.Len() == 0 {
+		oc.mu.Unlock()
 		return nil, false
 	}
 	item := heap.Pop(&oc.runningQueue).(*operator.OperatorWithTime[common.DispatcherID, *heartbeatpb.TableSpanStatus])
-	if item.IsRemoved {
-		return nil, true
-	}
 	op := item.OP
 	opID := op.ID()
-	// always call the PostFinish method to ensure the operator is cleaned up by itself.
-	if op.IsFinished() {
-		op.PostFinish()
-		item.IsRemoved = true
-		delete(oc.operators, opID)
-		metrics.FinishedOperatorCount.WithLabelValues(model.DefaultNamespace, oc.changefeedID.Name(), op.Type()).Inc()
-		metrics.OperatorDuration.WithLabelValues(model.DefaultNamespace, oc.changefeedID.Name(), op.Type()).Observe(time.Since(item.CreatedAt).Seconds())
-		log.Info("operator finished",
-			zap.String("role", oc.role),
-			zap.String("changefeed", oc.changefeedID.Name()),
-			zap.String("operator", opID.String()),
-			zap.String("operator", op.String()))
+	oc.mu.Unlock()
+	if item.IsRemoved.Load() {
 		return nil, true
 	}
+	if op.IsFinished() {
+		oc.finalizeOperator(item, opID)
+		return nil, true
+	}
+	// log warn message for stil running operator
+	if time.Since(item.CreatedAt) > time.Second*30 {
+		now := time.Now()
+		oc.mu.Lock()
+		lastWarn, exists := oc.lastWarnTime[opID]
+		shouldWarn := !exists || now.Sub(lastWarn) >= time.Second*30
+		if shouldWarn {
+			oc.lastWarnTime[opID] = now
+		}
+		oc.mu.Unlock()
+
+		if shouldWarn {
+			log.Warn("operator is still in running queue",
+				zap.Stringer("changefeedID", oc.changefeedID),
+				zap.String("operator", opID.String()),
+				zap.String("operator", op.String()),
+				zap.Any("timeSinceCreated", time.Since(item.CreatedAt)))
+		}
+	}
 	now := time.Now()
+	oc.mu.Lock()
+	defer oc.mu.Unlock()
+	if item.IsRemoved.Load() {
+		return nil, true
+	}
 	if now.Before(item.NotifyAt) {
 		heap.Push(&oc.runningQueue, item)
 		return nil, false
@@ -255,33 +288,85 @@ func (oc *Controller) pollQueueingOperator() (
 	return op, true
 }
 
+func (oc *Controller) finalizeOperator(
+	item *operator.OperatorWithTime[common.DispatcherID, *heartbeatpb.TableSpanStatus],
+	opID common.DispatcherID,
+) {
+	if !item.IsRemoved.CompareAndSwap(false, true) {
+		return
+	}
+	op := item.OP
+	// Always call the PostFinish method to ensure the operator is cleaned up by itself.
+	op.PostFinish()
+
+	oc.mu.Lock()
+	if cur, ok := oc.operators[opID]; ok && cur == item {
+		delete(oc.operators, opID)
+	}
+	delete(oc.lastWarnTime, opID)
+	oc.mu.Unlock()
+
+	metrics.OperatorCount.WithLabelValues(common.DefaultKeyspaceName, oc.changefeedID.Name(), op.Type(), common.StringMode(oc.mode)).Dec()
+	metrics.OperatorDuration.WithLabelValues(common.DefaultKeyspaceName, oc.changefeedID.Name(), op.Type(), common.StringMode(oc.mode)).Observe(time.Since(item.CreatedAt).Seconds())
+	log.Info("operator finished",
+		zap.String("role", oc.role),
+		zap.Stringer("changefeedID", oc.changefeedID),
+		zap.String("operatorID", opID.String()),
+		zap.String("operator", op.String()))
+}
+
+func (oc *Controller) cancelOperator(opID common.DispatcherID) {
+	oc.mu.RLock()
+	item, ok := oc.operators[opID]
+	oc.mu.RUnlock()
+	if !ok {
+		return
+	}
+	item.OP.OnTaskRemoved()
+	oc.finalizeOperator(item, opID)
+}
+
 func (oc *Controller) removeReplicaSet(op *removeDispatcherOperator) {
-	if old, ok := oc.operators[op.ID()]; ok {
-		log.Info("replica set is removed , replace the old one",
+	oc.mu.RLock()
+	old, ok := oc.operators[op.ID()]
+	oc.mu.RUnlock()
+	if ok {
+		log.Info("replica set is removed, replace the old one",
 			zap.String("role", oc.role),
-			zap.String("changefeed", oc.changefeedID.Name()),
+			zap.Stringer("changefeedID", oc.changefeedID),
 			zap.String("replicaSet", old.OP.ID().String()),
 			zap.String("operator", old.OP.String()))
 		old.OP.OnTaskRemoved()
-		old.OP.PostFinish()
-		old.IsRemoved = true
-		delete(oc.operators, op.ID())
+		oc.finalizeOperator(old, op.ID())
 	}
 	oc.pushOperator(op)
 }
 
 // pushOperator add an operator to the controller queue.
 func (oc *Controller) pushOperator(op operator.Operator[common.DispatcherID, *heartbeatpb.TableSpanStatus]) {
-	oc.checkAffectedNodes(op)
 	log.Info("add operator to running queue",
 		zap.String("role", oc.role),
-		zap.String("changefeed", oc.changefeedID.Name()),
+		zap.Stringer("changefeedID", oc.changefeedID),
 		zap.String("operator", op.String()))
 	withTime := operator.NewOperatorWithTime(op, time.Now())
+
+	oc.mu.Lock()
 	oc.operators[op.ID()] = withTime
+	oc.mu.Unlock()
+
 	op.Start()
+	// Check affected nodes after Start to avoid operators being forced into terminal states
+	// before they have initialized their span state. For example, a move operator can mark
+	// a span absent on node removal, and a subsequent Start must not bring it back to an
+	// invalid scheduling state with an empty node ID.
+	oc.checkAffectedNodes(op)
+
+	oc.mu.Lock()
 	heap.Push(&oc.runningQueue, withTime)
-	metrics.CreatedOperatorCount.WithLabelValues(model.DefaultNamespace, oc.changefeedID.Name(), op.Type()).Inc()
+	oc.mu.Unlock()
+
+	metrics.OperatorCount.WithLabelValues(common.DefaultKeyspaceName, oc.changefeedID.Name(), op.Type(), common.StringMode(oc.mode)).Inc()
+	metrics.TotalOperatorCount.WithLabelValues(common.DefaultKeyspaceName, oc.changefeedID.Name(), op.Type(), common.StringMode(oc.mode)).Inc()
 }
 
 func (oc *Controller) checkAffectedNodes(op operator.Operator[common.DispatcherID, *heartbeatpb.TableSpanStatus]) {
@@ -293,94 +378,115 @@ func (oc *Controller) checkAffectedNodes(op operator.Operator[common.DispatcherI
 	}
 }
 
-func (oc *Controller) NewAddOperator(replicaSet *replica.SpanReplication, id node.ID) operator.Operator[common.DispatcherID, *heartbeatpb.TableSpanStatus] {
-	return &AddDispatcherOperator{
-		replicaSet: replicaSet,
-		dest:       id,
-		db:         oc.replicationDB,
-	}
-}
-
 func (oc *Controller) NewMoveOperator(replicaSet *replica.SpanReplication, origin, dest node.ID) operator.Operator[common.DispatcherID, *heartbeatpb.TableSpanStatus] {
-	return &MoveDispatcherOperator{
-		replicaSet: replicaSet,
-		origin:     origin,
-		dest:       dest,
-		db:         oc.replicationDB,
+	return NewMoveDispatcherOperator(oc.spanController, replicaSet, origin, dest)
+}
+
+func checkMergeOperator(affectedReplicaSets []*replica.SpanReplication) bool {
+	if len(affectedReplicaSets) < 2 {
+		log.Info("affectedReplicaSets is less than 2, skip merge",
+			zap.Any("affectedReplicaSets", affectedReplicaSets))
+		return false
 	}
-}
 
-func (oc *Controller) NewRemoveOperator(replicaSet *replica.SpanReplication) operator.Operator[common.DispatcherID, *heartbeatpb.TableSpanStatus] {
-	return &removeDispatcherOperator{
-		replicaSet: replicaSet,
-		db:         oc.replicationDB,
-	}
-}
-
-func (oc *Controller) NewSplitOperator(
-	replicaSet *replica.SpanReplication, originNode node.ID, splitSpans []*heartbeatpb.TableSpan,
-) operator.Operator[common.DispatcherID, *heartbeatpb.TableSpanStatus] {
-	return NewSplitDispatcherOperator(oc.replicationDB, replicaSet, originNode, splitSpans)
-}
-
-// AddMergeSplitOperator adds a merge split operator to the controller.
-//  1. Merge Operator: len(affectedReplicaSets) > 1, len(splitSpans) == 1
-//  2. Split Operator: len(affectedReplicaSets) == 1, len(splitSpans) > 1
-//  3. MergeAndSplit Operator: len(affectedReplicaSets) > 1, len(splitSpans) > 1
-func (oc *Controller) AddMergeSplitOperator(
-	affectedReplicaSets []*replica.SpanReplication,
-	splitSpans []*heartbeatpb.TableSpan,
-) bool {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-	// TODO: check if there are some intersection between `ret.Replications` and `spans`.
-	// Ignore the intersection spans to prevent meaningless split operation.
+	affectedSpans := make([]*heartbeatpb.TableSpan, 0, len(affectedReplicaSets))
 	for _, replicaSet := range affectedReplicaSets {
-		if _, ok := oc.operators[replicaSet.ID]; ok {
-			log.Info("add operator failed, operator already exists",
-				zap.String("role", oc.role),
-				zap.String("changefeed", oc.changefeedID.Name()),
-				zap.String("dispatcherID", replicaSet.ID.String()),
-			)
+		affectedSpans = append(affectedSpans, replicaSet.Span)
+	}
+
+	prevTableSpan := affectedSpans[0]
+	nodeID := affectedReplicaSets[0].GetNodeID()
+	for idx := 1; idx < len(affectedSpans); idx++ {
+		currentTableSpan := affectedSpans[idx]
+		if !common.IsTableSpanConsecutive(prevTableSpan, currentTableSpan) {
+			log.Info("affectedReplicaSets is not consecutive, skip merge", zap.String("prevTableSpan", common.FormatTableSpan(prevTableSpan)), zap.String("currentTableSpan", common.FormatTableSpan(currentTableSpan)))
 			return false
 		}
-		span := oc.replicationDB.GetTaskByID(replicaSet.ID)
-		if span == nil {
-			log.Warn("add operator failed, span not found",
-				zap.String("role", oc.role),
-				zap.String("changefeed", oc.changefeedID.Name()),
-				zap.String("dispatcherID", replicaSet.ID.String()))
+		prevTableSpan = currentTableSpan
+		if affectedReplicaSets[idx].GetNodeID() != nodeID {
+			log.Info("affectedReplicaSets is not in the same node, skip merge", zap.Any("affectedReplicaSets", affectedReplicaSets))
 			return false
 		}
 	}
-	randomIdx := rand.Intn(len(affectedReplicaSets))
-	primaryID := affectedReplicaSets[randomIdx].ID
-	primaryOp := NewMergeSplitDispatcherOperator(oc.replicationDB, primaryID, affectedReplicaSets[randomIdx], affectedReplicaSets, splitSpans, nil)
-	for _, replicaSet := range affectedReplicaSets {
-		var op *MergeSplitDispatcherOperator
-		if replicaSet.ID == primaryID {
-			op = primaryOp
-		} else {
-			op = NewMergeSplitDispatcherOperator(oc.replicationDB, primaryID, replicaSet, nil, nil, primaryOp.onFinished)
-		}
-		oc.pushOperator(op)
-	}
-	log.Info("add merge split operator",
-		zap.String("role", oc.role),
-		zap.String("changefeed", oc.changefeedID.Name()),
-		zap.String("primary", primaryID.String()),
-		zap.Int64("tableID", splitSpans[0].TableID),
-		zap.Int("oldSpans", len(affectedReplicaSets)),
-		zap.Int("newSpans", len(splitSpans)),
-	)
 	return true
 }
 
-func (oc *Controller) GetLock() *sync.RWMutex {
-	oc.mu.Lock()
-	return &oc.mu
+// AddMergeOperator creates a merge operator, which merge consecutive replica sets.
+// We need create a mergeOperator for the new replicaset, and create len(affectedReplicaSets) empty operator
+// to occupy these replica set not evolve other scheduling among merging.
+func (oc *Controller) AddMergeOperator(
+	affectedReplicaSets []*replica.SpanReplication,
+) operator.Operator[common.DispatcherID, *heartbeatpb.TableSpanStatus] {
+	if !checkMergeOperator(affectedReplicaSets) {
+		return nil
+	}
+
+	operators := make([]operator.Operator[common.DispatcherID, *heartbeatpb.TableSpanStatus], 0, len(affectedReplicaSets))
+	for _, replicaSet := range affectedReplicaSets {
+		operator := NewOccupyDispatcherOperator(oc.spanController, replicaSet)
+		ret := oc.AddOperator(operator)
+		if ret {
+			operators = append(operators, operator)
+		} else {
+			log.Error("failed to add occupy dispatcher operator",
+				zap.Stringer("changefeedID", oc.changefeedID),
+				zap.Int64("group", replicaSet.GetGroupID()),
+				zap.String("span", common.FormatTableSpan(replicaSet.Span)),
+				zap.String("operator", operator.String()))
+			for _, op := range operators {
+				oc.cancelOperator(op.ID())
+			}
+			return nil
+		}
+	}
+
+	mergeOperator := NewMergeDispatcherOperator(oc.spanController, affectedReplicaSets, operators)
+	ret := oc.AddOperator(mergeOperator)
+	if !ret {
+		log.Error("failed to add merge dispatcher operator",
+			zap.Stringer("changefeedID", oc.changefeedID),
+			zap.Any("mergeSpans", affectedReplicaSets),
+			zap.String("operator", mergeOperator.String()))
+		for _, op := range operators {
+			oc.cancelOperator(op.ID())
+		}
+		oc.spanController.RemoveReplicatingSpan(mergeOperator.newReplicaSet)
+		return nil
+	}
+	log.Info("add merge operator",
+		zap.String("role", oc.role),
+		zap.Stringer("changefeedID", oc.changefeedID),
+		zap.Int("affectedReplicaSets", len(affectedReplicaSets)),
+	)
+	return mergeOperator
 }
 
-func (oc *Controller) ReleaseLock(mutex *sync.RWMutex) {
-	mutex.Unlock()
+func (oc *Controller) GetAllOperators() []operator.Operator[common.DispatcherID, *heartbeatpb.TableSpanStatus] {
+	oc.mu.RLock()
+	defer oc.mu.RUnlock()
+
+	operators := make([]operator.Operator[common.DispatcherID, *heartbeatpb.TableSpanStatus], 0, len(oc.operators))
+
+	for _, op := range oc.operators {
+		operators = append(operators, op.OP)
+	}
+	return operators
+}
+
+func (oc *Controller) Close() {
+	opTypes := []string{"occupy", "merge", "add", "remove", "move", "split", "merge"}
+
+	for _, opType := range opTypes {
+		metrics.OperatorCount.DeleteLabelValues(common.DefaultKeyspaceName, oc.changefeedID.Name(), opType, common.StringMode(oc.mode))
+		metrics.TotalOperatorCount.DeleteLabelValues(common.DefaultKeyspaceName, oc.changefeedID.Name(), opType, common.StringMode(oc.mode))
+		metrics.OperatorDuration.DeleteLabelValues(common.DefaultKeyspaceName, oc.changefeedID.Name(), opType, common.StringMode(oc.mode))
+	}
+}
+
+// =========== following func only for test ===========
+func (oc *Controller) RemoveOp(id common.DispatcherID) {
+	oc.mu.Lock()
+	defer oc.mu.Unlock()
+	delete(oc.operators, id)
+	delete(oc.lastWarnTime, id)
 }

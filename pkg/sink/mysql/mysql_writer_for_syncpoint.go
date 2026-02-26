@@ -21,7 +21,6 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/pkg/apperror"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
 	"github.com/pingcap/ticdc/pkg/config"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
@@ -29,7 +28,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func (w *MysqlWriter) createSyncTable() error {
+func (w *Writer) createSyncTable() error {
 	database := filter.TiCDCSystemSchema
 	query := `CREATE TABLE IF NOT EXISTS %s
 	(
@@ -45,7 +44,7 @@ func (w *MysqlWriter) createSyncTable() error {
 	return w.createTable(database, filter.SyncPointTable, query)
 }
 
-func (w *MysqlWriter) SendSyncPointEvent(event *commonEvent.SyncPointEvent) error {
+func (w *Writer) SendSyncPointEvent(event *commonEvent.SyncPointEvent) error {
 	tx, err := w.db.BeginTx(w.ctx, nil)
 	if err != nil {
 		return cerror.WrapError(cerror.ErrMySQLTxnError, errors.WithMessage(err, "sync table: begin Tx fail;"))
@@ -61,22 +60,17 @@ func (w *MysqlWriter) SendSyncPointEvent(event *commonEvent.SyncPointEvent) erro
 		}
 		return cerror.WrapError(cerror.ErrMySQLTxnError, errors.WithMessage(err, "failed to write syncpoint table; Failed to get tidb_current_ts;"))
 	}
+
+	commitTs := event.GetCommitTs()
+
 	// insert ts map
-	var builder strings.Builder
-	builder.WriteString("insert ignore into ")
-	builder.WriteString(filter.TiCDCSystemSchema)
-	builder.WriteString(".")
-	builder.WriteString(filter.SyncPointTable)
-	builder.WriteString(" (ticdc_cluster_id, changefeed, primary_ts, secondary_ts) VALUES ('")
-	builder.WriteString(config.GetGlobalServerConfig().ClusterID)
-	builder.WriteString("', '")
-	builder.WriteString(w.ChangefeedID.String())
-	builder.WriteString("', ")
-	builder.WriteString(strconv.FormatUint(event.GetCommitTs(), 10))
-	builder.WriteString(", ")
-	builder.WriteString(secondaryTs)
-	builder.WriteString(")")
-	query := builder.String()
+	query := fmt.Sprintf("insert ignore into %s.%s (ticdc_cluster_id, changefeed, primary_ts, secondary_ts) VALUES ('%s', '%s', %s, %s)",
+		filter.TiCDCSystemSchema,
+		filter.SyncPointTable,
+		config.GetGlobalServerConfig().ClusterID,
+		w.ChangefeedID.String(),
+		strconv.FormatUint(commitTs, 10),
+		secondaryTs)
 
 	_, err = tx.Exec(query)
 	if err != nil {
@@ -88,14 +82,14 @@ func (w *MysqlWriter) SendSyncPointEvent(event *commonEvent.SyncPointEvent) erro
 		return cerror.WrapError(cerror.ErrMySQLTxnError, errors.WithMessage(err, fmt.Sprintf("failed to write syncpoint table; Exec Failed; Query is %s", query)))
 	}
 
-	log.Debug("exec syncpoint ts query", zap.String("query", query))
+	log.Info("exec syncpoint ts query", zap.String("query", query))
 
 	// set global tidb_external_ts to secondary ts
 	// TiDB supports tidb_external_ts system variable since v6.4.0.
 	query = fmt.Sprintf("set global tidb_external_ts = %s", secondaryTs)
 	_, err = tx.Exec(query)
 	if err != nil {
-		if apperror.IsSyncPointIgnoreError(err) {
+		if cerror.IsSyncPointIgnoreError(err) {
 			// TODO(dongmen): to confirm if we need to log this error.
 			log.Warn("set global external ts failed, ignore this error", zap.Error(err))
 		} else {

@@ -20,17 +20,20 @@ import (
 
 	"github.com/gin-gonic/gin/binding"
 	"github.com/imdario/mergo"
-	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/config"
-	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/util"
 	"go.uber.org/zap"
 )
 
-// defaultMaxBatchSize sets the default value for max-batch-size
-const defaultMaxBatchSize int = 16
+const (
+	// MemBufShrinkThreshold represents the threshold of shrinking the buffer.
+	MemBufShrinkThreshold = 1024 * 1024
+	// defaultMaxBatchSize sets the default value for max-batch-size
+	defaultMaxBatchSize int = 16
+)
 
 // Config use to create the encoder
 type Config struct {
@@ -49,6 +52,8 @@ type Config struct {
 
 	EnableTiDBExtension bool
 	EnableRowChecksum   bool
+
+	OutputRowKey bool
 
 	// avro only
 	AvroConfluentSchemaRegistry    string
@@ -89,6 +94,8 @@ type Config struct {
 	DebeziumDisableSchema bool
 	// Debezium only. Whether before value should be included in the output.
 	DebeziumOutputOldValue bool
+	// CSV only. Whether header should be included in the output.
+	CSVOutputFieldHeader bool
 }
 
 // EncodingFormatType is the type of encoding format
@@ -112,6 +119,8 @@ func NewConfig(protocol config.Protocol) *Config {
 		EnableTiDBExtension: false,
 		EnableRowChecksum:   false,
 
+		OutputRowKey: false,
+
 		AvroConfluentSchemaRegistry:    "",
 		AvroDecimalHandlingMode:        "precise",
 		AvroBigintUnsignedHandlingMode: "long",
@@ -129,6 +138,7 @@ func NewConfig(protocol config.Protocol) *Config {
 		DebeziumOutputOldValue: true,
 		OpenOutputOldValue:     true,
 		DebeziumDisableSchema:  false,
+		CSVOutputFieldHeader:   false,
 	}
 }
 
@@ -171,6 +181,10 @@ type urlConfig struct {
 	// EncodingFormatType is only works for the simple protocol,
 	// can be `json` and `avro`, default to `json`.
 	EncodingFormatType *string `form:"encoding-format"`
+
+	// If both `EnableTiDBExtension` and `OutputRowKey` is set to true, row key will be outputed in the tidb-extension field.
+	// This is only used for the **canal-json** protocol.
+	OutputRowKey *bool `form:"output-row-key"`
 }
 
 // Apply fill the Config
@@ -178,8 +192,8 @@ func (c *Config) Apply(sinkURI *url.URL, sinkConfig *config.SinkConfig) error {
 	req := &http.Request{URL: sinkURI}
 	var err error
 	urlParameter := &urlConfig{}
-	if err := binding.Query.Bind(req, urlParameter); err != nil {
-		return cerror.WrapError(cerror.ErrMySQLInvalidConfig, err)
+	if err = binding.Query.Bind(req, urlParameter); err != nil {
+		return errors.WrapError(errors.ErrMySQLInvalidConfig, err)
 	}
 	if urlParameter, err = mergeConfig(sinkConfig, urlParameter); err != nil {
 		return err
@@ -187,6 +201,10 @@ func (c *Config) Apply(sinkURI *url.URL, sinkConfig *config.SinkConfig) error {
 
 	if urlParameter.EnableTiDBExtension != nil {
 		c.EnableTiDBExtension = *urlParameter.EnableTiDBExtension
+	}
+
+	if urlParameter.OutputRowKey != nil {
+		c.OutputRowKey = *urlParameter.OutputRowKey
 	}
 
 	if urlParameter.MaxBatchSize != nil {
@@ -218,8 +236,8 @@ func (c *Config) Apply(sinkURI *url.URL, sinkConfig *config.SinkConfig) error {
 		sinkConfig.KafkaConfig.GlueSchemaRegistryConfig != nil {
 		c.AvroGlueSchemaRegistry = sinkConfig.KafkaConfig.GlueSchemaRegistryConfig
 	}
-	if c.Protocol == config.ProtocolAvro && sinkConfig.ForceReplicate {
-		return cerror.ErrCodecInvalidConfig.GenWithStack(
+	if c.Protocol == config.ProtocolAvro && util.GetOrZero(sinkConfig.ForceReplicate) {
+		return errors.ErrCodecInvalidConfig.GenWithStack(
 			`force-replicate must be disabled, when using avro protocol`)
 	}
 
@@ -233,6 +251,7 @@ func (c *Config) Apply(sinkURI *url.URL, sinkConfig *config.SinkConfig) error {
 			c.BinaryEncodingMethod = sinkConfig.CSVConfig.BinaryEncodingMethod
 			c.OutputOldValue = sinkConfig.CSVConfig.OutputOldValue
 			c.OutputHandleKey = sinkConfig.CSVConfig.OutputHandleKey
+			c.CSVOutputFieldHeader = sinkConfig.CSVConfig.OutputFieldHeader
 		}
 		if sinkConfig.KafkaConfig != nil && sinkConfig.KafkaConfig.LargeMessageHandle != nil {
 			c.LargeMessageHandle = sinkConfig.KafkaConfig.LargeMessageHandle
@@ -253,8 +272,8 @@ func (c *Config) Apply(sinkURI *url.URL, sinkConfig *config.SinkConfig) error {
 	}
 
 	c.DeleteOnlyHandleKeyColumns = util.GetOrZero(sinkConfig.DeleteOnlyOutputHandleKeyColumns)
-	if c.DeleteOnlyHandleKeyColumns && sinkConfig.ForceReplicate {
-		return cerror.ErrCodecInvalidConfig.GenWithStack(
+	if c.DeleteOnlyHandleKeyColumns && util.GetOrZero(sinkConfig.ForceReplicate) {
+		return errors.ErrCodecInvalidConfig.GenWithStack(
 			`force-replicate must be disabled when configuration "delete-only-output-handle-key-columns" is true.`)
 	}
 
@@ -273,7 +292,7 @@ func (c *Config) Apply(sinkURI *url.URL, sinkConfig *config.SinkConfig) error {
 			case EncodingFormatJSON, EncodingFormatAvro:
 				c.EncodingFormat = encodingFormat
 			default:
-				return cerror.ErrCodecInvalidConfig.GenWithStack(
+				return errors.ErrCodecInvalidConfig.GenWithStack(
 					"unsupported encoding format type: %s for the simple protocol", encodingFormat)
 			}
 		}
@@ -334,16 +353,16 @@ func (c *Config) WithChangefeedID(id common.ChangeFeedID) *Config {
 // Validate the Config
 func (c *Config) Validate() error {
 	if c.EnableTiDBExtension &&
-		!(c.Protocol == config.ProtocolCanalJSON || c.Protocol == config.ProtocolAvro) {
+		!(c.Protocol == config.ProtocolCanalJSON || c.Protocol == config.ProtocolAvro || c.Protocol == config.ProtocolDebezium) {
 		log.Warn("ignore invalid config, enable-tidb-extension"+
-			"only supports canal-json/avro protocol",
+			"only supports canal-json/avro/debezium protocol",
 			zap.Bool("enableTidbExtension", c.EnableTiDBExtension),
 			zap.String("protocol", c.Protocol.String()))
 	}
 
 	if c.Protocol == config.ProtocolAvro {
 		if c.AvroConfluentSchemaRegistry != "" && c.AvroGlueSchemaRegistry != nil {
-			return cerror.ErrCodecInvalidConfig.GenWithStack(
+			return errors.ErrCodecInvalidConfig.GenWithStack(
 				`Avro protocol requires only one of "%s" or "%s" to specify the schema registry`,
 				codecOPTAvroSchemaRegistry,
 				coderOPTAvroGlueSchemaRegistry,
@@ -351,7 +370,7 @@ func (c *Config) Validate() error {
 		}
 
 		if c.AvroConfluentSchemaRegistry == "" && c.AvroGlueSchemaRegistry == nil {
-			return cerror.ErrCodecInvalidConfig.GenWithStack(
+			return errors.ErrCodecInvalidConfig.GenWithStack(
 				`Avro protocol requires parameter "%s" or "%s" to specify the schema registry`,
 				codecOPTAvroSchemaRegistry,
 				coderOPTAvroGlueSchemaRegistry,
@@ -360,7 +379,7 @@ func (c *Config) Validate() error {
 
 		if c.AvroDecimalHandlingMode != DecimalHandlingModePrecise &&
 			c.AvroDecimalHandlingMode != DecimalHandlingModeString {
-			return cerror.ErrCodecInvalidConfig.GenWithStack(
+			return errors.ErrCodecInvalidConfig.GenWithStack(
 				`%s value could only be "%s" or "%s"`,
 				codecOPTAvroDecimalHandlingMode,
 				DecimalHandlingModeString,
@@ -370,7 +389,7 @@ func (c *Config) Validate() error {
 
 		if c.AvroBigintUnsignedHandlingMode != BigintUnsignedHandlingModeLong &&
 			c.AvroBigintUnsignedHandlingMode != BigintUnsignedHandlingModeString {
-			return cerror.ErrCodecInvalidConfig.GenWithStack(
+			return errors.ErrCodecInvalidConfig.GenWithStack(
 				`%s value could only be "%s" or "%s"`,
 				codecOPTAvroBigintUnsignedHandlingMode,
 				BigintUnsignedHandlingModeLong,
@@ -381,7 +400,7 @@ func (c *Config) Validate() error {
 		if c.EnableRowChecksum {
 			if !(c.EnableTiDBExtension && c.AvroDecimalHandlingMode == DecimalHandlingModeString &&
 				c.AvroBigintUnsignedHandlingMode == BigintUnsignedHandlingModeString) {
-				return cerror.ErrCodecInvalidConfig.GenWithStack(
+				return errors.ErrCodecInvalidConfig.GenWithStack(
 					`Avro protocol with row level checksum,
 					should set "%s" to "%s", and set "%s" to "%s" and "%s" to "%s"`,
 					codecOPTEnableTiDBExtension, "true",
@@ -392,13 +411,13 @@ func (c *Config) Validate() error {
 	}
 
 	if c.MaxMessageBytes <= 0 {
-		return cerror.ErrCodecInvalidConfig.Wrap(
+		return errors.ErrCodecInvalidConfig.Wrap(
 			errors.Errorf("invalid max-message-bytes %d", c.MaxMessageBytes),
 		)
 	}
 
 	if c.MaxBatchSize <= 0 {
-		return cerror.ErrCodecInvalidConfig.Wrap(
+		return errors.ErrCodecInvalidConfig.Wrap(
 			errors.Errorf("invalid max-batch-size %d", c.MaxBatchSize),
 		)
 	}

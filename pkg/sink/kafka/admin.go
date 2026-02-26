@@ -14,15 +14,13 @@
 package kafka
 
 import (
-	"context"
 	"strconv"
 	"strings"
 
 	"github.com/IBM/sarama"
-	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/common"
-	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/errors"
 	"go.uber.org/zap"
 )
 
@@ -33,7 +31,7 @@ type saramaAdminClient struct {
 	admin  sarama.ClusterAdmin
 }
 
-func (a *saramaAdminClient) GetAllBrokers(_ context.Context) ([]Broker, error) {
+func (a *saramaAdminClient) GetAllBrokers() []Broker {
 	brokers := a.client.Brokers()
 	result := make([]Broker, 0, len(brokers))
 	for _, broker := range brokers {
@@ -41,14 +39,10 @@ func (a *saramaAdminClient) GetAllBrokers(_ context.Context) ([]Broker, error) {
 			ID: broker.ID(),
 		})
 	}
-
-	return result, nil
+	return result
 }
 
-func (a *saramaAdminClient) GetBrokerConfig(
-	_ context.Context,
-	configName string,
-) (string, error) {
+func (a *saramaAdminClient) GetBrokerConfig(configName string) (string, error) {
 	_, controller, err := a.admin.DescribeCluster()
 	if err != nil {
 		return "", errors.Trace(err)
@@ -73,16 +67,14 @@ func (a *saramaAdminClient) GetBrokerConfig(
 	}
 
 	log.Warn("Kafka config item not found",
-		zap.String("namespace", a.changefeed.Namespace()),
+		zap.String("keyspace", a.changefeed.Keyspace()),
 		zap.String("changefeed", a.changefeed.Name()),
 		zap.String("configName", configName))
-	return "", cerror.ErrKafkaConfigNotFound.GenWithStack(
+	return "", errors.ErrKafkaConfigNotFound.GenWithStack(
 		"cannot find the `%s` from the broker's configuration", configName)
 }
 
-func (a *saramaAdminClient) GetTopicConfig(
-	_ context.Context, topicName string, configName string,
-) (string, error) {
+func (a *saramaAdminClient) GetTopicConfig(topicName string, configName string) (string, error) {
 	configEntries, err := a.admin.DescribeConfig(sarama.ConfigResource{
 		Type:        sarama.TopicResource,
 		Name:        topicName,
@@ -98,7 +90,7 @@ func (a *saramaAdminClient) GetTopicConfig(
 	for _, entry := range configEntries {
 		if entry.Name == configName {
 			log.Info("Kafka config item found",
-				zap.String("namespace", a.changefeed.Namespace()),
+				zap.String("keyspace", a.changefeed.Keyspace()),
 				zap.String("changefeed", a.changefeed.Name()),
 				zap.String("configName", configName),
 				zap.String("configValue", entry.Value))
@@ -107,16 +99,14 @@ func (a *saramaAdminClient) GetTopicConfig(
 	}
 
 	log.Warn("Kafka config item not found",
-		zap.String("namespace", a.changefeed.Namespace()),
+		zap.String("keyspace", a.changefeed.Keyspace()),
 		zap.String("changefeed", a.changefeed.Name()),
 		zap.String("configName", configName))
-	return "", cerror.ErrKafkaConfigNotFound.GenWithStack(
+	return "", errors.ErrKafkaConfigNotFound.GenWithStack(
 		"cannot find the `%s` from the topic's configuration", configName)
 }
 
-func (a *saramaAdminClient) GetTopicsMeta(
-	_ context.Context, topics []string, ignoreTopicError bool,
-) (map[string]TopicDetail, error) {
+func (a *saramaAdminClient) GetTopicsMeta(topics []string, ignoreTopicError bool) (map[string]TopicDetail, error) {
 	result := make(map[string]TopicDetail, len(topics))
 
 	metaList, err := a.admin.DescribeTopics(topics)
@@ -126,11 +116,14 @@ func (a *saramaAdminClient) GetTopicsMeta(
 
 	for _, meta := range metaList {
 		if meta.Err != sarama.ErrNoError {
+			if meta.Err == sarama.ErrUnknownTopicOrPartition {
+				continue
+			}
 			if !ignoreTopicError {
 				return nil, meta.Err
 			}
 			log.Warn("fetch topic meta failed",
-				zap.String("namespace", a.changefeed.Namespace()),
+				zap.String("keyspace", a.changefeed.Keyspace()),
 				zap.String("changefeed", a.changefeed.Name()),
 				zap.String("topic", meta.Name),
 				zap.Error(meta.Err))
@@ -144,9 +137,7 @@ func (a *saramaAdminClient) GetTopicsMeta(
 	return result, nil
 }
 
-func (a *saramaAdminClient) GetTopicsPartitionsNum(
-	_ context.Context, topics []string,
-) (map[string]int32, error) {
+func (a *saramaAdminClient) GetTopicsPartitionsNum(topics []string) (map[string]int32, error) {
 	result := make(map[string]int32, len(topics))
 	for _, topic := range topics {
 		partition, err := a.client.Partitions(topic)
@@ -159,9 +150,7 @@ func (a *saramaAdminClient) GetTopicsPartitionsNum(
 	return result, nil
 }
 
-func (a *saramaAdminClient) CreateTopic(
-	_ context.Context, detail *TopicDetail, validateOnly bool,
-) error {
+func (a *saramaAdminClient) CreateTopic(detail *TopicDetail, validateOnly bool) error {
 	request := &sarama.TopicDetail{
 		NumPartitions:     detail.NumPartitions,
 		ReplicationFactor: detail.ReplicationFactor,
@@ -175,10 +164,17 @@ func (a *saramaAdminClient) CreateTopic(
 	return nil
 }
 
+func (a *saramaAdminClient) Heartbeat() {
+	brokers := a.client.Brokers()
+	for _, b := range brokers {
+		_, _ = b.ApiVersions(&sarama.ApiVersionsRequest{})
+	}
+}
+
 func (a *saramaAdminClient) Close() {
 	if err := a.admin.Close(); err != nil {
 		log.Warn("close admin client meet error",
-			zap.String("namespace", a.changefeed.Namespace()),
+			zap.String("keyspace", a.changefeed.Keyspace()),
 			zap.String("changefeed", a.changefeed.Name()),
 			zap.Error(err))
 	}

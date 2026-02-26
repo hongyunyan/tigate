@@ -205,7 +205,7 @@ for idx in $(seq 1 3); do
 		-A ${!host}:${!port} \
 		--status-addr ${!host}:${!status_port} \
 		--log-file "$OUT_DIR/tikv$idx.log" \
-		--log-level debug \
+		--log-level info \
 		-C "$OUT_DIR/tikv-config.toml" \
 		-s "$OUT_DIR/tikv$idx" &
 done
@@ -217,7 +217,7 @@ tikv-server \
 	-A ${DOWN_TIKV_HOST}:${DOWN_TIKV_PORT} \
 	--status-addr ${DOWN_TIKV_HOST}:${DOWN_TIKV_STATUS_PORT} \
 	--log-file "$OUT_DIR/tikv_down.log" \
-	--log-level debug \
+	--log-level info \
 	-C "$OUT_DIR/tikv-config.toml" \
 	-s "$OUT_DIR/tikv_down" &
 
@@ -286,8 +286,8 @@ while ! mysql -uroot -h${DOWN_TIDB_HOST} -P${DOWN_TIDB_PORT} --default-character
 	sleep 2
 done
 
-run_sql "update mysql.tidb set variable_value='60m' where variable_name='tikv_gc_life_time';" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
-run_sql "update mysql.tidb set variable_value='60m' where variable_name='tikv_gc_life_time';" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
+run_sql "SET GLOBAL tidb_gc_life_time='60m';" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
+run_sql "SET GLOBAL tidb_gc_life_time='60m';" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 run_sql "CREATE user 'normal'@'%' identified by '123456';" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 run_sql "GRANT select,insert,update,delete,index,create,drop,alter,create view,references ON *.* TO 'normal'@'%';" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}
 run_sql "FLUSH privileges" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT}

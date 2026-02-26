@@ -20,25 +20,18 @@ mkdir -p "$WORK_DIR"
 pkill -9 minio || true
 bin/minio server --address $S3_ENDPOINT "$WORK_DIR/s3" &
 MINIO_PID=$!
-i=0
-while ! curl -o /dev/null -v -s "http://$S3_ENDPOINT/"; do
-	i=$(($i + 1))
-	if [ $i -gt 30 ]; then
-		echo 'Failed to start minio'
-		exit 1
-	fi
-	sleep 2
-done
+check_minio $S3_ENDPOINT
 
 stop_minio() {
-	kill -2 $MINIO_PID
+	if [ $MINIO_PID -ne 0 ]; then
+		kill -2 $MINIO_PID || true
+	fi
 }
 
 stop() {
 	stop_minio
-	stop_tidb_cluster
+	stop_test $WORK_DIR
 }
-s3cmd --access_key=$MINIO_ACCESS_KEY --secret_key=$MINIO_SECRET_KEY --host=$S3_ENDPOINT --host-bucket=$S3_ENDPOINT --no-ssl mb s3://logbucket
 
 function run() {
 	if [ "$SINK_TYPE" == "storage" ]; then
@@ -50,7 +43,19 @@ function run() {
 	fi
 
 	start_tidb_cluster --workdir $WORK_DIR
-	cd $WORK_DIR
+
+	bin/minio server --address $S3_ENDPOINT "$WORK_DIR/s3" &
+	MINIO_PID=$!
+	i=0
+	while ! curl -o /dev/null -v -s "http://$S3_ENDPOINT/"; do
+		i=$(($i + 1))
+		if [ $i -gt 30 ]; then
+			echo 'Failed to start minio'
+			exit 1
+		fi
+		sleep 2
+	done
+	s3cmd --access_key=$MINIO_ACCESS_KEY --secret_key=$MINIO_SECRET_KEY --host=$S3_ENDPOINT --host-bucket=$S3_ENDPOINT --no-ssl mb s3://logbucket
 
 	# record tso before we create tables to skip the system table DDLs
 	start_ts=$(run_cdc_cli_tso_query $UP_PD_HOST_1 $UP_PD_PORT_1)
@@ -72,13 +77,13 @@ function run() {
 	case $SINK_TYPE in
 	"kafka")
 		SINK_URI="kafka://127.0.0.1:9092/$TOPIC_NAME_1?protocol=open-protocol&partition-num=4&kafka-version=${KAFKA_VERSION}&max-message-bytes=10485760"
-		cdc cli changefeed create -c=$cf_normal --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/normal.toml"
+		cdc_cli_changefeed create -c=$cf_normal --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/normal.toml"
 
 		SINK_URI="kafka://127.0.0.1:9092/$TOPIC_NAME_2?protocol=open-protocol&partition-num=4&kafka-version=${KAFKA_VERSION}&max-message-bytes=10485760"
-		cdc cli changefeed create -c=$cf_err1 --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/error-1.toml"
+		cdc_cli_changefeed create -c=$cf_err1 --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/error-1.toml"
 
 		SINK_URI="kafka://127.0.0.1:9092/$TOPIC_NAME_3?protocol=open-protocol&partition-num=4&kafka-version=${KAFKA_VERSION}&max-message-bytes=10485760"
-		cdc cli changefeed create -c=$cf_err2 --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/error-2.toml"
+		cdc_cli_changefeed create -c=$cf_err2 --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/error-2.toml"
 
 		run_kafka_consumer $WORK_DIR "kafka://127.0.0.1:9092/$TOPIC_NAME_1?protocol=open-protocol&partition-num=4&version=${KAFKA_VERSION}&max-message-bytes=10485760"
 		run_kafka_consumer $WORK_DIR "kafka://127.0.0.1:9092/$TOPIC_NAME_2?protocol=open-protocol&partition-num=4&version=${KAFKA_VERSION}&max-message-bytes=10485760"
@@ -86,9 +91,9 @@ function run() {
 		;;
 	*)
 		SINK_URI="mysql://normal:123456@127.0.0.1:3306/"
-		cdc cli changefeed create -c=$cf_normal --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/normal.toml"
-		cdc cli changefeed create -c=$cf_err1 --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/error-1.toml"
-		cdc cli changefeed create -c=$cf_err2 --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/error-2.toml"
+		cdc_cli_changefeed create -c=$cf_normal --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/normal.toml"
+		cdc_cli_changefeed create -c=$cf_err1 --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/error-1.toml"
+		cdc_cli_changefeed create -c=$cf_err2 --start-ts=$start_ts --sink-uri="$SINK_URI" --config="$CUR/conf/error-2.toml"
 		;;
 	esac
 
@@ -106,7 +111,7 @@ function run() {
 
 	check_changefeed_state "http://${UP_PD_HOST_1}:${UP_PD_PORT_1}" $cf_normal "normal" "null" ""
 	check_changefeed_state "http://${UP_PD_HOST_1}:${UP_PD_PORT_1}" $cf_err1 "normal" "null" ""
-	check_changefeed_state "http://${UP_PD_HOST_1}:${UP_PD_PORT_1}" $cf_err2 "failed" "ErrSyncRenameTableFailed" ""
+	do_retry 10 2 check_changefeed_state "http://${UP_PD_HOST_1}:${UP_PD_PORT_1}" $cf_err2 "failed" "ErrSyncRenameTableFailed" ""
 
 	check_sync_diff $WORK_DIR $CUR/conf/diff_config.toml 60
 

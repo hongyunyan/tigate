@@ -28,8 +28,6 @@ function prepare() {
 
 	start_tidb_cluster --workdir $WORK_DIR
 
-	cd $WORK_DIR
-
 	# record tso before we create tables to skip the system table DDLs
 	start_ts=$(run_cdc_cli_tso_query ${UP_PD_HOST_1} ${UP_PD_PORT_1})
 
@@ -45,7 +43,7 @@ function prepare() {
 		;;
 	*) SINK_URI="mysql://normal:123456@127.0.0.1:3306/" ;;
 	esac
-	run_cdc_cli changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI" -c "test"
+	do_retry 5 3 cdc_cli_changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI" -c "test"
 	case $SINK_TYPE in
 	kafka) run_kafka_consumer $WORK_DIR "kafka://127.0.0.1:9092/$TOPIC_NAME?protocol=open-protocol&partition-num=4&version=${KAFKA_VERSION}&max-message-bytes=10485760" ;;
 	storage) run_storage_consumer $WORK_DIR $SINK_URI "" "" ;;
@@ -70,20 +68,23 @@ function failOverCaseA-1() {
 	fi
 
 	# restart cdc server to enable failpoint
-	cdc_pid_1=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	cdc_pid_1=$(get_cdc_pid "$CDC_HOST" "$CDC_PORT")
 	kill_cdc_pid $cdc_pid_1
 	export GO_FAILPOINTS='github.com/pingcap/ticdc/downstreamadapter/dispatcher/BlockOrWaitReportAfterWrite=pause'
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "0-1" --addr "127.0.0.1:8300"
-	cdc_pid_1=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	cdc_pid_1=$(get_cdc_pid "$CDC_HOST" "$CDC_PORT")
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "1-1" --addr "127.0.0.1:8301"
 
 	run_sql "drop database fail_over_ddl_test;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 
 	## make ddl must reach the place and report to maintainer, and get the write status, and block in the place that report to maintainer
-	ensure 30 "run_sql 'show databases;' ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} && check_not_contains 'fail_over_ddl_test'"
+	# For kafka/pulsar consumer, ddl event will be flushed when the event's commitTs is bigger than the global watermark
+	if [ "$SINK_TYPE" == "mysql" ]; then
+		ensure 30 "run_sql 'show databases;' ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} && check_not_contains 'fail_over_ddl_test'"
+	fi
 
 	kill_cdc_pid $cdc_pid_1
-	cdc_pid_2=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	cdc_pid_2=$(get_cdc_pid "$CDC_HOST" "8301")
 	kill_cdc_pid $cdc_pid_2
 
 	export GO_FAILPOINTS=''
@@ -96,8 +97,7 @@ function failOverCaseA-1() {
 
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "1-2" --addr "127.0.0.1:8301"
 
-	run_sql "show databases;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} &&
-		check_not_contains "fail_over_test"
+	ensure 30 "run_sql 'show databases;' ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} && check_not_contains 'fail_over_ddl_test'"
 
 	## continue to write ddl and dml to test the cdc server is working well
 	run_sql_file $CUR/data/prepare.sql ${UP_TIDB_HOST} ${UP_TIDB_PORT}
@@ -107,6 +107,7 @@ function failOverCaseA-1() {
 	query_dispatcher_count "127.0.0.1:8300" "test" 3 10
 
 	cleanup_process $CDC_BINARY
+	stop_tidb_cluster
 
 	echo "failOverCaseA-1 passed successfully"
 }
@@ -120,20 +121,23 @@ function failOverCaseA-2() {
 	fi
 
 	# restart cdc server to enable failpoint
-	cdc_pid_1=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	cdc_pid_1=$(get_cdc_pid "$CDC_HOST" "$CDC_PORT")
 	kill_cdc_pid $cdc_pid_1
 	export GO_FAILPOINTS='github.com/pingcap/ticdc/downstreamadapter/dispatcher/BlockOrWaitReportAfterWrite=pause'
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "0-1" --addr "127.0.0.1:8300"
-	cdc_pid_1=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	cdc_pid_1=$(get_cdc_pid "$CDC_HOST" "$CDC_PORT")
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "1-1" --addr "127.0.0.1:8301"
 
 	run_sql "drop table fail_over_ddl_test.test1;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 
 	## make ddl must reach the place and report to maintainer, and get the write status, and block in the place that report to maintainer
-	ensure 30 "run_sql 'use fail_over_ddl_test;show tables;' ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} && check_not_contains 'test1'"
+	# For kafka/pulsar consumer, ddl event will be flushed when the event's commitTs is bigger than the global watermark
+	if [ "$SINK_TYPE" == "mysql" ]; then
+		ensure 30 "run_sql 'use fail_over_ddl_test;show tables;' ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} && check_not_contains 'test1'"
+	fi
 
 	kill_cdc_pid $cdc_pid_1
-	cdc_pid_2=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	cdc_pid_2=$(get_cdc_pid "$CDC_HOST" "8301")
 	kill_cdc_pid $cdc_pid_2
 
 	export GO_FAILPOINTS=''
@@ -146,9 +150,7 @@ function failOverCaseA-2() {
 
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "1-2" --addr "127.0.0.1:8301"
 
-	run_sql "use fail_over_ddl_test;show tables;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} &&
-		check_not_contains "test1" &&
-		check_contains "test2"
+	ensure 30 "run_sql 'use fail_over_ddl_test;show tables;' ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} && check_not_contains 'test1' && check_contains 'test2'"
 
 	ret=$?
 	if [ "$ret" != 0 ]; then
@@ -164,6 +166,7 @@ function failOverCaseA-2() {
 	query_dispatcher_count "127.0.0.1:8300" "test" 4 10
 
 	cleanup_process $CDC_BINARY
+	stop_tidb_cluster
 
 	echo "failOverCaseA-2 passed successfully"
 }
@@ -177,20 +180,24 @@ function failOverCaseA-3() {
 	fi
 
 	# restart cdc server to enable failpoint
-	cdc_pid_1=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	cdc_pid_1=$(get_cdc_pid "$CDC_HOST" "$CDC_PORT")
 	kill_cdc_pid $cdc_pid_1
+
 	export GO_FAILPOINTS='github.com/pingcap/ticdc/downstreamadapter/dispatcher/BlockOrWaitReportAfterWrite=pause'
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "0-1" --addr "127.0.0.1:8300"
-	cdc_pid_1=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	cdc_pid_1=$(get_cdc_pid "$CDC_HOST" "$CDC_PORT")
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "1-1" --addr "127.0.0.1:8301"
 
 	run_sql "rename table fail_over_ddl_test.test1 to fail_over_ddl_test.test4;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 
 	## make ddl must reach the place and report to maintainer, and get the write status, and block in the place that report to maintainer
-	ensure 30 "run_sql 'use fail_over_ddl_test;show tables;' ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} && check_not_contains 'test1' && check_contains 'test4'"
+	# For kafka/pulsar consumer, ddl event will be flushed when the event's commitTs is bigger than the global watermark
+	if [ "$SINK_TYPE" == "mysql" ]; then
+		ensure 30 "run_sql 'use fail_over_ddl_test;show tables;' ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} && check_not_contains 'test1' && check_contains 'test4'"
+	fi
 
 	kill_cdc_pid $cdc_pid_1
-	cdc_pid_2=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	cdc_pid_2=$(get_cdc_pid "$CDC_HOST" "8301")
 	kill_cdc_pid $cdc_pid_2
 
 	export GO_FAILPOINTS=''
@@ -203,10 +210,7 @@ function failOverCaseA-3() {
 
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "1-2" --addr "127.0.0.1:8301"
 
-	run_sql "use fail_over_ddl_test;show tables;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} &&
-		check_not_contains "test1" &&
-		check_contains "test2" &&
-		check_contains "test4"
+	ensure 30 "run_sql 'use fail_over_ddl_test;show tables;' ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} && check_not_contains 'test1' && check_contains 'test2' && check_contains 'test4'"
 
 	ret=$?
 	if [ "$ret" != 0 ]; then
@@ -223,6 +227,7 @@ function failOverCaseA-3() {
 	query_dispatcher_count "127.0.0.1:8300" "test" 5 10
 
 	cleanup_process $CDC_BINARY
+	stop_tidb_cluster
 
 	echo "failOverCaseA-3 passed successfully"
 }
@@ -236,11 +241,12 @@ function failOverCaseA-4() {
 	fi
 
 	# restart cdc server to enable failpoint
-	cdc_pid_1=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	cdc_pid_1=$(get_cdc_pid "$CDC_HOST" "$CDC_PORT")
 	kill_cdc_pid $cdc_pid_1
+
 	export GO_FAILPOINTS='github.com/pingcap/ticdc/downstreamadapter/dispatcher/BlockOrWaitReportAfterWrite=pause'
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "0-1" --addr "127.0.0.1:8300"
-	cdc_pid_1=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	cdc_pid_1=$(get_cdc_pid "$CDC_HOST" "$CDC_PORT")
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "1-1" --addr "127.0.0.1:8301"
 
 	run_sql "insert into fail_over_ddl_test.test1 values (2, 2);" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
@@ -249,10 +255,13 @@ function failOverCaseA-4() {
 	run_sql "truncate table fail_over_ddl_test.test1;" ${UP_TIDB_HOST} ${UP_TIDB_PORT}
 
 	## make ddl must reach the place and report to maintainer, and get the write status, and block in the place that report to maintainer
-	ensure 30 "run_sql 'select id from fail_over_ddl_test.test1;' ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} && check_not_contains '2'"
+	# For kafka/pulsar consumer, ddl event will be flushed when the event's commitTs is bigger than the global watermark
+	if [ "$SINK_TYPE" == "mysql" ]; then
+		ensure 30 "run_sql 'select id from fail_over_ddl_test.test1;' ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} && check_not_contains '2'"
+	fi
 
 	kill_cdc_pid $cdc_pid_1
-	cdc_pid_2=$(ps -C $CDC_BINARY -o pid= | awk '{print $1}')
+	cdc_pid_2=$(get_cdc_pid "$CDC_HOST" "8301")
 	kill_cdc_pid $cdc_pid_2
 
 	export GO_FAILPOINTS=''
@@ -265,9 +274,7 @@ function failOverCaseA-4() {
 
 	run_cdc_server --workdir $WORK_DIR --binary $CDC_BINARY --logsuffix "1-2" --addr "127.0.0.1:8301"
 
-	run_sql "use fail_over_ddl_test;show tables;" ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} &&
-		check_contains "test1" &&
-		check_contains "test2"
+	ensure 30 "run_sql 'use fail_over_ddl_test;show tables;' ${DOWN_TIDB_HOST} ${DOWN_TIDB_PORT} && check_contains 'test1' && check_contains 'test2'"
 
 	ret=$?
 	if [ "$ret" != 0 ]; then
@@ -284,11 +291,12 @@ function failOverCaseA-4() {
 	query_dispatcher_count "127.0.0.1:8300" "test" 5 10
 
 	cleanup_process $CDC_BINARY
+	stop_tidb_cluster
 
 	echo "failOverCaseA-4 passed successfully"
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 failOverCaseA-1
 failOverCaseA-2
 failOverCaseA-3

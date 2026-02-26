@@ -16,19 +16,16 @@ package common
 import (
 	"bytes"
 	"encoding/binary"
+	"regexp"
 	"strconv"
 
 	"github.com/google/uuid"
+	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
+	"github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/tidb/pkg/util/naming"
+	"go.uber.org/zap"
 )
-
-const (
-	// DefaultNamespace is the default namespace value,
-	// all the old changefeed will be put into default namespace
-	DefaultNamespace = "default"
-)
-
-var DefaultEndian = binary.LittleEndian
 
 type (
 	Ts      = uint64
@@ -94,6 +91,10 @@ func (d DispatcherID) Less(t any) bool {
 	return d.Low < cf.Low || d.Low == cf.Low && d.High < cf.High
 }
 
+func (d DispatcherID) IsZero() bool {
+	return d.Low == 0 && d.High == 0
+}
+
 type SchemaID int64
 
 type GID struct {
@@ -145,6 +146,10 @@ func (g GID) String() string {
 	return buf.String()
 }
 
+func (g GID) GetSize() int {
+	return 16
+}
+
 func NewGIDWithValue(Low uint64, High uint64) GID {
 	return GID{
 		Low:  Low,
@@ -152,25 +157,25 @@ func NewGIDWithValue(Low uint64, High uint64) GID {
 	}
 }
 
-// ChangeFeedDisplayName represents the user-friendly name and namespace of a changefeed.
+// ChangeFeedDisplayName represents the user-friendly name and keyspace of a changefeed.
 // This structure is used for external queries and display purposes.
 type ChangeFeedDisplayName struct {
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
+	Name     string `json:"name"`
+	Keyspace string `json:"keyspace"`
 }
 
-func NewChangeFeedDisplayName(name string, namespace string) ChangeFeedDisplayName {
+func NewChangeFeedDisplayName(name string, keyspace string) ChangeFeedDisplayName {
 	return ChangeFeedDisplayName{
-		Name:      name,
-		Namespace: namespace,
+		Name:     name,
+		Keyspace: keyspace,
 	}
 }
 
 func (r ChangeFeedDisplayName) String() string {
-	return r.Namespace + "/" + r.Name
+	return r.Keyspace + "/" + r.Name
 }
 
-// ChangefeedID is the unique identifier of a changefeed.
+// ChangeFeedID is the unique identifier of a changefeed.
 // GID is the inner unique identifier of a changefeed.
 // we can use Id to represent the changefeedID in performance-critical scenarios.
 // DisplayName is the user-friendly expression of a changefeed.
@@ -182,23 +187,32 @@ type ChangeFeedID struct {
 	DisplayName ChangeFeedDisplayName `json:"display"`
 }
 
-func NewChangefeedID() ChangeFeedID {
+func NewChangefeedID(keyspace string) ChangeFeedID {
 	cfID := ChangeFeedID{
 		Id: NewGID(),
 	}
+
+	if keyspace == "" {
+		keyspace = DefaultKeyspaceName
+	}
+
 	cfID.DisplayName = ChangeFeedDisplayName{
-		Name:      cfID.Id.String(),
-		Namespace: DefaultNamespace,
+		Name:     cfID.Id.String(),
+		Keyspace: keyspace,
 	}
 	return cfID
 }
 
-func NewChangeFeedIDWithName(name string) ChangeFeedID {
+func NewChangeFeedIDWithName(name string, keyspace string) ChangeFeedID {
+	if keyspace == "" {
+		keyspace = DefaultKeyspaceName
+	}
+
 	return ChangeFeedID{
 		Id: NewGID(),
 		DisplayName: ChangeFeedDisplayName{
-			Name:      name,
-			Namespace: DefaultNamespace,
+			Name:     name,
+			Keyspace: keyspace,
 		},
 	}
 }
@@ -218,8 +232,8 @@ func (cfID ChangeFeedID) Name() string {
 	return cfID.DisplayName.Name
 }
 
-func (cfID ChangeFeedID) Namespace() string {
-	return cfID.DisplayName.Namespace
+func (cfID ChangeFeedID) Keyspace() string {
+	return cfID.DisplayName.Keyspace
 }
 
 func (cfID ChangeFeedID) ID() GID {
@@ -233,8 +247,8 @@ func NewChangefeedIDFromPB(pb *heartbeatpb.ChangefeedID) ChangeFeedID {
 			High: pb.High,
 		},
 		DisplayName: ChangeFeedDisplayName{
-			Name:      pb.Name,
-			Namespace: pb.Namespace,
+			Name:     pb.Name,
+			Keyspace: pb.Keyspace,
 		},
 	}
 	return d
@@ -249,17 +263,35 @@ func NewChangefeedGIDFromPB(pb *heartbeatpb.ChangefeedID) GID {
 
 func (c ChangeFeedID) ToPB() *heartbeatpb.ChangefeedID {
 	return &heartbeatpb.ChangefeedID{
-		Low:       c.Id.Low,
-		High:      c.Id.High,
-		Name:      c.Name(),
-		Namespace: c.Namespace(),
+		Low:      c.Id.Low,
+		High:     c.Id.High,
+		Name:     c.Name(),
+		Keyspace: c.Keyspace(),
 	}
 }
 
-func NewChangefeedID4Test(namespace, name string) ChangeFeedID {
+const changeFeedIDMaxLen = 128
+
+var changeFeedIDRe = regexp.MustCompile(`^[a-zA-Z0-9]+(-[a-zA-Z0-9]+)*$`)
+
+// ValidateChangefeedID returns true if the changefeed ID matches
+// the pattern "^[a-zA-Z0-9]+(\-[a-zA-Z0-9]+)*$", length no more than "changeFeedIDMaxLen", eg, "simple-changefeed-task".
+func ValidateChangefeedID(changefeedID string) error {
+	if !changeFeedIDRe.MatchString(changefeedID) || len(changefeedID) > changeFeedIDMaxLen {
+		return errors.ErrInvalidChangefeedID.GenWithStackByArgs(changeFeedIDMaxLen)
+	}
+	return nil
+}
+
+// ValidateKeyspace use the naming rules of TiDB to check the validation of the keyspace
+func ValidateKeyspace(keyspace string) error {
+	return errors.Trace(naming.CheckKeyspaceName(keyspace))
+}
+
+func NewChangefeedID4Test(keyspace, name string) ChangeFeedID {
 	return NewChangeFeedIDWithDisplayName(ChangeFeedDisplayName{
-		Name:      name,
-		Namespace: namespace,
+		Name:     name,
+		Keyspace: keyspace,
 	})
 }
 
@@ -271,4 +303,74 @@ const (
 	PulsarSinkType
 	CloudStorageSinkType
 	BlackHoleSinkType
+	RedoSinkType
 )
+
+type RowType byte
+
+const (
+	// RowTypeDelete represents a delete row.
+	RowTypeDelete RowType = iota
+	// RowTypeInsert represents a insert row.
+	RowTypeInsert
+	// RowTypeUpdate represents a update row.
+	RowTypeUpdate
+)
+
+func (r RowType) String() string {
+	switch r {
+	case RowTypeDelete:
+		return "delete"
+	case RowTypeInsert:
+		return "insert"
+	case RowTypeUpdate:
+		return "update"
+	default:
+	}
+	log.Panic("RowType: invalid row type", zap.Uint8("rowType", uint8(r)))
+	return ""
+}
+
+const (
+	DefaultMode int64 = iota
+	RedoMode
+)
+
+func IsDefaultMode(mode int64) bool {
+	return mode == DefaultMode
+}
+
+func IsRedoMode(mode int64) bool {
+	return mode == RedoMode
+}
+
+func GetModeBySinkType(sinkType SinkType) int64 {
+	if sinkType == RedoSinkType {
+		return RedoMode
+	}
+	return DefaultMode
+}
+
+func StringMode(mode int64) string {
+	if mode == RedoMode {
+		return "redo"
+	}
+	return "default"
+}
+
+type KeyspaceMeta struct {
+	ID   uint32
+	Name string
+}
+
+const (
+	// DefaultKeyspaceName is the default keyspace value,
+	// all the old changefeed will be put into default keyspace
+	DefaultKeyspaceName = "default"
+	DefaultKeyspaceID   = uint32(0)
+)
+
+var DefaultKeyspace = KeyspaceMeta{
+	ID:   DefaultKeyspaceID,
+	Name: DefaultKeyspaceName,
+}

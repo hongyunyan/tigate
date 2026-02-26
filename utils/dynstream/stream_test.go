@@ -50,6 +50,7 @@ func newMockEvent(id int, path string, sleep time.Duration, work mockWork, start
 }
 
 type mockHandler struct {
+	mu            sync.Mutex
 	droppedEvents []*mockEvent
 }
 
@@ -74,20 +75,25 @@ func (h *mockHandler) Handle(dest any, events ...*mockEvent) (await bool) {
 	if event.done != nil {
 		event.done.Done()
 	}
-
 	return false
 }
 
 func (h *mockHandler) GetSize(event *mockEvent) int            { return 0 }
 func (h *mockHandler) GetArea(path string, dest any) int       { return 0 }
+func (h *mockHandler) GetMetricLabel(dest any) string          { return "test" }
 func (h *mockHandler) GetTimestamp(event *mockEvent) Timestamp { return 0 }
 func (h *mockHandler) GetType(event *mockEvent) EventType      { return DefaultEventType }
 func (h *mockHandler) IsPaused(event *mockEvent) bool          { return false }
-func (h *mockHandler) OnDrop(event *mockEvent) {
+func (h *mockHandler) OnDrop(event *mockEvent) interface{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.droppedEvents = append(h.droppedEvents, event)
+	return nil
 }
 
 func (h *mockHandler) drainDroppedEvents() []*mockEvent {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	events := h.droppedEvents
 	h.droppedEvents = nil
 	return events
@@ -117,12 +123,12 @@ func newInc(num int64, inc *atomic.Int64, notify ...*sync.WaitGroup) *Inc {
 
 func TestStreamBasic(t *testing.T) {
 	handler := mockHandler{}
-	stream := newStream(1, &handler, Option{UseBuffer: false})
+	stream := newStream(1, "test", &handler, Option{UseBuffer: false})
 	require.Equal(t, 0, stream.getPendingSize())
 
 	stream.start()
 	defer stream.close()
-	pi := newPathInfo[int, string, *mockEvent, any, *mockHandler](1, "test/path", nil)
+	pi := newPathInfo[int, string, *mockEvent, any, *mockHandler](1, "test", "test/path", nil)
 	stream.addPath(pi)
 	// Test basic event handling
 	inc := &atomic.Int64{}
@@ -137,7 +143,7 @@ func TestStreamBasic(t *testing.T) {
 	}
 
 	// Send event to stream
-	stream.in() <- newEvent(1)
+	stream.addEvent(newEvent(1))
 
 	notify.Wait()
 	// Verify event was processed
@@ -145,8 +151,8 @@ func TestStreamBasic(t *testing.T) {
 	require.Equal(t, 0, stream.getPendingSize())
 
 	// Test multiple events
-	stream.in() <- newEvent(2)
-	stream.in() <- newEvent(3)
+	stream.addEvent(newEvent(2))
+	stream.addEvent(newEvent(3))
 
 	notify.Wait()
 	// Verify all events were processed
@@ -156,12 +162,12 @@ func TestStreamBasic(t *testing.T) {
 
 func TestStreamBasicWithBuffer(t *testing.T) {
 	handler := mockHandler{}
-	stream := newStream(1, &handler, Option{UseBuffer: true})
+	stream := newStream(1, "test", &handler, Option{UseBuffer: true})
 	require.Equal(t, 0, stream.getPendingSize())
 
 	stream.start()
 	defer stream.close()
-	pi := newPathInfo[int, string, *mockEvent, any, *mockHandler](1, "test/path", nil)
+	pi := newPathInfo[int, string, *mockEvent, any, *mockHandler](1, "test", "test/path", nil)
 	stream.addPath(pi)
 	// Test basic event handling
 	inc := &atomic.Int64{}
@@ -176,7 +182,7 @@ func TestStreamBasicWithBuffer(t *testing.T) {
 	}
 
 	// Send event to stream
-	stream.in() <- newEvent(1)
+	stream.addEvent(newEvent(1))
 
 	notify.Wait()
 	// Verify event was processed
@@ -184,8 +190,8 @@ func TestStreamBasicWithBuffer(t *testing.T) {
 	require.Equal(t, 0, stream.getPendingSize())
 
 	// Test multiple events
-	stream.in() <- newEvent(2)
-	stream.in() <- newEvent(3)
+	stream.addEvent(newEvent(2))
+	stream.addEvent(newEvent(3))
 
 	notify.Wait()
 	// Verify all events were processed
@@ -195,10 +201,8 @@ func TestStreamBasicWithBuffer(t *testing.T) {
 
 func TestPathInfo(t *testing.T) {
 	// case 1: new path info
-	pi := newPathInfo[int, string, *mockEvent, any, *mockHandler](1, "test/path", nil)
+	pi := newPathInfo[int, string, *mockEvent, any, *mockHandler](1, "test", "test/path", nil)
 	require.Equal(t, 1, pi.area)
 	require.Equal(t, "test/path", pi.path)
 	require.Equal(t, int64(0), pi.pendingSize.Load())
-	require.Equal(t, false, pi.paused.Load())
-	require.Equal(t, time.Unix(0, 0), pi.lastSendFeedbackTime.Load())
 }

@@ -14,8 +14,6 @@ function prepare_tidb_cluster() {
 	rm -rf $WORK_DIR && mkdir -p $WORK_DIR
 	start_tidb_cluster --workdir $WORK_DIR
 
-	cd $WORK_DIR
-
 	# record tso before we create tables to skip the system table DDLs
 	start_ts=$(run_cdc_cli_tso_query ${UP_PD_HOST_1} ${UP_PD_PORT_1})
 
@@ -55,7 +53,7 @@ function try_to_run_cdc() {
 		;;
 	*) SINK_URI="mysql+ssl://normal:123456@127.0.0.1:3306/" ;;
 	esac
-	run_cdc_cli changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI"
+	cdc_cli_changefeed create --start-ts=$start_ts --sink-uri="$SINK_URI"
 	case $SINK_TYPE in
 	kafka) run_kafka_consumer $WORK_DIR "kafka://127.0.0.1:9092/$TOPIC_NAME?protocol=open-protocol&partition-num=4&version=${KAFKA_VERSION}&max-message-bytes=10485760" ;;
 	storage) run_storage_consumer $WORK_DIR $SINK_URI "" "" ;;
@@ -66,14 +64,14 @@ function try_to_run_cdc() {
 
 stop_cdc() {
 	echo "Later, cdc will receive a signal(SIGINT) and exit"
-	cdc_pid=$(ps -a | grep -m 1 "cdc.test" | awk '{print $1}')
+	cdc_pid=$(get_cdc_pid "$CDC_HOST" "$CDC_PORT")
 	echo "cdc pid is "$cdc_pid
 	sleep 60
 	kill_cdc_pid $cdc_pid
 	sleep 30
 }
 
-trap stop_tidb_cluster EXIT
+trap 'stop_test $WORK_DIR' EXIT
 prepare_tidb_cluster
 
 # If cdc gets started normally, no usage tips should be printed when exit

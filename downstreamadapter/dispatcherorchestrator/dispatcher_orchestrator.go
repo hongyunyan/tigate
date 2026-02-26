@@ -16,19 +16,22 @@ package dispatcherorchestrator
 import (
 	"context"
 	"encoding/json"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/downstreamadapter/dispatcher"
 	"github.com/pingcap/ticdc/downstreamadapter/dispatchermanager"
 	"github.com/pingcap/ticdc/heartbeatpb"
-	"github.com/pingcap/ticdc/pkg/apperror"
 	"github.com/pingcap/ticdc/pkg/common"
 	appcontext "github.com/pingcap/ticdc/pkg/common/context"
 	"github.com/pingcap/ticdc/pkg/config"
+	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/messaging"
 	"github.com/pingcap/ticdc/pkg/metrics"
 	"github.com/pingcap/ticdc/pkg/node"
+	"github.com/pingcap/ticdc/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -36,36 +39,116 @@ import (
 // for different change feeds based on maintainer bootstrap messages.
 type DispatcherOrchestrator struct {
 	mc                 messaging.MessageCenter
-	dispatcherManagers map[common.ChangeFeedID]*dispatchermanager.EventDispatcherManager
+	mutex              sync.Mutex // protect dispatcherManagers
+	dispatcherManagers map[common.ChangeFeedID]*dispatchermanager.DispatcherManager
+
+	// Fields for asynchronous message processing
+	msgQueue *pendingMessageQueue
+	wg       sync.WaitGroup
+
+	// closed indicates Close has been invoked and no more messages should be enqueued.
+	closed atomic.Bool
+	// msgGuardWaitGroup waits for in-flight RecvMaintainerRequest handlers before shutdown.
+	msgGuardWaitGroup util.GuardedWaitGroup
 }
 
 func New() *DispatcherOrchestrator {
 	m := &DispatcherOrchestrator{
 		mc:                 appcontext.GetService[messaging.MessageCenter](appcontext.MessageCenter),
-		dispatcherManagers: make(map[common.ChangeFeedID]*dispatchermanager.EventDispatcherManager),
+		dispatcherManagers: make(map[common.ChangeFeedID]*dispatchermanager.DispatcherManager),
+		msgQueue:           newPendingMessageQueue(),
 	}
 	m.mc.RegisterHandler(messaging.DispatcherManagerManagerTopic, m.RecvMaintainerRequest)
 	return m
 }
 
+// Run starts the message handling goroutine
+func (m *DispatcherOrchestrator) Run() {
+	log.Info("dispatcher orchestrator is running")
+
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.handleMessages()
+	}()
+}
+
 // RecvMaintainerRequest is the handler for the maintainer request message.
-// It will delegate the request to the corresponding handler based on the message type.
+// It puts the message into a queue for asynchronous processing to avoid blocking the message center.
 func (m *DispatcherOrchestrator) RecvMaintainerRequest(
 	_ context.Context,
 	msg *messaging.TargetMessage,
 ) error {
+	if !m.msgGuardWaitGroup.AddIf(func() bool { return !m.closed.Load() }) {
+		log.Debug("dispatcher orchestrator already closed, drop message", zap.Any("message", msg.Message))
+		return nil
+	}
+	defer m.msgGuardWaitGroup.Done()
+
+	key, ok := getPendingMessageKey(msg)
+	if !ok {
+		log.Warn("unknown message type, drop message",
+			zap.String("type", msg.Type.String()),
+			zap.Any("message", msg.Message))
+		return nil
+	}
+
+	// De-duplicate by (changefeedID, messageType) to avoid floods of retry messages.
+	_ = m.msgQueue.TryEnqueue(key, msg)
+	return nil
+}
+
+func getPendingMessageKey(msg *messaging.TargetMessage) (pendingMessageKey, bool) {
+	var changefeedID *heartbeatpb.ChangefeedID
 	switch req := msg.Message[0].(type) {
 	case *heartbeatpb.MaintainerBootstrapRequest:
-		return m.handleBootstrapRequest(msg.From, req)
+		changefeedID = req.ChangefeedID
 	case *heartbeatpb.MaintainerPostBootstrapRequest:
-		// Only the event dispatcher manager with table trigger event dispatcher will receive the post bootstrap request
-		return m.handlePostBootstrapRequest(msg.From, req)
+		changefeedID = req.ChangefeedID
 	case *heartbeatpb.MaintainerCloseRequest:
-		return m.handleCloseRequest(msg.From, req)
+		changefeedID = req.ChangefeedID
 	default:
-		log.Panic("unknown message type", zap.Any("message", msg.Message))
+		return pendingMessageKey{}, false
 	}
-	return nil
+	return pendingMessageKey{
+		changefeedID: common.NewChangefeedIDFromPB(changefeedID),
+		msgType:      msg.Type,
+	}, true
+}
+
+// handleMessages processes messages from the queue
+func (m *DispatcherOrchestrator) handleMessages() {
+	for {
+		key, ok := m.msgQueue.Pop()
+		if !ok {
+			log.Info("dispatcher orchestrator is shutting down, exit handleMessages")
+			return
+		}
+		msg := m.msgQueue.Get(key)
+
+		// Process the message
+		switch req := msg.Message[0].(type) {
+		case *heartbeatpb.MaintainerBootstrapRequest:
+			if err := m.handleBootstrapRequest(msg.From, req); err != nil {
+				log.Error("failed to handle bootstrap request", zap.Error(err))
+			}
+		case *heartbeatpb.MaintainerPostBootstrapRequest:
+			// Only the event dispatcher manager with table trigger event dispatcher will receive the post bootstrap request
+			if err := m.handlePostBootstrapRequest(msg.From, req); err != nil {
+				log.Error("failed to handle post bootstrap request", zap.Error(err))
+			}
+		case *heartbeatpb.MaintainerCloseRequest:
+			if err := m.handleCloseRequest(msg.From, req); err != nil {
+				log.Error("failed to handle close request", zap.Error(err))
+			}
+		default:
+			log.Warn("unknown message type, ignore it",
+				zap.String("type", msg.Type.String()),
+				zap.Any("message", msg.Message))
+		}
+
+		m.msgQueue.Done(key)
+	}
 }
 
 func (m *DispatcherOrchestrator) handleBootstrapRequest(
@@ -77,43 +160,51 @@ func (m *DispatcherOrchestrator) handleBootstrapRequest(
 	cfConfig := &config.ChangefeedConfig{}
 	if err := json.Unmarshal(req.Config, cfConfig); err != nil {
 		log.Panic("failed to unmarshal changefeed config",
-			zap.String("changefeedID", cfId.Name()), zap.Error(err))
-		return err
+			zap.String("changefeedID", cfId.Name()), zap.Any("data", req.Config), zap.Error(err))
 	}
 
+	m.mutex.Lock()
 	manager, exists := m.dispatcherManagers[cfId]
+	m.mutex.Unlock()
+
 	var err error
-	var startTs uint64
 	if !exists {
-		manager, startTs, err = dispatchermanager.
-			NewEventDispatcherManager(
-				cfId,
-				cfConfig,
-				req.TableTriggerEventDispatcherId,
-				req.StartTs,
-				from,
-				req.IsNewChangefeed,
-			)
-			// Fast return the error to maintainer.
+		start := time.Now()
+		manager, err = dispatchermanager.NewDispatcherManager(
+			req.KeyspaceId,
+			cfId,
+			cfConfig,
+			req.TableTriggerEventDispatcherId,
+			req.TableTriggerRedoDispatcherId,
+			req.StartTs,
+			from,
+			req.IsNewChangefeed,
+		)
+		// Fast return the error to maintainer.
 		if err != nil {
 			log.Error("failed to create new dispatcher manager",
-				zap.Any("changefeedID", cfId.Name()), zap.Error(err))
+				zap.Any("changefeedID", cfId.Name()), zap.Duration("duration", time.Since(start)), zap.Error(err))
 
-			appcontext.GetService[*dispatchermanager.HeartBeatCollector](appcontext.HeartbeatCollector).RemoveEventDispatcherManager(manager)
+			appcontext.GetService[*dispatchermanager.HeartBeatCollector](appcontext.HeartbeatCollector).RemoveDispatcherManager(cfId)
 
 			response := &heartbeatpb.MaintainerBootstrapResponse{
 				ChangefeedID: req.ChangefeedID,
 				Err: &heartbeatpb.RunningError{
 					Time:    time.Now().String(),
 					Node:    from.String(),
-					Code:    string(apperror.ErrorCode(err)),
+					Code:    string(errors.ErrorCode(err)),
 					Message: err.Error(),
 				},
 			}
+			log.Error("create new dispatcher manager failed",
+				zap.Any("changefeedID", cfId.Name()), zap.Duration("duration", time.Since(start)), zap.Error(err))
+
 			return m.sendResponse(from, messaging.MaintainerManagerTopic, response)
 		}
+		m.mutex.Lock()
 		m.dispatcherManagers[cfId] = manager
-		metrics.EventDispatcherManagerGauge.WithLabelValues(cfId.Namespace(), cfId.Name()).Inc()
+		m.mutex.Unlock()
+		metrics.DispatcherManagerGauge.WithLabelValues(cfId.Keyspace(), cfId.Name()).Inc()
 	} else {
 		// Check and potentially add a table trigger event dispatcher.
 		// This is necessary during maintainer node migration, as the existing
@@ -122,7 +213,7 @@ func (m *DispatcherOrchestrator) handleBootstrapRequest(
 		if req.TableTriggerEventDispatcherId != nil {
 			tableTriggerDispatcher := manager.GetTableTriggerEventDispatcher()
 			if tableTriggerDispatcher == nil {
-				startTs, err = manager.NewTableTriggerEventDispatcher(
+				err = manager.NewTableTriggerEventDispatcher(
 					req.TableTriggerEventDispatcherId,
 					req.StartTs,
 					false,
@@ -132,8 +223,21 @@ func (m *DispatcherOrchestrator) handleBootstrapRequest(
 						zap.Stringer("changefeedID", cfId), zap.Error(err))
 					return m.handleDispatcherError(from, req.ChangefeedID, err)
 				}
-			} else {
-				startTs = tableTriggerDispatcher.GetStartTs()
+			}
+		}
+		if req.TableTriggerRedoDispatcherId != nil {
+			tableTriggerRedoDispatcher := manager.GetTableTriggerRedoDispatcher()
+			if tableTriggerRedoDispatcher == nil {
+				err = manager.NewTableTriggerRedoDispatcher(
+					req.TableTriggerRedoDispatcherId,
+					req.StartTs,
+					false,
+				)
+				if err != nil {
+					log.Error("failed to create new table trigger redo dispatcher",
+						zap.Stringer("changefeedID", cfId), zap.Error(err))
+					return m.handleDispatcherError(from, req.ChangefeedID, err)
+				}
 			}
 		}
 	}
@@ -151,7 +255,19 @@ func (m *DispatcherOrchestrator) handleBootstrapRequest(
 			zap.String("changefeed", cfId.Name()), zap.Uint64("epoch", cfConfig.Epoch))
 	}
 
-	response := createBootstrapResponse(req.ChangefeedID, manager, startTs)
+	var (
+		startTs     uint64
+		redoStartTs uint64
+	)
+	if tableTriggerDispatcher := manager.GetTableTriggerEventDispatcher(); tableTriggerDispatcher != nil {
+		startTs = tableTriggerDispatcher.GetStartTs()
+	}
+	if manager.RedoEnable {
+		if tableTriggerRedoDispatcher := manager.GetTableTriggerRedoDispatcher(); tableTriggerRedoDispatcher != nil {
+			redoStartTs = tableTriggerRedoDispatcher.GetStartTs()
+		}
+	}
+	response := createBootstrapResponse(req.ChangefeedID, manager, startTs, redoStartTs)
 	return m.sendResponse(from, messaging.MaintainerManagerTopic, response)
 }
 
@@ -164,7 +280,11 @@ func (m *DispatcherOrchestrator) handlePostBootstrapRequest(
 	req *heartbeatpb.MaintainerPostBootstrapRequest,
 ) error {
 	cfId := common.NewChangefeedIDFromPB(req.ChangefeedID)
+
+	m.mutex.Lock()
 	manager, exists := m.dispatcherManagers[cfId]
+	m.mutex.Unlock()
+
 	if !exists || manager.GetTableTriggerEventDispatcher() == nil {
 		log.Error("Receive post bootstrap request but there is no table trigger event dispatcher",
 			zap.Any("changefeedID", cfId.Name()))
@@ -179,7 +299,7 @@ func (m *DispatcherOrchestrator) handlePostBootstrapRequest(
 			zap.String("actualDispatcherID",
 				common.NewDispatcherIDFromPB(req.TableTriggerEventDispatcherId).String()))
 
-		err := apperror.ErrChangefeedInitTableTriggerEventDispatcherFailed.
+		err := errors.ErrChangefeedInitTableTriggerDispatcherFailed.
 			GenWithStackByArgs("Receive post bootstrap request but the table trigger event dispatcher id is not match")
 
 		response := &heartbeatpb.MaintainerPostBootstrapResponse{
@@ -187,7 +307,7 @@ func (m *DispatcherOrchestrator) handlePostBootstrapRequest(
 			Err: &heartbeatpb.RunningError{
 				Time:    time.Now().String(),
 				Node:    from.String(),
-				Code:    string(apperror.ErrorCode(err)),
+				Code:    string(errors.ErrorCode(err)),
 				Message: err.Error(),
 			},
 		}
@@ -201,6 +321,14 @@ func (m *DispatcherOrchestrator) handlePostBootstrapRequest(
 		log.Error("failed to initialize table trigger event dispatcher",
 			zap.Any("changefeedID", cfId.Name()), zap.Error(err))
 		return m.handleDispatcherError(from, req.ChangefeedID, err)
+	}
+	if manager.RedoEnable {
+		err := manager.InitalizeTableTriggerRedoDispatcher(req.RedoSchemas)
+		if err != nil {
+			log.Error("failed to initialize table trigger redo dispatcher",
+				zap.Any("changefeedID", cfId.Name()), zap.Error(err))
+			return m.handleDispatcherError(from, req.ChangefeedID, err)
+		}
 	}
 
 	response := &heartbeatpb.MaintainerPostBootstrapResponse{
@@ -220,45 +348,47 @@ func (m *DispatcherOrchestrator) handleCloseRequest(
 		Success:      true,
 	}
 
+	m.mutex.Lock()
 	if manager, ok := m.dispatcherManagers[cfId]; ok {
 		if closed := manager.TryClose(req.Removed); closed {
 			delete(m.dispatcherManagers, cfId)
-			metrics.EventDispatcherManagerGauge.WithLabelValues(cfId.Namespace(), cfId.Name()).Dec()
+			metrics.DispatcherManagerGauge.WithLabelValues(cfId.Keyspace(), cfId.Name()).Dec()
 			response.Success = true
 		} else {
 			response.Success = false
 		}
 	}
+	m.mutex.Unlock()
 
 	log.Info("try close dispatcher manager",
-		zap.String("changefeed", cfId.Name()), zap.Bool("success", response.Success))
+		zap.String("changefeed", cfId.String()), zap.Bool("success", response.Success))
 	return m.sendResponse(from, messaging.MaintainerTopic, response)
 }
 
 func createBootstrapResponse(
 	changefeedID *heartbeatpb.ChangefeedID,
-	manager *dispatchermanager.EventDispatcherManager,
-	startTs uint64,
+	manager *dispatchermanager.DispatcherManager,
+	startTs, redoStartTs uint64,
 ) *heartbeatpb.MaintainerBootstrapResponse {
 	response := &heartbeatpb.MaintainerBootstrapResponse{
 		ChangefeedID: changefeedID,
 		Spans:        make([]*heartbeatpb.BootstrapTableSpan, 0, manager.GetDispatcherMap().Len()),
 	}
 
+	// table trigger event dispatcher startTs
 	if startTs != 0 {
 		response.CheckpointTs = startTs
 	}
 
-	manager.GetDispatcherMap().ForEach(func(id common.DispatcherID, d *dispatcher.Dispatcher) {
-		response.Spans = append(response.Spans, &heartbeatpb.BootstrapTableSpan{
-			ID:              id.ToPB(),
-			SchemaID:        d.GetSchemaID(),
-			Span:            d.GetTableSpan(),
-			ComponentStatus: d.GetComponentStatus(),
-			CheckpointTs:    d.GetCheckpointTs(),
-			BlockState:      d.GetBlockEventStatus(),
-		})
-	})
+	retrieveDispatcherSpanForBootstrapResponse(manager, response)
+	if manager.RedoEnable {
+		// table trigger redo dispatcher startTs
+		if redoStartTs != 0 {
+			response.RedoCheckpointTs = redoStartTs
+		}
+		retrieveRedoDispatcherSpanForBootstrapResponse(manager, response)
+	}
+	retrieveOperatorsForBootstrapResponse(changefeedID, manager, response)
 
 	return response
 }
@@ -273,7 +403,31 @@ func (m *DispatcherOrchestrator) sendResponse(to node.ID, topic string, msg mess
 }
 
 func (m *DispatcherOrchestrator) Close() {
+	if !m.closed.CompareAndSwap(false, true) {
+		return
+	}
+	log.Info("dispatcher orchestrator is closing")
 	m.mc.DeRegisterHandler(messaging.DispatcherManagerManagerTopic)
+
+	// Wait until all in-flight RecvMaintainerRequest calls finish using msgQueue.
+	m.msgGuardWaitGroup.Wait()
+
+	// Close the message queue to unblock handleMessages.
+	m.msgQueue.Close()
+
+	m.wg.Wait()
+
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	for len(m.dispatcherManagers) > 0 {
+		for id, manager := range m.dispatcherManagers {
+			ok := manager.TryClose(false)
+			if ok {
+				delete(m.dispatcherManagers, id)
+			}
+		}
+	}
+	log.Info("dispatcher orchestrator closed")
 }
 
 // handleDispatcherError creates and sends an error response for create dispatcher-related failures
@@ -287,9 +441,86 @@ func (m *DispatcherOrchestrator) handleDispatcherError(
 		Err: &heartbeatpb.RunningError{
 			Time:    time.Now().String(),
 			Node:    from.String(),
-			Code:    string(apperror.ErrorCode(err)),
+			Code:    string(errors.ErrorCode(err)),
 			Message: err.Error(),
 		},
 	}
 	return m.sendResponse(from, messaging.MaintainerManagerTopic, response)
+}
+
+func retrieveRedoDispatcherSpanForBootstrapResponse(
+	manager *dispatchermanager.DispatcherManager,
+	response *heartbeatpb.MaintainerBootstrapResponse,
+) {
+	manager.GetRedoDispatcherMap().ForEach(func(id common.DispatcherID, d *dispatcher.RedoDispatcher) {
+		response.Spans = append(response.Spans, &heartbeatpb.BootstrapTableSpan{
+			ID:              id.ToPB(),
+			SchemaID:        d.GetSchemaID(),
+			Span:            d.GetTableSpan(),
+			ComponentStatus: d.GetComponentStatus(),
+			CheckpointTs:    d.GetCheckpointTs(),
+			BlockState:      d.GetBlockEventStatus(),
+			Mode:            d.GetMode(),
+		})
+	})
+}
+
+func retrieveDispatcherSpanForBootstrapResponse(
+	manager *dispatchermanager.DispatcherManager,
+	response *heartbeatpb.MaintainerBootstrapResponse,
+) {
+	manager.GetDispatcherMap().ForEach(func(id common.DispatcherID, d *dispatcher.EventDispatcher) {
+		response.Spans = append(response.Spans, &heartbeatpb.BootstrapTableSpan{
+			ID:              id.ToPB(),
+			SchemaID:        d.GetSchemaID(),
+			Span:            d.GetTableSpan(),
+			ComponentStatus: d.GetComponentStatus(),
+			CheckpointTs:    d.GetCheckpointTs(),
+			BlockState:      d.GetBlockEventStatus(),
+			Mode:            d.GetMode(),
+		})
+	})
+}
+
+func retrieveOperatorsForBootstrapResponse(
+	changefeedID *heartbeatpb.ChangefeedID,
+	manager *dispatchermanager.DispatcherManager,
+	response *heartbeatpb.MaintainerBootstrapResponse,
+) {
+	manager.GetCurrentOperatorMap().Range(func(key, value any) bool {
+		req := value.(dispatchermanager.SchedulerDispatcherRequest)
+		dispatcherID := common.NewDispatcherIDFromPB(req.Config.DispatcherID)
+		if common.IsRedoMode(req.Config.Mode) {
+			if manager.RedoEnable && manager.GetRedoDispatcherMap() != nil {
+				_, ok := manager.GetRedoDispatcherMap().Get(dispatcherID)
+				// Log error if dispatcher not found and action is not create
+				// It's possible that the dispatcher is not found when the action is create
+				// because the dispatcher may be created after the operator is stored
+				if !ok && req.ScheduleAction != heartbeatpb.ScheduleAction_Create {
+					log.Error("Redo dispatcher not found, this should not happen",
+						zap.String("changefeed", changefeedID.String()),
+						zap.String("dispatcherID", req.Config.DispatcherID.String()),
+					)
+				}
+			}
+		} else {
+			_, ok := manager.GetDispatcherMap().Get(dispatcherID)
+			// Log error if dispatcher not found and action is not create
+			// It's possible that the dispatcher is not found when the action is create
+			// because the dispatcher may be created after the operator is stored
+			if !ok && req.ScheduleAction != heartbeatpb.ScheduleAction_Create {
+				log.Error("Dispatcher not found, this should not happen",
+					zap.String("changefeed", changefeedID.String()),
+					zap.String("dispatcherID", req.Config.DispatcherID.String()),
+				)
+			}
+		}
+		response.Operators = append(response.Operators, &heartbeatpb.ScheduleDispatcherRequest{
+			ChangefeedID:   req.ChangefeedID,
+			Config:         req.Config,
+			ScheduleAction: req.ScheduleAction,
+			OperatorType:   req.OperatorType,
+		})
+		return true
+	})
 }

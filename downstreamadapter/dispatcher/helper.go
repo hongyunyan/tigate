@@ -15,6 +15,7 @@ package dispatcher
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/log"
@@ -45,7 +46,7 @@ func (r *ResendTaskMap) Get(identifier BlockEventIdentifier) *ResendTask {
 }
 
 func (r *ResendTaskMap) Set(identifier BlockEventIdentifier, task *ResendTask) {
-	log.Info("set resend task", zap.Any("identifier", identifier), zap.Any("task", task))
+	log.Info("set resend task", zap.Any("identifier", identifier), zap.Any("taskDispatcherID", task.dispatcher.GetId()))
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 	r.m[identifier] = task
@@ -63,6 +64,16 @@ func (r *ResendTaskMap) Len() int {
 	return len(r.m)
 }
 
+func (r *ResendTaskMap) Keys() []BlockEventIdentifier {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	keys := make([]BlockEventIdentifier, 0, len(r.m))
+	for key := range r.m {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
 // Considering the sync point event and ddl event may have the same commitTs,
 // we need to distinguish them.
 type BlockEventIdentifier struct {
@@ -74,6 +85,7 @@ type BlockEventStatus struct {
 	mutex             sync.Mutex
 	blockPendingEvent commonEvent.BlockEvent
 	blockStage        heartbeatpb.BlockStage
+	blockCommitTs     uint64
 }
 
 func (b *BlockEventStatus) clear() {
@@ -82,6 +94,7 @@ func (b *BlockEventStatus) clear() {
 
 	b.blockPendingEvent = nil
 	b.blockStage = heartbeatpb.BlockStage_NONE
+	b.blockCommitTs = 0
 }
 
 func (b *BlockEventStatus) setBlockEvent(event commonEvent.BlockEvent, blockStage heartbeatpb.BlockStage) {
@@ -90,6 +103,7 @@ func (b *BlockEventStatus) setBlockEvent(event commonEvent.BlockEvent, blockStag
 
 	b.blockPendingEvent = event
 	b.blockStage = blockStage
+	b.blockCommitTs = event.GetCommitTs()
 }
 
 func (b *BlockEventStatus) updateBlockStage(blockStage heartbeatpb.BlockStage) {
@@ -98,11 +112,44 @@ func (b *BlockEventStatus) updateBlockStage(blockStage heartbeatpb.BlockStage) {
 	b.blockStage = blockStage
 }
 
+func (b *BlockEventStatus) getEvent() commonEvent.BlockEvent {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	return b.blockPendingEvent
+}
+
 func (b *BlockEventStatus) getEventAndStage() (commonEvent.BlockEvent, heartbeatpb.BlockStage) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
 	return b.blockPendingEvent, b.blockStage
+}
+
+// actionMatchs checks whether the action is for the current pending ddl/sync point event.
+func (b *BlockEventStatus) actionMatchs(action *heartbeatpb.DispatcherAction) bool {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	if b.blockPendingEvent == nil {
+		return false
+	}
+
+	if b.blockStage != heartbeatpb.BlockStage_WAITING {
+		return false
+	}
+
+	return b.blockCommitTs == action.CommitTs
+}
+
+func (b *BlockEventStatus) getEventCommitTs() (uint64, bool) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	if b.blockPendingEvent == nil {
+		return 0, false
+	}
+	return b.blockCommitTs, true
 }
 
 type SchemaIDToDispatchers struct {
@@ -180,6 +227,11 @@ func (s *ComponentStateWithMutex) Get() heartbeatpb.ComponentState {
 	return s.componentStatus
 }
 
+type TableSpanStatusWithSeq struct {
+	*heartbeatpb.TableSpanStatus
+	Seq uint64
+}
+
 /*
 HeartBeatInfo is used to collect the message for HeartBeatRequest for each dispatcher.
 Mainly about the progress of each dispatcher:
@@ -188,35 +240,45 @@ Mainly about the progress of each dispatcher:
 type HeartBeatInfo struct {
 	heartbeatpb.Watermark
 	Id              common.DispatcherID
-	TableSpan       *heartbeatpb.TableSpan
 	ComponentStatus heartbeatpb.ComponentState
 	IsRemoving      bool
 }
 
-// Resend Task is reponsible for resending the TableSpanBlockStatus message with ddl info to maintainer each 50ms.
-// The task will be cancelled when the the dispatcher received the ack message from the maintainer
+// ResendTask is responsible for periodically resending the TableSpanBlockStatus message to the maintainer.
+// The task will be cancelled when the dispatcher receives the ACK message from the maintainer.
 type ResendTask struct {
-	message    *heartbeatpb.TableSpanBlockStatus
-	dispatcher *Dispatcher
-	callback   func() // function need to be called when the task is cancelled
-	taskHandle *threadpool.TaskHandle
+	message      *heartbeatpb.TableSpanBlockStatus
+	dispatcher   Dispatcher
+	callback     func() // function need to be called when the task is cancelled
+	taskHandle   *threadpool.TaskHandle
+	executeCount uint64
 }
 
-func newResendTask(message *heartbeatpb.TableSpanBlockStatus, dispatcher *Dispatcher, callback func()) *ResendTask {
+const resendTimeInterval = 5 * time.Second
+
+func newResendTask(message *heartbeatpb.TableSpanBlockStatus, dispatcher Dispatcher, callback func()) *ResendTask {
 	taskScheduler := GetDispatcherTaskScheduler()
 	t := &ResendTask{
 		message:    message,
 		dispatcher: dispatcher,
 		callback:   callback,
 	}
-	t.taskHandle = taskScheduler.Submit(t, time.Now().Add(50*time.Millisecond))
+	t.taskHandle = taskScheduler.Submit(t, time.Now().Add(resendTimeInterval))
 	return t
 }
 
 func (t *ResendTask) Execute() time.Time {
-	log.Debug("resend task", zap.Any("message", t.message), zap.Any("dispatcherID", t.dispatcher.id))
-	t.dispatcher.blockStatusesChan <- t.message
-	return time.Now().Add(200 * time.Millisecond)
+	log.Debug("resend task", zap.Any("message", t.message), zap.Any("dispatcherID", t.dispatcher.GetId()))
+	t.dispatcher.GetBlockStatusesChan() <- t.message
+
+	executeCount := atomic.AddUint64(&t.executeCount, 1)
+	if executeCount%10 == 0 {
+		log.Info("resend task periodic resend",
+			zap.Any("dispatcherID", t.dispatcher.GetId()),
+			zap.Any("message", t.message),
+			zap.Uint64("executeCount", executeCount))
+	}
+	return time.Now().Add(resendTimeInterval)
 }
 
 func (t *ResendTask) Cancel() {
@@ -293,17 +355,21 @@ func (h *DispatcherStatusHandler) Path(event DispatcherStatusWithID) common.Disp
 	return event.GetDispatcherID()
 }
 
-func (h *DispatcherStatusHandler) Handle(dispatcher *Dispatcher, events ...DispatcherStatusWithID) (await bool) {
-	for _, event := range events {
-		dispatcher.HandleDispatcherStatus(event.GetDispatcherStatus())
+func (h *DispatcherStatusHandler) Handle(dispatcher Dispatcher, events ...DispatcherStatusWithID) (await bool) {
+	if len(events) != 1 {
+		panic("invalid event count")
 	}
-	return false
+	return dispatcher.HandleDispatcherStatus(events[0].GetDispatcherStatus())
 }
 
 func (h *DispatcherStatusHandler) GetSize(event DispatcherStatusWithID) int   { return 0 }
 func (h *DispatcherStatusHandler) IsPaused(event DispatcherStatusWithID) bool { return false }
-func (h *DispatcherStatusHandler) GetArea(path common.DispatcherID, dest *Dispatcher) common.GID {
-	return dest.changefeedID.ID()
+func (h *DispatcherStatusHandler) GetArea(path common.DispatcherID, dest Dispatcher) common.GID {
+	return dest.GetChangefeedID().ID()
+}
+
+func (h *DispatcherStatusHandler) GetMetricLabel(dest Dispatcher) string {
+	return dest.GetChangefeedID().String()
 }
 
 func (h *DispatcherStatusHandler) GetTimestamp(event DispatcherStatusWithID) dynstream.Timestamp {
@@ -316,21 +382,55 @@ func (h *DispatcherStatusHandler) GetTimestamp(event DispatcherStatusWithID) dyn
 }
 
 func (h *DispatcherStatusHandler) GetType(event DispatcherStatusWithID) dynstream.EventType {
-	return dynstream.DefaultEventType
+	// DispatcherStatus may trigger downstream IO (e.g. executing DDL) when handling Action_Write.
+	// Make it non-batchable to ensure we can safely return await=true for a single event.
+	return dynstream.EventType{DataGroup: 0, Property: dynstream.NonBatchable}
 }
-func (h *DispatcherStatusHandler) OnDrop(event DispatcherStatusWithID) {}
+
+func (h *DispatcherStatusHandler) OnDrop(event DispatcherStatusWithID) interface{} {
+	return nil
+}
 
 // dispatcherStatusDS is the dynamic stream for dispatcher status.
 // It's a server level singleton, so we use a sync.Once to ensure the instance is created only once.
 var (
-	dispatcherStatusDS     dynstream.DynamicStream[common.GID, common.DispatcherID, DispatcherStatusWithID, *Dispatcher, *DispatcherStatusHandler]
+	dispatcherStatusDS     dynstream.DynamicStream[common.GID, common.DispatcherID, DispatcherStatusWithID, Dispatcher, *DispatcherStatusHandler]
 	dispatcherStatusDSOnce sync.Once
 )
 
-func GetDispatcherStatusDynamicStream() dynstream.DynamicStream[common.GID, common.DispatcherID, DispatcherStatusWithID, *Dispatcher, *DispatcherStatusHandler] {
+func GetDispatcherStatusDynamicStream() dynstream.DynamicStream[common.GID, common.DispatcherID, DispatcherStatusWithID, Dispatcher, *DispatcherStatusHandler] {
 	dispatcherStatusDSOnce.Do(func() {
-		dispatcherStatusDS = dynstream.NewParallelDynamicStream(func(id common.DispatcherID) uint64 { return common.GID(id).FastHash() }, &DispatcherStatusHandler{})
+		dispatcherStatusDS = dynstream.NewParallelDynamicStream("dispatcher-status", &DispatcherStatusHandler{})
 		dispatcherStatusDS.Start()
 	})
 	return dispatcherStatusDS
+}
+
+// bootstrapState used to check if send bootstrap event after changefeed created
+type bootstrapState int32
+
+const (
+	BootstrapNotStarted bootstrapState = iota
+	BootstrapInProgress
+	BootstrapFinished
+)
+
+func storeBootstrapState(addr *bootstrapState, state bootstrapState) {
+	atomic.StoreInt32((*int32)(addr), int32(state))
+}
+
+func loadBootstrapState(addr *bootstrapState) bootstrapState {
+	return bootstrapState(atomic.LoadInt32((*int32)(addr)))
+}
+
+// addToDynamicStream add self to dynamic stream
+func addToStatusDynamicStream(d Dispatcher) {
+	dispatcherStatusDS := GetDispatcherStatusDynamicStream()
+	err := dispatcherStatusDS.AddPath(d.GetId(), d)
+	if err != nil {
+		log.Error("add dispatcher to dynamic stream failed",
+			zap.Stringer("changefeedID", d.GetChangefeedID()),
+			zap.Stringer("dispatcher", d.GetId()),
+			zap.Error(err))
+	}
 }

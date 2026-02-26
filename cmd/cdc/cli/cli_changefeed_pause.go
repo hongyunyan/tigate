@@ -14,8 +14,6 @@
 package cli
 
 import (
-	"context"
-
 	"github.com/pingcap/ticdc/cmd/cdc/factory"
 	"github.com/pingcap/ticdc/cmd/util"
 	apiv2client "github.com/pingcap/ticdc/pkg/api/v2"
@@ -27,7 +25,7 @@ type pauseChangefeedOptions struct {
 	apiClient apiv2client.APIV2Interface
 
 	changefeedID string
-	namespace    string
+	keyspace     string
 }
 
 // newPauseChangefeedOptions creates new options for the `cli changefeed pause` command.
@@ -38,7 +36,7 @@ func newPauseChangefeedOptions() *pauseChangefeedOptions {
 // addFlags receives a *cobra.Command reference and binds
 // flags related to template printing to it.
 func (o *pauseChangefeedOptions) addFlags(cmd *cobra.Command) {
-	cmd.PersistentFlags().StringVarP(&o.namespace, "namespace", "n", "default", "Replication task (changefeed) Namespace")
+	cmd.PersistentFlags().StringVarP(&o.keyspace, "keyspace", "k", "", "Replication task (changefeed) Keyspace")
 	cmd.PersistentFlags().StringVarP(&o.changefeedID, "changefeed-id", "c", "", "Replication task (changefeed) ID")
 	_ = cmd.MarkPersistentFlagRequired("changefeed-id")
 }
@@ -55,9 +53,9 @@ func (o *pauseChangefeedOptions) complete(f factory.Factory) error {
 }
 
 // run the `cli changefeed pause` command.
-func (o *pauseChangefeedOptions) run() error {
-	ctx := context.Background()
-	return o.apiClient.Changefeeds().Pause(ctx, o.namespace, o.changefeedID)
+func (o *pauseChangefeedOptions) run(cmd *cobra.Command) error {
+	ctx := cmd.Context()
+	return o.apiClient.Changefeeds().Pause(ctx, o.keyspace, o.changefeedID)
 }
 
 // newCmdPauseChangefeed creates the `cli changefeed pause` command.
@@ -70,7 +68,7 @@ func newCmdPauseChangefeed(f factory.Factory) *cobra.Command {
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			util.CheckErr(o.complete(f))
-			util.CheckErr(o.run())
+			util.CheckErr(o.run(cmd))
 		},
 	}
 

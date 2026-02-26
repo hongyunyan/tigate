@@ -17,11 +17,15 @@ import (
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/heartbeatpb"
 	"github.com/pingcap/ticdc/pkg/common"
+	"github.com/pingcap/tidb/pkg/meta/model"
 )
+
+//go:generate msgp
 
 type Event interface {
 	GetType() int
 	GetSeq() uint64
+	GetEpoch() uint64
 	GetDispatcherID() common.DispatcherID
 	GetCommitTs() common.Ts
 	GetStartTs() common.Ts
@@ -53,23 +57,66 @@ type BlockEvent interface {
 }
 
 const (
-	// TEvent is the event type of a transaction.
-	TypeDMLEvent = iota
+	// DMLEvent is the event type of a transaction.
+	TypeDMLEvent = 0
+	// BatchDMLEvent is the event type of a batch transactions.
+	TypeBatchDMLEvent = 1
 	// DDLEvent is the event type of a DDL.
-	TypeDDLEvent
+	TypeDDLEvent = 2
 	// ResolvedEvent is the event type of a resolvedTs.
-	TypeResolvedEvent
+	TypeResolvedEvent = 3
 	// BatchResolvedTs is the event type of a batch resolvedTs.
-	TypeBatchResolvedEvent
+	TypeBatchResolvedEvent = 4
 	// SyncPointEvent is the event type of a sync point.
-	TypeSyncPointEvent
+	TypeSyncPointEvent = 5
 	// HandshakeEvent is the event type to indicate the start of a new event stream.
-	TypeHandshakeEvent
+	TypeHandshakeEvent = 7
 	// TypeReadyEvent is the event type to indicate the event service is ready to send events.
-	TypeReadyEvent
+	TypeReadyEvent = 6
 	// TypeNotReusableEvent is the event type to indicate the event service has no data for reuse.
-	TypeNotReusableEvent
+	TypeNotReusableEvent = 8
+	// TypeDropEvent is the event type to indicate an event has been dropped.
+	TypeDropEvent = 9
+	// TypeCongestionControl is the event type for congestion control messages.
+	TypeCongestionControl = 10
+	// TypeDispatcherHeartbeat is the event type for dispatcher heartbeat messages.
+	TypeDispatcherHeartbeat = 11
+	// TypeDispatcherHeartbeatResponse is the event type for dispatcher heartbeat response messages.
+	TypeDispatcherHeartbeatResponse = 12
 )
+
+func TypeToString(t int) string {
+	switch t {
+	case TypeDMLEvent:
+		return "DMLEvent"
+	case TypeBatchDMLEvent:
+		return "BatchDMLEvent"
+	case TypeDDLEvent:
+		return "DDLEvent"
+	case TypeResolvedEvent:
+		return "ResolvedEvent"
+	case TypeBatchResolvedEvent:
+		return "BatchResolvedEvent"
+	case TypeSyncPointEvent:
+		return "SyncPointEvent"
+	case TypeHandshakeEvent:
+		return "HandshakeEvent"
+	case TypeReadyEvent:
+		return "ReadyEvent"
+	case TypeNotReusableEvent:
+		return "NotReusableEvent"
+	case TypeDropEvent:
+		return "DropEvent"
+	case TypeCongestionControl:
+		return "CongestionControl"
+	case TypeDispatcherHeartbeat:
+		return "DispatcherHeartbeat"
+	case TypeDispatcherHeartbeatResponse:
+		return "DispatcherHeartbeatResponse"
+	default:
+		return "unknown"
+	}
+}
 
 // fakeDispatcherID is a fake dispatcherID for batch resolvedTs.
 var fakeDispatcherID = common.DispatcherID(common.NewGIDWithValue(0, 0))
@@ -97,11 +144,12 @@ func (t InfluenceType) toPB() heartbeatpb.InfluenceType {
 }
 
 type InfluencedTables struct {
-	InfluenceType InfluenceType
+	InfluenceType InfluenceType `msg:"influence-type"`
 	// only exists when InfluenceType is InfluenceTypeNormal
-	TableIDs []int64
+	// NOTE: All the table IDs in TableIDs are physical table IDs.
+	TableIDs []int64 `msg:"tables"`
 	// only exists when InfluenceType is InfluenceTypeDB
-	SchemaID int64
+	SchemaID int64 `msg:"schema"`
 }
 
 func (i *InfluencedTables) ToPB() *heartbeatpb.InfluencedTables {
@@ -119,19 +167,27 @@ func ToTablesPB(tables []Table) []*heartbeatpb.Table {
 	res := make([]*heartbeatpb.Table, len(tables))
 	for i, t := range tables {
 		res[i] = &heartbeatpb.Table{
-			TableID:  t.TableID,
-			SchemaID: t.SchemaID,
+			TableID:   t.TableID,
+			SchemaID:  t.SchemaID,
+			Splitable: t.Splitable,
 		}
 	}
 	return res
 }
 
-type Table struct {
-	SchemaID int64
-	TableID  int64
-	*SchemaTableName
+type SchemaTableName struct {
+	SchemaName string `msg:"schema-name"`
+	TableName  string `msg:"table-name"`
 }
 
+type Table struct {
+	SchemaID         int64 `msg:"-"`
+	TableID          int64 `msg:"table"`
+	Splitable        bool  `msg:"-"` // whether the table is eligible for split
+	*SchemaTableName `msg:"-"`
+}
+
+//msgp:ignore SchemaIDChange
 type SchemaIDChange struct {
 	TableID     int64
 	OldSchemaID int64
@@ -153,38 +209,7 @@ func ToSchemaIDChangePB(SchemaIDChange []SchemaIDChange) []*heartbeatpb.SchemaID
 	return res
 }
 
-type EventSenderState byte
-
-const (
-	EventSenderStateNormal EventSenderState = iota
-	EventSenderStatePaused
-)
-
-func (s EventSenderState) String() string {
-	switch s {
-	case EventSenderStateNormal:
-		return "normal"
-	case EventSenderStatePaused:
-		return "paused"
-	}
-	return "unknown"
-}
-
-func (s EventSenderState) encode() []byte {
-	return []byte{byte(s)}
-}
-
-func (s *EventSenderState) decode(data []byte) {
-	if len(data) == 0 {
-		return
-	}
-	*s = EventSenderState(data[0])
-}
-
-func (s EventSenderState) GetSize() int {
-	return 1
-}
-
-func (s EventSenderState) IsPaused() bool {
-	return s == EventSenderStatePaused
+//msgp:ignore Selector
+type Selector interface {
+	Select(colInfo *model.ColumnInfo) bool
 }

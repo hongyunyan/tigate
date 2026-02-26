@@ -14,7 +14,6 @@
 package cli
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 
@@ -36,7 +35,8 @@ type updateChangefeedOptions struct {
 
 	commonChangefeedOptions *changefeedCommonOptions
 	changefeedID            string
-	namespace               string
+	keyspace                string
+	verbose                 bool
 }
 
 // newUpdateChangefeedOptions creates new options for the `cli changefeed update` command.
@@ -50,8 +50,9 @@ func newUpdateChangefeedOptions(commonChangefeedOptions *changefeedCommonOptions
 // flags related to template printing to it.
 func (o *updateChangefeedOptions) addFlags(cmd *cobra.Command) {
 	o.commonChangefeedOptions.addFlags(cmd)
-	cmd.PersistentFlags().StringVarP(&o.namespace, "namespace", "n", "default", "Replication task (changefeed) Namespace")
+	cmd.PersistentFlags().StringVarP(&o.keyspace, "keyspace", "k", "default", "Replication task (changefeed) Keyspace")
 	cmd.PersistentFlags().StringVarP(&o.changefeedID, "changefeed-id", "c", "", "Replication task (changefeed) ID")
+	cmd.PersistentFlags().BoolVarP(&o.verbose, "verbose", "v", false, "Print verbose information when updating a changefeed. Caution: This will list all tables to be replicated by the changefeed. If the number of tables is extremely large, it may flood your screen.")
 	_ = cmd.MarkPersistentFlagRequired("changefeed-id")
 }
 
@@ -91,9 +92,9 @@ func (o *updateChangefeedOptions) complete(f factory.Factory) error {
 
 // run the `cli changefeed update` command.
 func (o *updateChangefeedOptions) run(cmd *cobra.Command) error {
-	ctx := context.Background()
+	ctx := cmd.Context()
 
-	old, err := o.apiV2Client.Changefeeds().Get(ctx, o.namespace, o.changefeedID)
+	old, err := o.apiV2Client.Changefeeds().Get(ctx, o.keyspace, o.changefeedID)
 	if err != nil {
 		return err
 	}
@@ -103,6 +104,7 @@ func (o *updateChangefeedOptions) run(cmd *cobra.Command) error {
 		return err
 	}
 	// sink uri is not changed, set old to empty to skip diff
+	// old sink uri may contain sensitive information, the password part is masked
 	if newInfo.SinkURI == "" {
 		old.SinkURI = ""
 	}
@@ -129,7 +131,41 @@ func (o *updateChangefeedOptions) run(cmd *cobra.Command) error {
 	}
 
 	changefeedConfig := o.getChangefeedConfig(cmd, newInfo)
-	info, err := o.apiV2Client.Changefeeds().Update(ctx, changefeedConfig, o.namespace, o.changefeedID)
+
+	tables, err1 := o.apiV2Client.Changefeeds().GetAllTables(ctx, &v2.VerifyTableConfig{
+		ReplicaConfig: changefeedConfig.ReplicaConfig,
+		StartTs:       newInfo.CheckpointTs,
+	}, o.keyspace)
+	if err1 == nil {
+		ignoreIneligibleTables := false
+		if len(tables.IneligibleTables) != 0 {
+			if putil.GetOrZero(newInfo.Config.ForceReplicate) {
+				cmd.Printf("[WARN] Force to replicate some ineligible tables, "+
+					"these tables do not have a primary key or a not-null unique key: %#v\n"+
+					"[WARN] This may cause data redundancy, "+
+					"please refer to the official documentation for details.\n",
+					tables.IneligibleTables)
+			} else {
+				cmd.Printf("[WARN] Some tables are not eligible to replicate, "+
+					"because they do not have a primary key or a not-null unique key: %#v\n",
+					tables.IneligibleTables)
+				if !o.commonChangefeedOptions.noConfirm {
+					ignoreIneligibleTables, err = confirmIgnoreIneligibleTables(cmd)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+
+		if o.commonChangefeedOptions.noConfirm {
+			ignoreIneligibleTables = true
+		}
+
+		changefeedConfig.ReplicaConfig.IgnoreIneligibleTable = putil.AddressOf(ignoreIneligibleTables)
+	}
+
+	info, err := o.apiV2Client.Changefeeds().Update(ctx, changefeedConfig, o.keyspace, o.changefeedID)
 	if err != nil {
 		return err
 	}
@@ -137,9 +173,14 @@ func (o *updateChangefeedOptions) run(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	cmd.Printf("Update changefeed config successfully! "+
-		"\nID: %s\nInfo: %s\n", o.changefeedID, infoStr)
 
+	cmd.Printf("Update changefeed config successfully! "+
+		"\nID: %s\nInfo: %s\nIneligibleTablesCount: %d\nEligibleTablesCount: %d\nAllTablesCount: %d\nWarning: %s\n", info.ID, infoStr, len(tables.IneligibleTables), len(tables.EligibleTables), len(tables.AllTables), err1)
+	if o.verbose {
+		cmd.Printf("EligibleTables: %s\n", formatTableNames(tables.EligibleTables))
+		cmd.Printf("IneligibleTables: %s\n", formatTableNames(tables.IneligibleTables))
+		cmd.Printf("AllTables: %s\n", formatTableNames(tables.AllTables))
+	}
 	return nil
 }
 
@@ -175,7 +216,7 @@ func (o *updateChangefeedOptions) applyChanges(oldInfo *v2.ChangeFeedInfo,
 		case "pd", "log-level", "key", "cert", "ca", "server":
 		// Do nothing, this is a flags from the cli command
 		// we don't use it to update, but we do use these flags.
-		case "upstream-pd", "upstream-ca", "upstream-cert", "upstream-key":
+		case "upstream-pd", "upstream-ca", "upstream-cert", "upstream-key", "keyspace":
 		default:
 			// use this default branch to prevent new added parameter is not added
 			log.Warn("unsupported flag, please report a bug", zap.String("flagName", flag.Name))

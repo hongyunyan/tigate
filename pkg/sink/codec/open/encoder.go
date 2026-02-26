@@ -14,15 +14,17 @@
 package open
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"sync"
 
-	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
-	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/sink/codec/common"
 	"github.com/pingcap/ticdc/pkg/sink/kafka/claimcheck"
+	"github.com/pingcap/ticdc/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -30,9 +32,14 @@ const (
 	batchVersion1 uint64 = 1
 )
 
-// BatchEncoder for open protocol will batch multiple row changed events into a single message.
+var (
+	lock             sync.RWMutex
+	columnFlagsCache = make(map[int64]map[string]uint64, 32)
+)
+
+// batchEncoder for open protocol will batch multiple row changed events into a single message.
 // One message can contain at most MaxBatchSize events, and the total size of the message cannot exceed MaxMessageBytes.
-type BatchEncoder struct {
+type batchEncoder struct {
 	messages []*common.Message
 	// buff the callback of the latest message
 	callbackBuff []func()
@@ -42,13 +49,48 @@ type BatchEncoder struct {
 	config *common.Config
 }
 
+// NewBatchEncoder creates a new batchEncoder.
+func NewBatchEncoder(ctx context.Context, config *common.Config) (common.EventEncoder, error) {
+	claimCheck, err := claimcheck.New(ctx, config.LargeMessageHandle, config.ChangefeedID)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	lock.Lock()
+	clear(columnFlagsCache)
+	lock.Unlock()
+	return &batchEncoder{
+		config:     config,
+		claimCheck: claimCheck,
+	}, nil
+}
+
+func (d *batchEncoder) Clean() {
+	if d.claimCheck != nil {
+		d.claimCheck.CleanMetrics()
+	}
+}
+
+func (d *batchEncoder) fetchColumnFlags(e *commonEvent.RowEvent) map[string]uint64 {
+	lock.RLock()
+	result, ok := columnFlagsCache[e.GetTableID()]
+	lock.RUnlock()
+	if !ok {
+		result = initColumnFlags(e.TableInfo)
+		lock.Lock()
+		columnFlagsCache[e.GetTableID()] = result
+		lock.Unlock()
+	}
+	return result
+}
+
 // AppendRowChangedEvent implements the RowEventEncoder interface
-func (d *BatchEncoder) AppendRowChangedEvent(
+func (d *batchEncoder) AppendRowChangedEvent(
 	ctx context.Context,
 	_ string,
 	e *commonEvent.RowEvent,
 ) error {
-	key, value, length, err := encodeRowChangedEvent(e, d.config, false, "")
+	columnFlags := d.fetchColumnFlags(e)
+	key, value, length, err := encodeRowChangedEvent(e, columnFlags, d.config, false, "")
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -61,7 +103,7 @@ func (d *BatchEncoder) AppendRowChangedEvent(
 				zap.Int("length", length),
 				zap.Any("table", e.TableInfo.TableName),
 				zap.Any("key", key))
-			return cerror.ErrMessageTooLarge.GenWithStackByArgs()
+			return errors.ErrMessageTooLarge.GenWithStackByArgs(e.TableInfo.GetTableName(), length, d.config.MaxMessageBytes)
 		}
 
 		if d.config.LargeMessageHandle.EnableClaimCheck() {
@@ -74,7 +116,7 @@ func (d *BatchEncoder) AppendRowChangedEvent(
 				return errors.Trace(err)
 			}
 
-			key, value, length, err = encodeRowChangedEvent(e, d.config, true, d.claimCheck.FileNameWithPrefix(claimCheckFileName))
+			key, value, length, err = encodeRowChangedEvent(e, columnFlags, d.config, true, d.claimCheck.FileNameWithPrefix(claimCheckFileName))
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -85,13 +127,13 @@ func (d *BatchEncoder) AppendRowChangedEvent(
 					zap.Int("maxMessageBytes", d.config.MaxMessageBytes),
 					zap.Int("length", length),
 					zap.Any("key", key))
-				return cerror.ErrMessageTooLarge.GenWithStackByArgs()
+				return errors.ErrMessageTooLarge.GenWithStackByArgs(e.TableInfo.GetTableName(), length, d.config.MaxMessageBytes)
 			}
 		}
 
 		if d.config.LargeMessageHandle.HandleKeyOnly() {
 			// it must that `LargeMessageHandle == LargeMessageHandleOnlyHandleKeyColumns` here.
-			key, value, length, err = encodeRowChangedEvent(e, d.config, true, "")
+			key, value, length, err = encodeRowChangedEvent(e, columnFlags, d.config, true, "")
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -102,7 +144,7 @@ func (d *BatchEncoder) AppendRowChangedEvent(
 					zap.Int("length", length),
 					zap.Any("table", e.TableInfo.TableName),
 					zap.Any("key", key))
-				return cerror.ErrMessageTooLarge.GenWithStackByArgs()
+				return errors.ErrMessageTooLarge.GenWithStackByArgs(e.TableInfo.GetTableName(), length, d.config.MaxMessageBytes)
 			}
 		}
 	}
@@ -112,7 +154,7 @@ func (d *BatchEncoder) AppendRowChangedEvent(
 }
 
 // Build implements the RowEventEncoder interface
-func (d *BatchEncoder) Build() (messages []*common.Message) {
+func (d *batchEncoder) Build() (messages []*common.Message) {
 	if len(d.messages) == 0 {
 		return nil
 	}
@@ -122,7 +164,7 @@ func (d *BatchEncoder) Build() (messages []*common.Message) {
 	return result
 }
 
-func (d *BatchEncoder) pushMessage(key, value []byte, callback func()) {
+func (d *batchEncoder) pushMessage(key, value []byte, callback func()) {
 	length := len(key) + len(value) + 16
 
 	var (
@@ -158,7 +200,7 @@ func (d *BatchEncoder) pushMessage(key, value []byte, callback func()) {
 	latestMessage.IncRowsCount()
 }
 
-func (d *BatchEncoder) finalizeCallback() {
+func (d *batchEncoder) finalizeCallback() {
 	if len(d.callbackBuff) == 0 || len(d.messages) == 0 {
 		return
 	}
@@ -191,25 +233,12 @@ func enhancedKeyValue(key, value []byte) ([]byte, []byte) {
 	return keyOutput, valueOutput
 }
 
-// NewBatchEncoder creates a new BatchEncoder.
-func NewBatchEncoder(ctx context.Context, config *common.Config) (common.EventEncoder, error) {
-	claimCheck, err := claimcheck.New(ctx, config.LargeMessageHandle, config.ChangefeedID)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return &BatchEncoder{
-		config:     config,
-		claimCheck: claimCheck,
-	}, nil
-}
+func (d *batchEncoder) EncodeDDLEvent(e *commonEvent.DDLEvent) (*common.Message, error) {
+	lock.Lock()
+	tableID := e.GetTableID()
+	delete(columnFlagsCache, tableID)
+	defer lock.Unlock()
 
-func (d *BatchEncoder) Clean() {
-	if d.claimCheck != nil {
-		d.claimCheck.CleanMetrics()
-	}
-}
-
-func (d *BatchEncoder) EncodeDDLEvent(e *commonEvent.DDLEvent) (*common.Message, error) {
 	key, value, err := encodeDDLEvent(e, d.config)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -219,7 +248,36 @@ func (d *BatchEncoder) EncodeDDLEvent(e *commonEvent.DDLEvent) (*common.Message,
 }
 
 // EncodeCheckpointEvent implements the RowEventEncoder interface
-func (d *BatchEncoder) EncodeCheckpointEvent(ts uint64) (*common.Message, error) {
-	key, value := encodeResolvedTs(ts)
+func (d *batchEncoder) EncodeCheckpointEvent(ts uint64) (*common.Message, error) {
+	keyBuf := &bytes.Buffer{}
+	keyWriter := util.BorrowJSONWriter(keyBuf)
+
+	keyWriter.WriteObject(func() {
+		keyWriter.WriteUint64Field("ts", ts)
+		keyWriter.WriteIntField("t", int(common.MessageTypeResolved))
+	})
+
+	util.ReturnJSONWriter(keyWriter)
+
+	key := keyBuf.Bytes()
+
+	var keyLenByte [8]byte
+	var valueLenByte [8]byte
+	var versionByte [8]byte
+	binary.BigEndian.PutUint64(keyLenByte[:], uint64(len(key)))
+	binary.BigEndian.PutUint64(valueLenByte[:], 0)
+	binary.BigEndian.PutUint64(versionByte[:], batchVersion1)
+
+	keyOutput := new(bytes.Buffer)
+
+	keyOutput.Write(versionByte[:])
+	keyOutput.Write(keyLenByte[:])
+	keyOutput.Write(key)
+
+	valueOutput := new(bytes.Buffer)
+	valueOutput.Write(valueLenByte[:])
+
+	key = keyOutput.Bytes()
+	value := valueOutput.Bytes()
 	return common.NewMsg(key, value), nil
 }
