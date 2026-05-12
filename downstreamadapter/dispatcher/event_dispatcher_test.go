@@ -61,7 +61,7 @@ func newTestSharedInfo(
 		0,
 		0,
 		make(chan TableSpanStatusWithSeq, 128),
-		make(chan *heartbeatpb.TableSpanBlockStatus, 128),
+		128,
 		make(chan error, 1),
 	)
 }
@@ -488,10 +488,8 @@ func TestDispatcherIgnoresStaleIgnoredBlockStatus(t *testing.T) {
 	})
 	require.False(t, await)
 
-	select {
-	case msg := <-dispatcher.GetBlockStatusesChan():
+	if msg, ok := dispatcher.TakeBlockStatusWithTimeout(200 * time.Millisecond); ok {
 		require.FailNow(t, "unexpected fast retry for stale ignored block status", "msg=%v", msg)
-	case <-time.After(200 * time.Millisecond):
 	}
 }
 
