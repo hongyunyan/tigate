@@ -47,10 +47,10 @@ type regionInfo struct {
 	// Whether to filter out the value write by cdc itself.
 	// It should be `true` in BDR mode
 	filterLoop bool
-// scanPriority is sent to TiKV/CSE. It informs the remote incremental scan admission logic
-// to schedule TiCDC region requests by priority and maintain consistent ordering across retries.
+	// scanPriority is sent to TiKV/CSE so remote incremental scan admission can
 	// preserve TiCDC's business priority across retries.
-	scanPriority cdcpb.ScanPriority
+	scanPriority        cdcpb.ScanPriority
+	scanPrioritySources scanPrioritySources
 }
 
 func (s *regionInfo) isStopped() bool {

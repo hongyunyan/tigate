@@ -141,24 +141,6 @@ func newSubscribedSpan(
 	return rt
 }
 
-func (span *subscribedSpan) maybeMarkCaughtUp(pdClock pdutil.Clock, resolvedTs uint64) {
-	if span.everCaughtUp.Load() || !isTsCloseToCurrent(pdClock, resolvedTs) {
-		return
-	}
-	if span.everCaughtUp.CompareAndSwap(false, true) {
-		log.Info("subscription catches up for the first time",
-			zap.Uint64("subscriptionID", uint64(span.subID)),
-			zap.Uint64("resolvedTs", resolvedTs))
-	}
-}
-
-func (span *subscribedSpan) effectiveScanTaskPriority(priority TaskType) TaskType {
-	if priority == TaskHighPrior || span.everCaughtUp.Load() {
-		return TaskHighPrior
-	}
-	return priority
-}
-
 func (span *subscribedSpan) clearKVEventsCache() {
 	if cap(span.kvEventsCache) > kvEventsCacheMaxSize {
 		span.kvEventsCache = nil

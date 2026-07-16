@@ -445,6 +445,7 @@ func TestRegionRetryScanPriority(t *testing.T) {
 				regionTaskQueue: priorityqueue.New[PriorityTask](),
 			}
 			client.pdClock = pdutil.NewClock4Test()
+			client.scanPriorityResolver = newScanPriorityResolver(client.pdClock)
 			client.failureHandler = newRegionFailureHandler(client)
 			_, span := newScanPriorityTestSpan()
 			span.everCaughtUp.Store(tc.everCaughtUp)
@@ -522,7 +523,7 @@ func TestRangeRetryPreservesScanPriority(t *testing.T) {
 
 			select {
 			case task := <-client.rangeTaskCh:
-				require.Equal(t, tc.expected, task.priority)
+				require.Equal(t, tc.expected, task.inheritedDecision.priority)
 				require.Equal(t, rawSpan, task.span)
 			case <-time.After(time.Second):
 				require.Fail(t, "expected range retry task")
@@ -561,56 +562,7 @@ func (s *mockDynamicStream) GetMetrics() dynstream.Metrics[int, SubscriptionID] 
 	return dynstream.Metrics[int, SubscriptionID]{}
 }
 
-func TestInitialScanTaskPriority(t *testing.T) {
-	setInitialScanLowPriorityThresholdForTest(t, 30*time.Minute)
-
-	currentTime := time.Date(2026, time.June, 27, 12, 0, 0, 0, time.UTC)
-	pdClock := pdutil.NewClock4Test()
-	pdClock.(*pdutil.Clock4Test).SetTS(oracle.GoTimeToTS(currentTime))
-	client := &subscriptionClient{
-		pdClock: pdClock,
-	}
-
-	for _, tc := range []struct {
-		name     string
-		startTs  uint64
-		expected TaskType
-	}{
-		{
-			name:     "zero start ts",
-			startTs:  0,
-			expected: TaskLowPrior,
-		},
-		{
-			name:     "recent start ts",
-			startTs:  oracle.GoTimeToTS(currentTime.Add(-29 * time.Minute)),
-			expected: TaskHighPrior,
-		},
-		{
-			name:     "threshold boundary",
-			startTs:  oracle.GoTimeToTS(currentTime.Add(-30 * time.Minute)),
-			expected: TaskHighPrior,
-		},
-		{
-			name:     "old start ts",
-			startTs:  oracle.GoTimeToTS(currentTime.Add(-31 * time.Minute)),
-			expected: TaskLowPrior,
-		},
-		{
-			name:     "future start ts",
-			startTs:  oracle.GoTimeToTS(currentTime.Add(time.Minute)),
-			expected: TaskHighPrior,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.expected, client.initialScanTaskPriority(tc.startTs))
-		})
-	}
-}
-
-func TestSubscribeUsesInitialScanTaskPriority(t *testing.T) {
-	setInitialScanLowPriorityThresholdForTest(t, 30*time.Minute)
-
+func TestSubscribeUsesDefaultInheritedScanPriority(t *testing.T) {
 	ctx := t.Context()
 
 	currentTime := time.Date(2026, time.June, 27, 12, 0, 0, 0, time.UTC)
@@ -625,6 +577,7 @@ func TestSubscribeUsesInitialScanTaskPriority(t *testing.T) {
 		eventSink:              sink,
 		rangeTaskCh:            make(chan rangeTask, 2),
 		pdClock:                pdClock,
+		scanPriorityResolver:   newScanPriorityResolver(pdClock),
 		resolveLockTaskCh:      make(chan resolveLockTask, 1),
 		resolveLockRateLimiter: newResolveLockRateLimiter(),
 	}
@@ -653,26 +606,27 @@ func TestSubscribeUsesInitialScanTaskPriority(t *testing.T) {
 		false,
 	)
 
-	require.Equal(t, TaskHighPrior, (<-client.rangeTaskCh).priority)
-	require.Equal(t, TaskLowPrior, (<-client.rangeTaskCh).priority)
+	require.Equal(t, defaultScanPriorityDecision(), (<-client.rangeTaskCh).inheritedDecision)
+	require.Equal(t, defaultScanPriorityDecision(), (<-client.rangeTaskCh).inheritedDecision)
 }
 
 func TestSubscribedSpanMarksCaughtUp(t *testing.T) {
-	setInitialScanLowPriorityThresholdForTest(t, 30*time.Minute)
+	setScanPriorityLagThresholdForTest(t, 30*time.Minute)
 
 	currentTime := time.Date(2026, time.June, 27, 12, 0, 0, 0, time.UTC)
 	pdClock := pdutil.NewClock4Test()
 	pdClock.(*pdutil.Clock4Test).SetTS(oracle.GoTimeToTS(currentTime))
+	resolver := newScanPriorityResolver(pdClock)
 	_, span := newScanPriorityTestSpan()
 
 	oldResolvedTs := oracle.GoTimeToTS(currentTime.Add(-31 * time.Minute))
-	span.maybeMarkCaughtUp(pdClock, oldResolvedTs)
+	resolver.observeSpanResolved(span, oldResolvedTs)
 	require.False(t, span.everCaughtUp.Load())
 
-	span.maybeMarkCaughtUp(pdClock, oracle.GoTimeToTS(currentTime.Add(-time.Minute)))
+	resolver.observeSpanResolved(span, oracle.GoTimeToTS(currentTime.Add(-time.Minute)))
 	require.True(t, span.everCaughtUp.Load())
 
-	span.maybeMarkCaughtUp(pdClock, oldResolvedTs)
+	resolver.observeSpanResolved(span, oldResolvedTs)
 	require.True(t, span.everCaughtUp.Load())
 }
 
@@ -694,7 +648,7 @@ func newScanPriorityTestRegion(span *subscribedSpan) regionInfo {
 	return newRegionInfo(tikv.NewRegionVerID(1, 1, 1), span.span, nil, span, false)
 }
 
-func setInitialScanLowPriorityThresholdForTest(t *testing.T, threshold time.Duration) {
+func setScanPriorityLagThresholdForTest(t *testing.T, threshold time.Duration) {
 	t.Helper()
 	oldConfig := config.GetGlobalServerConfig()
 	testConfig := oldConfig.Clone()
