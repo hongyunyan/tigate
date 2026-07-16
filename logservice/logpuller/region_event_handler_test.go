@@ -209,7 +209,9 @@ func TestHandleResolvedTs(t *testing.T) {
 	option := dynstream.NewOption()
 	pdClock := pdutil.NewClock4Test()
 	pdClock.(*pdutil.Clock4Test).SetTS(10)
-	ds := dynstream.NewParallelDynamicStream("test", &regionEventHandler{pdClock: pdClock}, option)
+	ds := dynstream.NewParallelDynamicStream("test", &regionEventHandler{
+		scanPriorityResolver: newScanPriorityResolver(pdClock),
+	}, option)
 	ds.Start()
 
 	consumeKVEvents := func(events []common.RawKVEntry, _ func()) bool { return false } // not used
