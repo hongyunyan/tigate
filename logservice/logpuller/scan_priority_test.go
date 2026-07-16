@@ -25,7 +25,7 @@ import (
 )
 
 func TestScanPriorityResolver(t *testing.T) {
-	setInitialScanLowPriorityThresholdForTest(t, 30*time.Minute)
+	setScanPriorityLagThresholdForTest(t, 30*time.Minute)
 
 	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
 	pdClock := pdutil.NewClock4Test()
@@ -41,27 +41,27 @@ func TestScanPriorityResolver(t *testing.T) {
 		{
 			name: "all rules remain low",
 			facts: scanPriorityFacts{
-				intent:           scanPriorityIntent{priorityFloor: TaskLowPrior},
+				inherited:        defaultScanPriorityDecision(),
 				regionResolvedTs: oracle.GoTimeToTS(now.Add(-31 * time.Minute)),
 			},
 			expectedPriority: TaskLowPrior,
 		},
 		{
-			name: "inherited high floor",
+			name: "inherited decision is preserved",
 			facts: scanPriorityFacts{
-				intent: scanPriorityIntent{
-					priorityFloor: TaskHighPrior,
-					sources:       scanPrioritySourceInherited,
+				inherited: scanPriorityDecision{
+					priority: TaskHighPrior,
+					sources:  scanPrioritySourceRegionLowLag,
 				},
 				regionResolvedTs: oracle.GoTimeToTS(now.Add(-31 * time.Minute)),
 			},
 			expectedPriority: TaskHighPrior,
-			expectedSources:  scanPrioritySourceInherited,
+			expectedSources:  scanPrioritySourceRegionLowLag,
 		},
 		{
 			name: "span ever caught up floor",
 			facts: scanPriorityFacts{
-				intent:           scanPriorityIntent{priorityFloor: TaskLowPrior},
+				inherited:        defaultScanPriorityDecision(),
 				spanEverCaughtUp: true,
 				regionResolvedTs: oracle.GoTimeToTS(now.Add(-31 * time.Minute)),
 			},
@@ -71,7 +71,7 @@ func TestScanPriorityResolver(t *testing.T) {
 		{
 			name: "region low lag floor",
 			facts: scanPriorityFacts{
-				intent:           scanPriorityIntent{priorityFloor: TaskLowPrior},
+				inherited:        defaultScanPriorityDecision(),
 				regionResolvedTs: oracle.GoTimeToTS(now.Add(-time.Minute)),
 			},
 			expectedPriority: TaskHighPrior,
@@ -80,15 +80,15 @@ func TestScanPriorityResolver(t *testing.T) {
 		{
 			name: "independent high floors are combined",
 			facts: scanPriorityFacts{
-				intent: scanPriorityIntent{
-					priorityFloor: TaskHighPrior,
-					sources:       scanPrioritySourceInitialLowLag,
+				inherited: scanPriorityDecision{
+					priority: TaskHighPrior,
+					sources:  scanPrioritySourceRegionLowLag,
 				},
 				spanEverCaughtUp: true,
 				regionResolvedTs: oracle.GoTimeToTS(now.Add(-time.Minute)),
 			},
 			expectedPriority: TaskHighPrior,
-			expectedSources: scanPrioritySourceInitialLowLag |
+			expectedSources: scanPrioritySourceRegionLowLag |
 				scanPrioritySourceSpanEverCaughtUp,
 		},
 	}
@@ -102,17 +102,15 @@ func TestScanPriorityResolver(t *testing.T) {
 	}
 }
 
-func TestRetryScanIntent(t *testing.T) {
+func TestScanPriorityDecisionFromRegion(t *testing.T) {
 	region := regionInfo{
 		scanPriority:        cdcpb.ScanPriority_SCAN_PRIORITY_HIGH,
 		scanPrioritySources: scanPrioritySourceRegionLowLag,
 	}
 
-	intent := retryScanIntent(region)
-	require.Equal(t, TaskHighPrior, intent.priorityFloor)
-	require.Equal(t,
-		scanPrioritySourceRegionLowLag|scanPrioritySourceInherited,
-		intent.sources)
+	decision := scanPriorityDecisionFromRegion(region)
+	require.Equal(t, TaskHighPrior, decision.priority)
+	require.Equal(t, scanPrioritySourceRegionLowLag, decision.sources)
 }
 
 var benchmarkScanPriorityDecision scanPriorityDecision
@@ -125,7 +123,7 @@ func BenchmarkScanPriorityResolver(b *testing.B) {
 
 	b.Run("span sticky high", func(b *testing.B) {
 		facts := scanPriorityFacts{
-			intent:           scanPriorityIntent{priorityFloor: TaskLowPrior},
+			inherited:        defaultScanPriorityDecision(),
 			spanEverCaughtUp: true,
 		}
 		b.ReportAllocs()
@@ -136,7 +134,7 @@ func BenchmarkScanPriorityResolver(b *testing.B) {
 
 	b.Run("region lag", func(b *testing.B) {
 		facts := scanPriorityFacts{
-			intent:           scanPriorityIntent{priorityFloor: TaskLowPrior},
+			inherited:        defaultScanPriorityDecision(),
 			regionResolvedTs: oracle.GoTimeToTS(now),
 		}
 		b.ReportAllocs()

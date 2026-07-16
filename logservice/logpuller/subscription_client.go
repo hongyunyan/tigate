@@ -85,10 +85,10 @@ type resolveLockTask struct {
 // rangeTask represents a task to subscribe a range span of a table.
 // It can be a part of a table or a whole table, it also can be a part of a region.
 type rangeTask struct {
-	span           heartbeatpb.TableSpan
-	subscribedSpan *subscribedSpan
-	filterLoop     bool
-	priorityIntent scanPriorityIntent
+	span              heartbeatpb.TableSpan
+	subscribedSpan    *subscribedSpan
+	filterLoop        bool
+	inheritedDecision scanPriorityDecision
 }
 
 type SubscriptionClientConfig struct {
@@ -266,20 +266,18 @@ func (s *subscriptionClient) Subscribe(
 	s.spanRegistry.Add(rt)
 	s.eventSink.AddPath(rt)
 
-	priorityIntent := s.scanPriorityResolver.initialScanIntent(startTs)
 	select {
 	case <-s.ctx.Done():
 		log.Warn("subscribes span failed, the subscription client has closed")
 	case s.rangeTaskCh <- rangeTask{
-		span:           span,
-		subscribedSpan: rt,
-		filterLoop:     rt.filterLoop,
-		priorityIntent: priorityIntent,
+		span:              span,
+		subscribedSpan:    rt,
+		filterLoop:        rt.filterLoop,
+		inheritedDecision: defaultScanPriorityDecision(),
 	}:
 		log.Info("subscribes span done",
 			zap.Uint64("subscriptionID", uint64(subID)),
 			zap.Int64("tableID", span.TableID), zap.Uint64("startTs", startTs),
-			zap.String("initialScanPriority", priorityIntent.priorityFloor.String()),
 			zap.String("startKey", spanz.HexKey(span.StartKey)), zap.String("endKey", spanz.HexKey(span.EndKey)))
 	}
 }
@@ -550,7 +548,7 @@ func (s *subscriptionClient) handleRangeTasks(ctx context.Context) error {
 		case task := <-s.rangeTaskCh:
 			g.Go(func() error {
 				return s.divideSpanAndScheduleRegionRequests(
-					ctx, task.span, task.subscribedSpan, task.filterLoop, task.priorityIntent)
+					ctx, task.span, task.subscribedSpan, task.filterLoop, task.inheritedDecision)
 			})
 		}
 	}
@@ -566,7 +564,7 @@ func (s *subscriptionClient) divideSpanAndScheduleRegionRequests(
 	span heartbeatpb.TableSpan,
 	subscribedSpan *subscribedSpan,
 	filterLoop bool,
-	priorityIntent scanPriorityIntent,
+	inheritedDecision scanPriorityDecision,
 ) error {
 	// Limit the number of regions loaded at a time to make the load more stable.
 	limit := 1024
@@ -630,7 +628,7 @@ func (s *subscriptionClient) divideSpanAndScheduleRegionRequests(
 			regionInfo := newRegionInfo(verID, intersectSpan, nil, subscribedSpan, filterLoop)
 
 			// Schedule a region request to subscribe the region.
-			s.scheduleRegionRequest(ctx, regionInfo, priorityIntent)
+			s.scheduleRegionRequest(ctx, regionInfo, inheritedDecision)
 
 			nextSpan.StartKey = regionMeta.EndKey
 			// If the nextSpan.StartKey is larger than the subscribedSpan.span.EndKey,
@@ -647,7 +645,7 @@ func (s *subscriptionClient) divideSpanAndScheduleRegionRequests(
 func (s *subscriptionClient) scheduleRegionRequest(
 	ctx context.Context,
 	region regionInfo,
-	priorityIntent scanPriorityIntent,
+	inheritedDecision scanPriorityDecision,
 ) {
 	lockRangeResult := region.subscribedSpan.rangeLock.LockRange(
 		ctx, region.span.StartKey, region.span.EndKey, region.verID.GetID(), region.verID.GetVer())
@@ -660,7 +658,7 @@ func (s *subscriptionClient) scheduleRegionRequest(
 	case regionlock.LockRangeStatusSuccess:
 		region.lockedRangeState = lockRangeResult.LockedRangeState
 		decision := s.scanPriorityResolver.resolve(scanPriorityFacts{
-			intent:           priorityIntent,
+			inherited:        inheritedDecision,
 			spanEverCaughtUp: region.subscribedSpan.everCaughtUp.Load(),
 			regionResolvedTs: region.resolvedTs(),
 		})
@@ -682,7 +680,7 @@ func (s *subscriptionClient) scheduleRegionRequest(
 		}
 	case regionlock.LockRangeStatusStale:
 		for _, r := range lockRangeResult.RetryRanges {
-			s.scheduleRangeRequest(ctx, r, region.subscribedSpan, region.filterLoop, priorityIntent)
+			s.scheduleRangeRequest(ctx, r, region.subscribedSpan, region.filterLoop, inheritedDecision)
 		}
 	default:
 		return
@@ -693,15 +691,15 @@ func (s *subscriptionClient) scheduleRangeRequest(
 	ctx context.Context, span heartbeatpb.TableSpan,
 	subscribedSpan *subscribedSpan,
 	filterLoop bool,
-	priorityIntent scanPriorityIntent,
+	inheritedDecision scanPriorityDecision,
 ) {
 	select {
 	case <-ctx.Done():
 	case s.rangeTaskCh <- rangeTask{
-		span:           span,
-		subscribedSpan: subscribedSpan,
-		filterLoop:     filterLoop,
-		priorityIntent: priorityIntent,
+		span:              span,
+		subscribedSpan:    subscribedSpan,
+		filterLoop:        filterLoop,
+		inheritedDecision: inheritedDecision,
 	}:
 	}
 }

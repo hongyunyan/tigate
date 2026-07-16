@@ -27,12 +27,10 @@ import (
 
 // scanPrioritySources records the independent reasons that require a scan task
 // to run at high priority. It is a bitmask so priority decisions do not allocate.
-type scanPrioritySources uint8
+type scanPrioritySources uint64
 
 const (
-	scanPrioritySourceInitialLowLag scanPrioritySources = 1 << iota
-	scanPrioritySourceInherited
-	scanPrioritySourceSpanEverCaughtUp
+	scanPrioritySourceSpanEverCaughtUp scanPrioritySources = 1 << iota
 	scanPrioritySourceRegionLowLag
 )
 
@@ -40,13 +38,7 @@ func (s scanPrioritySources) String() string {
 	if s == 0 {
 		return "none"
 	}
-	sources := make([]string, 0, 4)
-	if s&scanPrioritySourceInitialLowLag != 0 {
-		sources = append(sources, "initial-low-lag")
-	}
-	if s&scanPrioritySourceInherited != 0 {
-		sources = append(sources, "inherited")
-	}
+	sources := make([]string, 0, 2)
 	if s&scanPrioritySourceSpanEverCaughtUp != 0 {
 		sources = append(sources, "span-ever-caught-up")
 	}
@@ -56,17 +48,10 @@ func (s scanPrioritySources) String() string {
 	return strings.Join(sources, ",")
 }
 
-// scanPriorityIntent carries the minimum priority that must be preserved while
-// a range is resolved into regions or a failed request is retried.
-type scanPriorityIntent struct {
-	priorityFloor TaskType
-	sources       scanPrioritySources
-}
-
 // scanPriorityFacts is an immutable snapshot used to make one region priority
 // decision at the region scheduling boundary.
 type scanPriorityFacts struct {
-	intent           scanPriorityIntent
+	inherited        scanPriorityDecision
 	spanEverCaughtUp bool
 	regionResolvedTs uint64
 }
@@ -86,50 +71,40 @@ func newScanPriorityResolver(pdClock pdutil.Clock) *scanPriorityResolver {
 	return &scanPriorityResolver{pdClock: pdClock}
 }
 
-func (r *scanPriorityResolver) initialScanIntent(startTs uint64) scanPriorityIntent {
-	intent := scanPriorityIntent{priorityFloor: TaskLowPrior}
-	if r.isTsCloseToCurrent(startTs) {
-		intent.priorityFloor = TaskHighPrior
-		intent.sources = scanPrioritySourceInitialLowLag
-	}
-	return intent
+func defaultScanPriorityDecision() scanPriorityDecision {
+	return scanPriorityDecision{priority: TaskLowPrior}
 }
 
-// retryScanIntent preserves the effective priority of the failed request. The
-// resolver will combine this floor with the latest span and region facts.
-func retryScanIntent(region regionInfo) scanPriorityIntent {
-	priority := taskTypeFromScanPriority(region.scanPriority)
-	sources := region.scanPrioritySources
-	if priority == TaskHighPrior {
-		sources |= scanPrioritySourceInherited
+// scanPriorityDecisionFromRegion preserves the effective decision of a failed
+// request while the range is resolved again. Inheritance is transport, not a
+// separate reason for the priority.
+func scanPriorityDecisionFromRegion(region regionInfo) scanPriorityDecision {
+	return scanPriorityDecision{
+		priority: taskTypeFromScanPriority(region.scanPriority),
+		sources:  region.scanPrioritySources,
 	}
-	return scanPriorityIntent{priorityFloor: priority, sources: sources}
 }
 
 func (r *scanPriorityResolver) resolve(facts scanPriorityFacts) scanPriorityDecision {
-	decision := scanPriorityDecision{priority: TaskLowPrior}
-
-	// Inherited and span-level floors are cheap to evaluate and can avoid a
-	// pdClock read for the common sticky-high path.
-	if facts.intent.priorityFloor == TaskHighPrior {
-		decision.requireHigh(facts.intent.sources)
-	}
+	decision := facts.inherited
 	if facts.spanEverCaughtUp {
-		decision.requireHigh(scanPrioritySourceSpanEverCaughtUp)
+		decision.requireAtLeast(TaskHighPrior, scanPrioritySourceSpanEverCaughtUp)
 	}
-	if decision.priority == TaskHighPrior {
-		return decision
-	}
-
 	if r.isTsCloseToCurrent(facts.regionResolvedTs) {
-		decision.requireHigh(scanPrioritySourceRegionLowLag)
+		decision.requireAtLeast(TaskHighPrior, scanPrioritySourceRegionLowLag)
 	}
 	return decision
 }
 
-func (d *scanPriorityDecision) requireHigh(source scanPrioritySources) {
-	d.priority = TaskHighPrior
-	d.sources |= source
+// requireAtLeast applies one priority floor. TaskType values with a smaller
+// numeric value have a higher priority.
+func (d *scanPriorityDecision) requireAtLeast(priority TaskType, source scanPrioritySources) {
+	if priority < d.priority {
+		d.priority = priority
+	}
+	if priority == d.priority {
+		d.sources |= source
+	}
 }
 
 // observeSpanResolved maintains the sticky span-level fact used by the
