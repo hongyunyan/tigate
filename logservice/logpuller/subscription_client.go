@@ -184,7 +184,7 @@ func NewSubscriptionClient(
 	subClient.ctx, subClient.cancel = context.WithCancel(context.Background())
 	subClient.scanPriorityResolver = newScanPriorityResolver(subClient.pdClock)
 	subClient.failureHandler = newRegionFailureHandler(subClient)
-	subClient.eventSink = newRegionEventSink(subClient.failureHandler, subClient.scanPriorityResolver)
+	subClient.eventSink = newRegionEventSink(subClient.failureHandler)
 	subClient.spanRegistry = newSpanRegistry(subClient.pd, subClient.pdClock)
 
 	subClient.initMetrics()
@@ -262,6 +262,7 @@ func (s *subscriptionClient) Subscribe(
 		advanceResolvedTs,
 		advanceInterval,
 		bdrMode,
+		s.scanPriorityResolver,
 	)
 	s.spanRegistry.Add(rt)
 	s.eventSink.AddPath(rt)

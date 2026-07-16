@@ -87,9 +87,8 @@ func (event regionEvent) mustFirstState() *regionFeedState {
 }
 
 type regionEventHandler struct {
-	eventSink            *regionEventSink
-	failureHandler       *regionFailureHandler
-	scanPriorityResolver *scanPriorityResolver
+	eventSink      *regionEventSink
+	failureHandler *regionFailureHandler
 }
 
 func (h *regionEventHandler) Path(event regionEvent) SubscriptionID {
@@ -143,9 +142,6 @@ func (h *regionEventHandler) Handle(span *subscribedSpan, events ...regionEvent)
 		} else {
 			log.Panic("should not reach", zap.Any("event", event), zap.Any("events", events))
 		}
-	}
-	if newResolvedTs > 0 {
-		h.scanPriorityResolver.observeSpanResolved(span, newResolvedTs)
 	}
 	tryAdvanceResolvedTs := func() {
 		if newResolvedTs != 0 {
@@ -423,8 +419,7 @@ func handleResolvedTs(span *subscribedSpan, state *regionFeedState, resolvedTs u
 					zap.Uint64("lastResolvedTs", lastResolvedTs),
 					zap.Float64("decreaseLag(s)", decreaseLag))
 			}
-			span.resolvedTs.Store(ts)
-			span.resolvedTsUpdated.Store(time.Now().Unix())
+			span.updateResolvedTs(ts)
 			return ts
 		}
 	}

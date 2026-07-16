@@ -73,7 +73,8 @@ type subscribedSpan struct {
 	resolvedTs        atomic.Uint64
 	// everCaughtUp remains true once the subscription catches up, so recovery scans
 	// stay high priority even if a later failure temporarily increases the lag.
-	everCaughtUp atomic.Bool
+	everCaughtUp         atomic.Bool
+	scanPriorityResolver *scanPriorityResolver
 }
 
 // spanRegistry tracks subscribed spans and owns span-level background maintenance.
@@ -96,6 +97,7 @@ func newSubscribedSpan(
 	advanceResolvedTs func(ts uint64),
 	advanceInterval int64,
 	filterLoop bool,
+	scanPriorityResolver *scanPriorityResolver,
 ) *subscribedSpan {
 	rangeLock := regionlock.NewRangeLock(uint64(subID), span.StartKey, span.EndKey, startTs)
 
@@ -106,9 +108,10 @@ func newSubscribedSpan(
 		filterLoop: filterLoop,
 		rangeLock:  rangeLock,
 
-		consumeKVEvents:   consumeKVEvents,
-		advanceResolvedTs: advanceResolvedTs,
-		advanceInterval:   advanceInterval,
+		consumeKVEvents:      consumeKVEvents,
+		advanceResolvedTs:    advanceResolvedTs,
+		advanceInterval:      advanceInterval,
+		scanPriorityResolver: scanPriorityResolver,
 	}
 	rt.initialized.Store(false)
 	rt.resolvedTsUpdated.Store(time.Now().Unix())
@@ -139,6 +142,14 @@ func newSubscribedSpan(
 		}
 	}
 	return rt
+}
+
+func (span *subscribedSpan) updateResolvedTs(resolvedTs uint64) {
+	span.resolvedTs.Store(resolvedTs)
+	span.resolvedTsUpdated.Store(time.Now().Unix())
+	if span.scanPriorityResolver != nil {
+		span.scanPriorityResolver.observeSpanResolved(span, resolvedTs)
+	}
 }
 
 func (span *subscribedSpan) clearKVEventsCache() {

@@ -209,9 +209,7 @@ func TestHandleResolvedTs(t *testing.T) {
 	option := dynstream.NewOption()
 	pdClock := pdutil.NewClock4Test()
 	pdClock.(*pdutil.Clock4Test).SetTS(10)
-	ds := dynstream.NewParallelDynamicStream("test", &regionEventHandler{
-		scanPriorityResolver: newScanPriorityResolver(pdClock),
-	}, option)
+	ds := dynstream.NewParallelDynamicStream("test", &regionEventHandler{}, option)
 	ds.Start()
 
 	consumeKVEvents := func(events []common.RawKVEntry, _ func()) bool { return false } // not used
@@ -234,12 +232,13 @@ func TestHandleResolvedTs(t *testing.T) {
 			EndKey:   common.ToComparableKey(common.UpperBoundKey),
 		}
 		subSpan1 = &subscribedSpan{
-			subID:             subID1,
-			span:              heartbeatpb.TableSpan{},
-			rangeLock:         regionlock.NewRangeLock(uint64(subID1), span.StartKey, span.EndKey, 1),
-			consumeKVEvents:   consumeKVEvents,
-			advanceResolvedTs: advanceResolvedTs,
-			advanceInterval:   0,
+			subID:                subID1,
+			span:                 heartbeatpb.TableSpan{},
+			rangeLock:            regionlock.NewRangeLock(uint64(subID1), span.StartKey, span.EndKey, 1),
+			consumeKVEvents:      consumeKVEvents,
+			advanceResolvedTs:    advanceResolvedTs,
+			advanceInterval:      0,
+			scanPriorityResolver: newScanPriorityResolver(pdClock),
 		}
 		ds.AddPath(subID1, subSpan1, dynstream.AreaSettings{})
 		state1.region.subscribedSpan = subSpan1

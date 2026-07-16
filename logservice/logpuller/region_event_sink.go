@@ -38,10 +38,7 @@ type regionEventSink struct {
 	ds dynstream.DynamicStream[int, SubscriptionID, regionEvent, *subscribedSpan, *regionEventHandler]
 }
 
-func newRegionEventSink(
-	failureHandler *regionFailureHandler,
-	scanPriorityResolver *scanPriorityResolver,
-) *regionEventSink {
+func newRegionEventSink(failureHandler *regionFailureHandler) *regionEventSink {
 	sink := &regionEventSink{}
 	sink.cond = sync.NewCond(&sink.mu)
 
@@ -54,11 +51,7 @@ func newRegionEventSink(
 	option.EnableMemoryControl = true
 	ds := dynstream.NewParallelDynamicStream(
 		"log-puller",
-		&regionEventHandler{
-			eventSink:            sink,
-			failureHandler:       failureHandler,
-			scanPriorityResolver: scanPriorityResolver,
-		},
+		&regionEventHandler{eventSink: sink, failureHandler: failureHandler},
 		option,
 	)
 	ds.Start()

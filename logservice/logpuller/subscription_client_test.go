@@ -81,6 +81,7 @@ func TestGenerateResolveLockTask(t *testing.T) {
 		advanceResolvedTs,
 		0,
 		false,
+		nil,
 	)
 	client.spanRegistry.Add(span)
 
@@ -153,12 +154,12 @@ func TestResolveLockTaskDeduplicatedAcrossSubscribedSpans(t *testing.T) {
 		TableID:  1,
 		StartKey: []byte{'a'},
 		EndKey:   []byte{'z'},
-	}, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	}, 100, consumeKVEvents, advanceResolvedTs, 0, false, nil)
 	span2 := newSubscribedSpan(client.ctx, client.resolveLockRateLimiter, client.resolveLockTaskCh, SubscriptionID(2), heartbeatpb.TableSpan{
 		TableID:  2,
 		StartKey: []byte{'a'},
 		EndKey:   []byte{'z'},
-	}, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	}, 100, consumeKVEvents, advanceResolvedTs, 0, false, nil)
 
 	res := span1.rangeLock.LockRange(context.Background(), []byte{'b'}, []byte{'c'}, 1, 100)
 	require.Equal(t, regionlock.LockRangeStatusSuccess, res.Status)
@@ -268,6 +269,7 @@ func TestResolveLockTaskDroppedWhenChannelFull(t *testing.T) {
 		advanceResolvedTs,
 		0,
 		false,
+		nil,
 	)
 
 	res := span.rangeLock.LockRange(context.Background(), []byte{'b'}, []byte{'c'}, 1, 100)
@@ -327,6 +329,7 @@ func TestStopTaskUsesSubscribedSpanFilterLoop(t *testing.T) {
 		advanceResolvedTs,
 		0,
 		true,
+		nil,
 	)
 
 	res := span.rangeLock.LockRange(context.Background(), rawSpan.StartKey, rawSpan.EndKey, 1, 1)
@@ -841,7 +844,7 @@ func TestGetResolvedTargetTs(t *testing.T) {
 		TableID:  1,
 		StartKey: []byte{'a'},
 		EndKey:   []byte{'z'},
-	}, 100, consumeKVEvents, advanceResolvedTs, 0, false)
+	}, 100, consumeKVEvents, advanceResolvedTs, 0, false, nil)
 	span.initialized.Store(true)
 
 	// Replicate the getResolvedTargetTs closure from runResolveLockChecker
